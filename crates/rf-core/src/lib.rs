@@ -15,8 +15,10 @@
 
 #![forbid(unsafe_code)]
 
+mod arch;
 mod elf;
 mod error;
 
+pub use arch::{Arch, Endianness, Image};
 pub use elf::{Binary, ElfBinary, ElfClass, Section};
 pub use error::Error;
