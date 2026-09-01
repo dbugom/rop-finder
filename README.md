@@ -30,7 +30,7 @@ tests/
 |---|---|---|
 | **0. Spike** | `rf-core` + `rf-scan` MVP: x86/x64 ELF only, memchr anchors, per-start decode cache, JSON out; parity harness | done |
 | **1. Engine** | All ROPgadget arches (capstone-rs), PE/Mach-O/Universal/Raw loaders, rayon parallelism | **done** (trie index, fuzz corpus pending) |
-| 2. Features | `--section`, `--base`/`--offset` parity polish, structured binary info | planned |
+| 2. Features | `--section`, `--base` hardening, `--info` structured binary info | **done** |
 | 3. MCP server | `rf-mcp` stdio tools | planned |
 | 4a/4b. Chains | Chain IR, Linux execve chains, Windows VirtualProtect chains | planned |
 | 5. Differentiators | Semantic classification + ranking, chain DSL, dispatcher analysis | planned |
@@ -53,6 +53,8 @@ rop-finder --binary ./prog --only "pop|ret" --badbytes "0a|0d" --range 0x1000-0x
 rop-finder --binary ./prog --base 0x400000 --offset 0x1000
 rop-finder --binary tests/fixtures/raw-x86.raw --rawArch=x86 --rawMode=32
 rop-finder --binary tests/fixtures/elf-ARMv7-ls --thumb
+rop-finder --binary ./ntoskrnl.exe --section .text --base 0   # ring0: RVAs, .text only
+rop-finder --binary ./prog --info                           # metadata JSON, no scan
 ```
 
 Formats are detected by magic bytes (ELF, PE, Mach-O, Universal/fat Mach-O);
@@ -66,9 +68,70 @@ with endianness from the binary.
 
 Output format matches ROPgadget: `0x<addr> : insn ; insn ; ...` (human) or a
 JSON array of `{"vaddr", "bytes", "text"}` with `--json` (plus an `arch`
-field per gadget for Universal binaries).
+field per gadget for Universal binaries, and a `section` field per gadget
+when `--section` is used).
 
 Exit codes: `0` success, `1` usage error, `2` malformed/unsupported binary.
+
+## Phase 2 features
+
+### `--section <glob>` — scan only selected executable sections
+
+Restricts the scan to the binary's *named* executable sections
+(`SHF_EXECINSTR` sections for ELF, `Characteristics & IMAGE_SCN_MEM_EXECUTE`
+for PE, `__TEXT` executable sections for Mach-O) instead of ROPgadget's
+default `PF_X` *segment* granularity. Repeatable and comma-separated, with
+`*` globbing:
+
+```sh
+rop-finder --binary ./prog --section .text
+rop-finder --binary ./prog --section ".init*,.plt" --section .text
+```
+
+With `--json`, every gadget gains a `section` field naming the section that
+contains it. An unknown name exits `1` and lists the available executable
+sections. `--range`, `--base`, `--offset`, and `--badbytes` compose with
+`--section` normally.
+
+**Stripped-ELF caveat:** without a section table there are no names to
+match; the loader falls back to synthetic `PT_LOAD#n` segment names (one per
+executable segment) and prints a one-line stderr warning when `--section` is
+used against such a binary.
+
+### `--base <hex>` — load-time rebase
+
+Rebases the image at load time, before scanning: every gadget vaddr becomes
+`vaddr - original_image_base + <base>`. `--base 0` yields RVA-style
+addresses. `--offset` is applied *after* the rebase, so the final printed
+address is `vaddr - original_base + base + offset`. `--badbytes` is checked
+against that **final** address — e.g. after `--base 0x55550000`,
+`--badbytes 55` eliminates every gadget. For Universal (fat Mach-O)
+binaries every slice is slid by the same delta (`base - first_slice_base`);
+ROPgadget has no `--base` for Universal.
+
+### `--info` — structured binary metadata
+
+Dumps image metadata as JSON and exits without scanning (`--base` is
+honoured, so the printed addresses match what a scan would emit):
+
+```json
+{
+  "format": "pe",            // elf | pe | macho | raw | universal
+  "arch": "x64",
+  "endianness": "little",
+  "addr_size": 8,
+  "image_base": "0x4ad00000",
+  "entry": "0x4ad090b4",
+  "sections": [{"name": ".text", "vaddr": "0x4ad01000", "size": 160256,
+                "executable": true, "writable": false}, ...],
+  "imports":  [{"dll": "KERNEL32.dll", "symbol": "GetTickCount",
+                "iat_vaddr": "0x4ad2b382"}, ...]   // PE only; [] otherwise
+}
+```
+
+Universal binaries emit `{"format": "universal", "slices": [<per-slice macho
+info>, ...]}`. Addresses are hex strings (consistent with gadget vaddrs),
+sizes are numbers.
 
 ## Parity harness
 

@@ -13,5 +13,6 @@ path = "src/main.rs"
 rf-core = { path = "../rf-core" }
 rf-scan = { path = "../rf-scan" }
 clap.workspace = true
+globset = "0.4"
 serde.workspace = true
 serde_json.workspace = true
