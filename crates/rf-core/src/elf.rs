@@ -192,6 +192,72 @@ impl ElfBinary {
         self.entry = self.entry.wrapping_add(delta);
         self.image_base = new_base;
     }
+
+    /// Map `e_machine` + ELF class to the shared [`Arch`] contract.
+    pub fn arch(&self) -> Result<crate::Arch, Error> {
+        use crate::Arch::*;
+        use goblin::elf::header as h;
+        let is64 = self.is_64();
+        Ok(match self.machine {
+            h::EM_386 => X86,
+            h::EM_X86_64 => X64,
+            h::EM_ARM => Arm,
+            h::EM_AARCH64 => Arm64,
+            h::EM_MIPS => {
+                if is64 {
+                    Mips64
+                } else {
+                    Mips32
+                }
+            }
+            h::EM_PPC => Ppc32,
+            h::EM_PPC64 => Ppc64,
+            h::EM_SPARC | h::EM_SPARC32PLUS => Sparc,
+            h::EM_SPARCV9 => SparcV9,
+            h::EM_RISCV => {
+                if is64 {
+                    RiscV64
+                } else {
+                    RiscV32
+                }
+            }
+            other => return Err(Error::Unsupported(format!("e_machine {other}"))),
+        })
+    }
+}
+
+impl crate::Image for ElfBinary {
+    fn arch(&self) -> crate::Arch {
+        self.arch().unwrap_or(crate::Arch::X86)
+    }
+
+    fn endianness(&self) -> crate::Endianness {
+        if self.little_endian {
+            crate::Endianness::Little
+        } else {
+            crate::Endianness::Big
+        }
+    }
+
+    fn image_base(&self) -> u64 {
+        self.image_base()
+    }
+
+    fn entry(&self) -> u64 {
+        self.entry()
+    }
+
+    fn exec_sections(&self) -> Vec<&Section> {
+        self.exec_sections()
+    }
+
+    fn exec_scan_regions(&self) -> &[Section] {
+        self.exec_scan_regions()
+    }
+
+    fn rebase(&mut self, new_base: u64) {
+        self.rebase(new_base)
+    }
 }
 
 /// Clamp a file range to what the file actually contains. Never panics,
