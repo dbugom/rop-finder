@@ -194,7 +194,9 @@ pub fn format_gadget(
 fn capstone_normalize(instr: &iced_x86::Instruction, text: &mut String) {
     let mnem = format!("{:?}", instr.mnemonic()).to_lowercase();
     // iced's Mnemonic is size-suffixed (Stosb/Stosd/...), capstone's is too.
-    let stringop = ["movs", "cmps", "stos", "lods", "scas"].iter().any(|p| mnem.starts_with(p))
+    let stringop = ["movs", "cmps", "stos", "lods", "scas"]
+        .iter()
+        .any(|p| mnem.starts_with(p))
         || ["insb", "insw", "insd", "outsb", "outsw", "outsd"].contains(&mnem.as_str());
     let has_mem = (0..instr.op_count()).any(|i| instr.op_kind(i) == iced_x86::OpKind::Memory);
     if !has_mem {
@@ -249,8 +251,11 @@ fn capstone_normalize(instr: &iced_x86::Instruction, text: &mut String) {
 /// rsp/rbp-based addressing, ES for the destination of one-address string
 /// ops, DS otherwise (approximation — covers the cases capstone applies).
 fn default_segment(instr: &iced_x86::Instruction, mnem: &str) -> Register {
-    if ["stosb", "stosw", "stosd", "stosq", "scasb", "scasw", "scasd", "scasq", "insb", "insw", "insd"]
-        .contains(&mnem)
+    if [
+        "stosb", "stosw", "stosd", "stosq", "scasb", "scasw", "scasd", "scasq", "insb", "insw",
+        "insd",
+    ]
+    .contains(&mnem)
     {
         Register::ES
     } else {
@@ -296,9 +301,10 @@ pub fn pass_clean(decodes: &[WinInsn], multibr: bool, filter_suffixes: &[String]
     {
         return true;
     }
-    if middle.iter().any(|d| {
-        d.flow != FlowControl::Next && cs_mnemonic(d).contains("ret")
-    }) {
+    if middle
+        .iter()
+        .any(|d| d.flow != FlowControl::Next && cs_mnemonic(d).contains("ret"))
+    {
         return true;
     }
     // Built-in mnemonic filter ("db|int3", full equality — see above) plus
@@ -308,7 +314,10 @@ pub fn pass_clean(decodes: &[WinInsn], multibr: bool, filter_suffixes: &[String]
             if m == "db" || m == "int3" {
                 return true;
             }
-            if filter_suffixes.iter().any(|s| !s.is_empty() && m.ends_with(s.as_str())) {
+            if filter_suffixes
+                .iter()
+                .any(|s| !s.is_empty() && m.ends_with(s.as_str()))
+            {
                 return true;
             }
         }

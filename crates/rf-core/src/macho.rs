@@ -120,9 +120,8 @@ impl MachOBinary {
                     entry = sec.addr;
                 }
                 // macho.py:283.
-                let executable = sec.flags & (S_ATTR_SOME_INSTRUCTIONS
-                    | S_ATTR_PURE_INSTRUCTIONS)
-                    != 0;
+                let executable =
+                    sec.flags & (S_ATTR_SOME_INSTRUCTIONS | S_ATTR_PURE_INSTRUCTIONS) != 0;
                 let section = Section {
                     name,
                     vaddr: sec.addr,

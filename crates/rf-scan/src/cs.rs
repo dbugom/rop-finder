@@ -68,10 +68,11 @@ pub fn spec(arch: Arch, endian: Endianness, thumb: bool) -> Result<CsSpec, Error
                 "x86/x64 use the iced-x86 path, not capstone".to_string(),
             ))
         }
-        Arch::Arm | Arch::ArmThumb => {
-            let thumb = thumb || arch == Arch::ArmThumb;
-            (CsArch::ARM, if thumb { Mode::Thumb } else { Mode::Arm }, false)
-        }
+        Arch::Arm | Arch::ArmThumb => (
+            CsArch::ARM,
+            if thumb { Mode::Thumb } else { Mode::Arm },
+            false,
+        ),
         Arch::Arm64 => (CsArch::ARM64, Mode::Arm, false),
         Arch::Mips32 => (CsArch::MIPS, Mode::Mips32, false),
         Arch::Mips64 => (CsArch::MIPS, Mode::Mips64, false),
@@ -287,13 +288,10 @@ pub fn scan_anchor(
         for i in 0..opts.depth {
             let stepped = i * align;
             // Aligned path (gadgets.py:75-81).
-            let aligned_ok = align != 0
-                && ref_pos >= stepped
-                && {
-                    let s = ref_pos - stepped;
-                    s < code.len()
-                        && (sec_vaddr.wrapping_add(s as u64)) % align as u64 == 0
-                };
+            let aligned_ok = align != 0 && ref_pos >= stepped && {
+                let s = ref_pos - stepped;
+                s < code.len() && (sec_vaddr.wrapping_add(s as u64)) % align as u64 == 0
+            };
             let start = if aligned_ok {
                 ref_pos - stepped
             } else {
@@ -330,7 +328,10 @@ pub fn scan_anchor(
                 continue;
             }
             out.push(Gadget {
-                vaddr: opts.offset.wrapping_add(sec_vaddr).wrapping_add(start as u64),
+                vaddr: opts
+                    .offset
+                    .wrapping_add(sec_vaddr)
+                    .wrapping_add(start as u64),
                 bytes: code[start..end].to_vec(),
                 insns: format_gadget(cs, code, start, end, sec_vaddr),
                 delay_slot,
@@ -368,11 +369,22 @@ mod tests {
         ScanOptions::default()
     }
 
-    fn tables_for(kind_enabled: (bool, bool, bool), arch: Arch, endian: Endianness, thumb: bool) -> Vec<Vec<Anchor>> {
+    fn tables_for(
+        kind_enabled: (bool, bool, bool),
+        arch: Arch,
+        endian: Endianness,
+        thumb: bool,
+    ) -> Vec<Vec<Anchor>> {
         [
-            kind_enabled.0.then(|| anchors::table(TableKind::Rop, arch, endian, thumb)),
-            kind_enabled.1.then(|| anchors::table(TableKind::Jop, arch, endian, thumb)),
-            kind_enabled.2.then(|| anchors::table(TableKind::Sys, arch, endian, thumb)),
+            kind_enabled
+                .0
+                .then(|| anchors::table(TableKind::Rop, arch, endian, thumb)),
+            kind_enabled
+                .1
+                .then(|| anchors::table(TableKind::Jop, arch, endian, thumb)),
+            kind_enabled
+                .2
+                .then(|| anchors::table(TableKind::Sys, arch, endian, thumb)),
         ]
         .into_iter()
         .flatten()
@@ -439,7 +451,8 @@ mod tests {
         // when the base is 0x1001 (0x1001 + 3 == 0x1004).
         let g = scan(&code, 0x1001, Arch::Arm, Endianness::Little, false, &opts());
         assert!(
-            g.iter().any(|x| x.vaddr == 0x1004 && x.text().starts_with("svc")),
+            g.iter()
+                .any(|x| x.vaddr == 0x1004 && x.text().starts_with("svc")),
             "{:?}",
             texts(&g)
         );
@@ -457,20 +470,40 @@ mod tests {
         let t = texts(&g);
         assert!(t.contains(&"bx lr".to_string()), "{t:?}");
         assert!(
-            g.iter().all(|x| x.bytes.len() <= 4 || !x.bytes.starts_with(&[0xff; 4])),
+            g.iter()
+                .all(|x| x.bytes.len() <= 4 || !x.bytes.starts_with(&[0xff; 4])),
             "{t:?}"
         );
     }
 
     #[test]
     fn thumb_pop_pc_and_svc() {
-        // pop {pc} ; bx lr ; svc #0 (Thumb, LE)
+        // pop {pc} ; bx lr ; svc #0 (Thumb, LE). Thumb mode comes only from
+        // the thumb flag — an ArmThumb arch tag alone must not enable it
+        // (ROPgadget scans ARMv7/Thumb2 PEs in ARM mode without --thumb).
         let code = [0x00, 0xbd, 0x70, 0x47, 0x00, 0xdf];
-        let g = scan(&code, 0x2000, Arch::ArmThumb, Endianness::Little, false, &opts());
+        let g = scan(
+            &code,
+            0x2000,
+            Arch::ArmThumb,
+            Endianness::Little,
+            true,
+            &opts(),
+        );
         let t = texts(&g);
         assert!(t.contains(&"pop {pc}".to_string()), "{t:?}");
         assert!(t.contains(&"bx lr".to_string()), "{t:?}");
         assert!(t.iter().any(|x| x.starts_with("svc")), "{t:?}");
+        // Same bytes, thumb=false → ARM mode: no thumb gadgets.
+        let g = scan(
+            &code,
+            0x2000,
+            Arch::ArmThumb,
+            Endianness::Little,
+            false,
+            &opts(),
+        );
+        assert!(texts(&g).iter().all(|x| x != "pop {pc}"));
     }
 
     #[test]
@@ -480,7 +513,14 @@ mod tests {
             0xe0, 0x03, 0x01, 0xaa, 0xc0, 0x03, 0x5f, 0xd6, 0x00, 0x00, 0x20, 0xd4, 0xc0, 0x03,
             0x5f, 0xd6,
         ];
-        let g = scan(&code, 0x4000, Arch::Arm64, Endianness::Little, false, &opts());
+        let g = scan(
+            &code,
+            0x4000,
+            Arch::Arm64,
+            Endianness::Little,
+            false,
+            &opts(),
+        );
         let t = texts(&g);
         assert!(t.contains(&"ret".to_string()), "{t:?}");
         assert!(t.contains(&"mov x0, x1 ; ret".to_string()), "{t:?}");
@@ -506,7 +546,14 @@ mod tests {
     fn mips_be_jr_ra_with_delay_slot() {
         // jr $ra ; nop  (BE) — anchor size 8 includes the delay slot.
         let code = [0x03, 0xe0, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00];
-        let g = scan(&code, 0x400000, Arch::Mips32, Endianness::Big, false, &opts());
+        let g = scan(
+            &code,
+            0x400000,
+            Arch::Mips32,
+            Endianness::Big,
+            false,
+            &opts(),
+        );
         let t = texts(&g);
         assert!(t.contains(&"jr $ra ; nop".to_string()), "{t:?}");
         let jr = g.iter().find(|x| x.text() == "jr $ra ; nop").unwrap();
@@ -520,7 +567,14 @@ mod tests {
         let code = [
             0xff, 0xff, 0xff, 0xff, 0x03, 0xe0, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00,
         ];
-        let g = scan(&code, 0x400000, Arch::Mips32, Endianness::Big, false, &opts());
+        let g = scan(
+            &code,
+            0x400000,
+            Arch::Mips32,
+            Endianness::Big,
+            false,
+            &opts(),
+        );
         let t = texts(&g);
         assert!(t.contains(&"jr $ra ; nop".to_string()), "{t:?}");
         assert!(
@@ -545,7 +599,14 @@ mod tests {
     fn riscv_c_ret_anchor() {
         // c.jr ra (capstone 5 spelling of 0x8082) alone.
         let code = [0x82, 0x80];
-        let g = scan(&code, 0x1000, Arch::RiscV64, Endianness::Little, false, &opts());
+        let g = scan(
+            &code,
+            0x1000,
+            Arch::RiscV64,
+            Endianness::Little,
+            false,
+            &opts(),
+        );
         let t = texts(&g);
         assert!(t.contains(&"c.jr ra".to_string()), "{t:?}");
     }

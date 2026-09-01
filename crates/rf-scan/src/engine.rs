@@ -19,8 +19,8 @@
 //! thread scheduling. `ScanOptions::parallel = false` selects the serial
 //! path (tests).
 
-use std::collections::HashSet;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use rayon::prelude::*;
@@ -59,8 +59,11 @@ pub struct ScanOptions {
     /// ROPgadget --offset: additive slide applied at emission; disassembly
     /// is unaffected.
     pub offset: u64,
-    /// ROPgadget --thumb: disassemble ARM binaries in Thumb mode
-    /// (gadgets.py:331, 448). `Arch::ArmThumb` implies this.
+    /// ROPgadget --thumb: disassemble ARM binaries in Thumb mode.
+    /// This flag is the ONLY source of Thumb mode: `Arch::ArmThumb` (e.g. a
+    /// PE built for ARMv7/Thumb2) does NOT imply it, because ROPgadget
+    /// scans such binaries in ARM mode unless --thumb is given
+    /// (gadgets.py:331, 448).
     pub thumb: bool,
     /// Scan (region × anchor) work items with rayon. Output is identical
     /// either way; serial exists for tests and debugging.
@@ -144,7 +147,7 @@ pub fn scan_binary<B: Image + ?Sized>(bin: &B, opts: &ScanOptions) -> Result<Vec
         }
     }
 
-    let thumb = opts.thumb || arch == Arch::ArmThumb;
+    let thumb = opts.thumb;
     let all = if arch.is_x86_family() {
         let bits = if arch == Arch::X64 { 64 } else { 32 };
         let tables = x86_tables(bits, opts);
@@ -157,9 +160,12 @@ pub fn scan_binary<B: Image + ?Sized>(bin: &B, opts: &ScanOptions) -> Result<Vec
         // clean error rather than empty per-thread results.
         let _probe = cs::open(&spec)?;
         let tables: Vec<Vec<Anchor>> = [
-            opts.rop.then(|| anchors::table(TableKind::Rop, arch, endian, thumb)),
-            opts.jop.then(|| anchors::table(TableKind::Jop, arch, endian, thumb)),
-            opts.sys.then(|| anchors::table(TableKind::Sys, arch, endian, thumb)),
+            opts.rop
+                .then(|| anchors::table(TableKind::Rop, arch, endian, thumb)),
+            opts.jop
+                .then(|| anchors::table(TableKind::Jop, arch, endian, thumb)),
+            opts.sys
+                .then(|| anchors::table(TableKind::Sys, arch, endian, thumb)),
         ]
         .into_iter()
         .flatten()
@@ -203,7 +209,11 @@ fn scan_work(
 ) -> Vec<Gadget> {
     let work: Vec<(&(Vec<u8>, u64), &Anchor)> = regions
         .iter()
-        .flat_map(|r| tables.iter().flat_map(move |t| t.iter().map(move |a| (r, a))))
+        .flat_map(|r| {
+            tables
+                .iter()
+                .flat_map(move |t| t.iter().map(move |a| (r, a)))
+        })
         .collect();
     let run = |item: &(&(Vec<u8>, u64), &Anchor)| {
         let ((bytes, vaddr), anchor) = *item;
@@ -242,7 +252,10 @@ pub fn post_process(mut all: Vec<Gadget>, opts: &ScanOptions, addr_size: usize) 
     if !opts.badbytes.is_empty() {
         keyed.retain(|(_, g)| {
             let packed = g.vaddr.to_le_bytes();
-            !opts.badbytes.iter().any(|b| packed[..addr_size].contains(b))
+            !opts
+                .badbytes
+                .iter()
+                .any(|b| packed[..addr_size].contains(b))
         });
     }
 
@@ -338,10 +351,17 @@ fn x86_scan_anchor(
             let insns = cache
                 .entry(start)
                 .or_insert_with(|| {
-                    Rc::new(x86::decode_window(code, start, sec_vaddr, bits, start + window))
+                    Rc::new(x86::decode_window(
+                        code,
+                        start,
+                        sec_vaddr,
+                        bits,
+                        start + window,
+                    ))
                 })
                 .clone();
-            if let Some(g) = try_candidate(code, sec_vaddr, bits, start, end, &insns, opts, &mut fmt)
+            if let Some(g) =
+                try_candidate(code, sec_vaddr, bits, start, end, &insns, opts, &mut fmt)
             {
                 out.push(g);
             }
@@ -376,7 +396,10 @@ fn try_candidate(
         return None;
     }
     Some(Gadget {
-        vaddr: opts.offset.wrapping_add(sec_vaddr).wrapping_add(start as u64),
+        vaddr: opts
+            .offset
+            .wrapping_add(sec_vaddr)
+            .wrapping_add(start as u64),
         bytes: code[start..end].to_vec(),
         insns: x86::format_gadget(code, start, end, sec_vaddr, bits, fmt),
         delay_slot: false, // x86/x64 have no delay slots
@@ -403,13 +426,19 @@ mod tests {
         let g = scan(b"\x55\x89\xe5\xc3", 0x1000, 32, &opts());
         let texts: Vec<String> = g.iter().map(|x| x.text()).collect();
         assert!(texts.contains(&"ret".to_string()), "{texts:?}");
-        assert!(texts.contains(&"mov ebp, esp ; ret".to_string()), "{texts:?}");
+        assert!(
+            texts.contains(&"mov ebp, esp ; ret".to_string()),
+            "{texts:?}"
+        );
         assert!(
             texts.contains(&"push ebp ; mov ebp, esp ; ret".to_string()),
             "{texts:?}"
         );
         // vaddr of the full prologue gadget
-        let full = g.iter().find(|x| x.text() == "push ebp ; mov ebp, esp ; ret").unwrap();
+        let full = g
+            .iter()
+            .find(|x| x.text() == "push ebp ; mov ebp, esp ; ret")
+            .unwrap();
         assert_eq!(full.vaddr, 0x1000);
         assert_eq!(full.bytes, b"\x55\x89\xe5\xc3");
     }
@@ -455,7 +484,8 @@ mod tests {
         o.multibr = true;
         let g = scan(code, 0x1000, 32, &o);
         assert!(
-            g.iter().any(|x| x.text().starts_with("call") && x.text().ends_with("ret")),
+            g.iter()
+                .any(|x| x.text().starts_with("call") && x.text().ends_with("ret")),
             "--multibr must keep it: {:?}",
             g.iter().map(|x| x.text()).collect::<Vec<_>>()
         );
@@ -490,7 +520,9 @@ mod tests {
         let g = scan(b"\x0f\xff\xc3", 0x1000, 64, &opts());
         // Only the bare "ret" from anchor at 2 with i=0 survives; nothing
         // starting at 0 or 1 that spans the invalid bytes.
-        assert!(g.iter().all(|x| x.vaddr == 0x1002 || !x.bytes.starts_with(&[0x0f, 0xff])),);
+        assert!(g
+            .iter()
+            .all(|x| x.vaddr == 0x1002 || !x.bytes.starts_with(&[0x0f, 0xff])),);
     }
 
     #[test]
@@ -561,7 +593,10 @@ mod tests {
         ];
         let out = post_process(all, &opts(), 4);
         assert_eq!(out.len(), 2);
-        let m = out.iter().find(|g| g.text() == "mov eax, eax ; ret").unwrap();
+        let m = out
+            .iter()
+            .find(|g| g.text() == "mov eax, eax ; ret")
+            .unwrap();
         assert_eq!(m.vaddr, 0x2000, "first occurrence must win");
         assert_eq!(m.bytes, b"\x89\xc0\xc3");
         // sorted alphabetically: "mov..." < "ret"
@@ -607,12 +642,18 @@ mod tests {
 
     #[test]
     fn scans_real_fixture() {
-        let path =
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/elf-Linux-x64");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/elf-Linux-x64"
+        );
         let bytes = std::fs::read(path).unwrap();
         let bin = rf_core::Binary::parse(&bytes).unwrap();
         let g = scan_binary(&bin, &opts()).unwrap();
-        assert!(g.len() > 1000, "expected thousands of gadgets, got {}", g.len());
+        assert!(
+            g.len() > 1000,
+            "expected thousands of gadgets, got {}",
+            g.len()
+        );
         assert!(g.iter().any(|x| x.text() == "ret"));
         // every gadget vaddr lies inside some scanned exec region
         let exec = bin.exec_scan_regions();
@@ -630,7 +671,11 @@ mod tests {
         for x in g.iter().step_by(97) {
             let retexts =
                 crate::x86::format_gadget(&x.bytes, 0, x.bytes.len(), x.vaddr, 64, &mut fmt);
-            assert_eq!(retexts, x.insns, "gadget {:#x} bytes do not re-decode", x.vaddr);
+            assert_eq!(
+                retexts, x.insns,
+                "gadget {:#x} bytes do not re-decode",
+                x.vaddr
+            );
         }
     }
 

@@ -45,9 +45,7 @@ impl Binary {
             match &bytes[..4] {
                 b"\x7fELF" => return Format::Elf,
                 // FAT_MAGIC / FAT_MAGIC_64 (binary.py:43; cafebabf added).
-                [0xca, 0xfe, 0xba, 0xbe] | [0xca, 0xfe, 0xba, 0xbf] => {
-                    return Format::Universal
-                }
+                [0xca, 0xfe, 0xba, 0xbe] | [0xca, 0xfe, 0xba, 0xbf] => return Format::Universal,
                 // Mach-O magics, little- and big-endian, 32- and 64-bit
                 // (binary.py:45-46).
                 [0xce, 0xfa, 0xed, 0xfe]

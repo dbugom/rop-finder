@@ -7,11 +7,12 @@ For every fixture in tests/fixtures:
   * compare the post-dedup sets of (vaddr, bytes) and report
     |ref|, |ours|, |intersection|, ref-only, ours-only and % overlap.
 
-Coverage policy (Phase 1a): every *ELF* fixture is compared. Fixtures are
-skipped gracefully — never fatal — when:
-  * the file is not an ELF (rf-cli still loads ELF only), or
-  * the ROPgadget oracle cannot handle it (unsupported arch/format), or
-  * rop-finder reports the binary as unsupported (exit code 2).
+Coverage policy (Phase 1): the FULL corpus is compared — ELF (all arches),
+PE (x86/x64/ARMv7), Mach-O (x86/x64/PPC), Universal (fat Mach-O, flattened
+like ROPgadget's universal.py), and raw-x86.raw (both tools get
+--rawArch=x86 --rawMode=32). Fixtures are skipped gracefully — never
+fatal — when the ROPgadget oracle cannot handle the file or rop-finder
+reports it as unsupported (exit code 2).
 
 A small number of diffs is expected and acceptable IF explained:
   * dedup-survivor differences (text dedup with different formatters)
@@ -39,6 +40,13 @@ DEPTH = 10
 
 REF_LINE = re.compile(r"^(0x[0-9a-f]+)\s*:\s*(.*?)\s*//\s*([0-9a-f]+)\s*$")
 
+# Fixtures that need explicit raw-loader flags for BOTH tools (mirrors
+# ropgadget/test-suite-binaries/test.sh, which uses --rawArch=x86
+# --rawMode=32 for raw-x86.raw).
+EXTRA_FLAGS = {
+    "raw-x86.raw": ["--rawArch=x86", "--rawMode=32"],
+}
+
 
 def find_rop_finder(release: bool) -> str:
     profile = "release" if release else "debug"
@@ -50,12 +58,12 @@ def find_rop_finder(release: bool) -> str:
     return exe
 
 
-def run_ref(fixture: str):
+def run_ref(fixture: str, extra):
     """Return ({(vaddr, bytes): text}, seconds), or (None, dt) when the
     oracle itself cannot handle this binary (unsupported arch/format)."""
     t0 = time.perf_counter()
     p = subprocess.run(
-        [sys.executable, ROPGADGET, "--binary", fixture, "--depth", str(DEPTH), "--dump"],
+        [sys.executable, ROPGADGET, "--binary", fixture, "--depth", str(DEPTH), "--dump"] + extra,
         capture_output=True, text=True,
     )
     dt = time.perf_counter() - t0
@@ -69,7 +77,7 @@ def run_ref(fixture: str):
     return gadgets, dt
 
 
-def run_ours(binary: str, fixture: str, runs: int = 1):
+def run_ours(binary: str, fixture: str, extra, runs: int = 1):
     """Return ({(vaddr, bytes): text}, best-of-N seconds), or (None, None)
     when rop-finder reports the binary as unsupported (exit code 2); other
     failures stay fatal."""
@@ -78,7 +86,7 @@ def run_ours(binary: str, fixture: str, runs: int = 1):
     for _ in range(runs):
         t0 = time.perf_counter()
         p = subprocess.run(
-            [binary, "--binary", fixture, "--depth", str(DEPTH), "--json"],
+            [binary, "--binary", fixture, "--depth", str(DEPTH), "--json"] + extra,
             capture_output=True, text=True,
         )
         dt = time.perf_counter() - t0
@@ -134,15 +142,12 @@ def main():
     skipped = []
     for name in names:
         path = os.path.join(FIXTURES, name)
-        with open(path, "rb") as fh:
-            if fh.read(4) != b"\x7fELF":
-                skipped.append((name, "not an ELF (rf-cli loads ELF only)"))
-                continue
-        ref, t_ref = run_ref(path)
+        extra = EXTRA_FLAGS.get(name, [])
+        ref, t_ref = run_ref(path, extra)
         if ref is None:
             skipped.append((name, "ROPgadget oracle cannot handle it"))
             continue
-        ours, t_ours = run_ours(binary, path, runs=3)
+        ours, t_ours = run_ours(binary, path, extra, runs=3)
         if ours is None:
             skipped.append((name, "arch not supported by this rop-finder build"))
             continue

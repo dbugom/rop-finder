@@ -332,7 +332,10 @@ mod tests {
 
     #[test]
     fn truncations_never_panic() {
-        for name in ["pe-x86-cmd-v6.1.7600", "pe-Windows-ARMv7-Thumb2LE-HelloWorld"] {
+        for name in [
+            "pe-x86-cmd-v6.1.7600",
+            "pe-Windows-ARMv7-Thumb2LE-HelloWorld",
+        ] {
             let bytes = load_fixture(name);
             // Every truncation length in the header region must return
             // (Ok or Err), never panic.

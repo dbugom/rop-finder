@@ -130,11 +130,34 @@ pub fn jop_anchors(is64: bool) -> Vec<Anchor> {
     let mut v: Vec<Anchor> = vec![
         a("call/jmp reg", pat!(f(0xff), BytePat::Ranges(REG))),
         a("call/jmp [reg]", pat!(f(0xff), BytePat::Ranges(MEM))),
-        a("call/jmp [esp]", pat!(f(0xff), BytePat::Ranges(MEM_SP), f(0x24))),
-        a("call/jmp [reg + disp8]", pat!(f(0xff), BytePat::Ranges(MEM_D8), ANY)),
-        a("call/jmp [esp + disp8]", pat!(f(0xff), BytePat::Ranges(MEM_SP_D8), f(0x24), ANY)),
-        a("call/jmp [reg + disp32]", pat!(f(0xff), BytePat::Ranges(MEM_D32), ANY, ANY, ANY, ANY)),
-        a("call/jmp [esp + disp32]", pat!(f(0xff), BytePat::Ranges(MEM_SP_D32), f(0x24), ANY, ANY, ANY, ANY)),
+        a(
+            "call/jmp [esp]",
+            pat!(f(0xff), BytePat::Ranges(MEM_SP), f(0x24)),
+        ),
+        a(
+            "call/jmp [reg + disp8]",
+            pat!(f(0xff), BytePat::Ranges(MEM_D8), ANY),
+        ),
+        a(
+            "call/jmp [esp + disp8]",
+            pat!(f(0xff), BytePat::Ranges(MEM_SP_D8), f(0x24), ANY),
+        ),
+        a(
+            "call/jmp [reg + disp32]",
+            pat!(f(0xff), BytePat::Ranges(MEM_D32), ANY, ANY, ANY, ANY),
+        ),
+        a(
+            "call/jmp [esp + disp32]",
+            pat!(
+                f(0xff),
+                BytePat::Ranges(MEM_SP_D32),
+                f(0x24),
+                ANY,
+                ANY,
+                ANY,
+                ANY
+            ),
+        ),
     ];
     if is64 {
         // \x41 (REX.B) prefix converts r[abcd]x..rdi forms to r8-r15 forms.
@@ -158,10 +181,38 @@ pub fn jop_anchors(is64: bool) -> Vec<Anchor> {
         a("jmp rel8", pat!(f(0xeb), ANY)),
         a("jmp rel32", pat!(f(0xe9), ANY, ANY, ANY, ANY)),
         // MPX — decode as "bnd jmp"/"bnd call", always rejected by passCleanX86
-        a("bnd jmp [reg]", pat!(f(0xf2), f(0xff), BytePat::Ranges(&[(0x20, 0x23), (0x26, 0x27)]))),
-        a("bnd jmp reg", pat!(f(0xf2), f(0xff), BytePat::Ranges(&[(0xe0, 0xe4), (0xe6, 0xe7)]))),
-        a("bnd jmp [reg] (2)", pat!(f(0xf2), f(0xff), BytePat::Ranges(&[(0x10, 0x13), (0x16, 0x17)]))),
-        a("bnd call reg", pat!(f(0xf2), f(0xff), BytePat::Ranges(&[(0xd0, 0xd4), (0xd6, 0xd7)]))),
+        a(
+            "bnd jmp [reg]",
+            pat!(
+                f(0xf2),
+                f(0xff),
+                BytePat::Ranges(&[(0x20, 0x23), (0x26, 0x27)])
+            ),
+        ),
+        a(
+            "bnd jmp reg",
+            pat!(
+                f(0xf2),
+                f(0xff),
+                BytePat::Ranges(&[(0xe0, 0xe4), (0xe6, 0xe7)])
+            ),
+        ),
+        a(
+            "bnd jmp [reg] (2)",
+            pat!(
+                f(0xf2),
+                f(0xff),
+                BytePat::Ranges(&[(0x10, 0x13), (0x16, 0x17)])
+            ),
+        ),
+        a(
+            "bnd call reg",
+            pat!(
+                f(0xf2),
+                f(0xff),
+                BytePat::Ranges(&[(0xd0, 0xd4), (0xd6, 0xd7)])
+            ),
+        ),
     ]);
     v
 }
@@ -172,11 +223,34 @@ pub fn sys_anchors() -> Vec<Anchor> {
         a("int 0x80", pat!(f(0xcd), f(0x80))),
         a("sysenter", pat!(f(0x0f), f(0x34))),
         a("syscall", pat!(f(0x0f), f(0x05))),
-        a("call DWORD PTR gs:0x10", pat!(f(0x65), f(0xff), f(0x15), f(0x10), f(0x00), f(0x00), f(0x00))),
+        a(
+            "call DWORD PTR gs:0x10",
+            pat!(
+                f(0x65),
+                f(0xff),
+                f(0x15),
+                f(0x10),
+                f(0x00),
+                f(0x00),
+                f(0x00)
+            ),
+        ),
         a("int 0x80 ; ret", pat!(f(0xcd), f(0x80), f(0xc3))),
         a("sysenter ; ret", pat!(f(0x0f), f(0x34), f(0xc3))),
         a("syscall ; ret", pat!(f(0x0f), f(0x05), f(0xc3))),
-        a("call DWORD PTR gs:0x10 ; ret", pat!(f(0x65), f(0xff), f(0x15), f(0x10), f(0x00), f(0x00), f(0x00), f(0xc3))),
+        a(
+            "call DWORD PTR gs:0x10 ; ret",
+            pat!(
+                f(0x65),
+                f(0xff),
+                f(0x15),
+                f(0x10),
+                f(0x00),
+                f(0x00),
+                f(0x00),
+                f(0xc3)
+            ),
+        ),
         a("sysret", pat!(f(0x0f), f(0x07))),
         a("sysret (rex.w)", pat!(f(0x48), f(0x0f), f(0x07))),
         a("iret", pat!(f(0xcf))),
@@ -220,14 +294,11 @@ pub fn table(kind: TableKind, arch: Arch, endian: Endianness, thumb: bool) -> Ve
                 Sys => sys_anchors(),
             }
         }
-        Arch::Arm | Arch::ArmThumb => {
-            let thumb = thumb || arch == Arch::ArmThumb;
-            match kind {
-                Rop => vec![], // gadgets.py:180-181 — ARM has no RET
-                Jop => arm_jop(thumb, be),
-                Sys => arm_sys(thumb, be),
-            }
-        }
+        Arch::Arm | Arch::ArmThumb => match kind {
+            Rop => vec![], // gadgets.py:180-181 — ARM has no RET
+            Jop => arm_jop(thumb, be),
+            Sys => arm_sys(thumb, be),
+        },
         Arch::Arm64 => match kind {
             // gadgets.py:182-191
             Rop => {
@@ -284,14 +355,24 @@ pub fn table(kind: TableKind, arch: Arch, endian: Endianness, thumb: bool) -> Ve
                 if be {
                     vec![m(
                         "jmp %g[0-3]",
-                        pat!(f(0x81), f(0xc0), r(&[(0x00, 0x00), (0x40, 0x40), (0x80, 0x80), (0xc0, 0xc0)]), f(0x00)),
+                        pat!(
+                            f(0x81),
+                            f(0xc0),
+                            r(&[(0x00, 0x00), (0x40, 0x40), (0x80, 0x80), (0xc0, 0xc0)]),
+                            f(0x00)
+                        ),
                         4,
                         4,
                     )]
                 } else {
                     vec![m(
                         "jmp %g[0-3]",
-                        pat!(f(0x00), r(&[(0x00, 0x00), (0x40, 0x40), (0x80, 0x80), (0xc0, 0xc0)]), f(0xc0), f(0x81)),
+                        pat!(
+                            f(0x00),
+                            r(&[(0x00, 0x00), (0x40, 0x40), (0x80, 0x80), (0xc0, 0xc0)]),
+                            f(0xc0),
+                            f(0x81)
+                        ),
                         4,
                         4,
                     )]
@@ -361,25 +442,105 @@ fn mips_jop(be: bool) -> Vec<Anchor> {
     use mips_sets::*;
     if be {
         vec![
-            m("jalr $v[0-1]|$a[0-3]", pat!(f(0x00), r(V0_A3), f(0xf8), f(0x09), ANY, ANY, ANY, ANY), 8, 4),
-            m("jalr $t[0-7]|$s[0-7]", pat!(r(R01_02), r(T0_S7), f(0xf8), f(0x09), ANY, ANY, ANY, ANY), 8, 4),
-            m("jalr $t[8-9]|$s8|$ra", pat!(f(0x03), r(T8_RA), f(0xf8), f(0x09), ANY, ANY, ANY, ANY), 8, 4),
-            m("jr $v[0-1]|$a[0-3]", pat!(f(0x00), r(V0_A3), f(0x00), f(0x08), ANY, ANY, ANY, ANY), 8, 4),
-            m("jr $t[0-7]|$s[0-7]", pat!(r(R01_02), r(T0_S7), f(0x00), f(0x08), ANY, ANY, ANY, ANY), 8, 4),
-            m("jr $t[8-9]|$s8|$ra", pat!(f(0x03), r(T8_RA), f(0x00), f(0x08), ANY, ANY, ANY, ANY), 8, 4),
-            m("jal addr", pat!(r(&[(0x0c, 0x0f)]), ANY, ANY, ANY, ANY, ANY, ANY, ANY), 8, 4),
-            m("j addr", pat!(r(&[(0x08, 0x0b)]), ANY, ANY, ANY, ANY, ANY, ANY, ANY), 8, 4),
+            m(
+                "jalr $v[0-1]|$a[0-3]",
+                pat!(f(0x00), r(V0_A3), f(0xf8), f(0x09), ANY, ANY, ANY, ANY),
+                8,
+                4,
+            ),
+            m(
+                "jalr $t[0-7]|$s[0-7]",
+                pat!(r(R01_02), r(T0_S7), f(0xf8), f(0x09), ANY, ANY, ANY, ANY),
+                8,
+                4,
+            ),
+            m(
+                "jalr $t[8-9]|$s8|$ra",
+                pat!(f(0x03), r(T8_RA), f(0xf8), f(0x09), ANY, ANY, ANY, ANY),
+                8,
+                4,
+            ),
+            m(
+                "jr $v[0-1]|$a[0-3]",
+                pat!(f(0x00), r(V0_A3), f(0x00), f(0x08), ANY, ANY, ANY, ANY),
+                8,
+                4,
+            ),
+            m(
+                "jr $t[0-7]|$s[0-7]",
+                pat!(r(R01_02), r(T0_S7), f(0x00), f(0x08), ANY, ANY, ANY, ANY),
+                8,
+                4,
+            ),
+            m(
+                "jr $t[8-9]|$s8|$ra",
+                pat!(f(0x03), r(T8_RA), f(0x00), f(0x08), ANY, ANY, ANY, ANY),
+                8,
+                4,
+            ),
+            m(
+                "jal addr",
+                pat!(r(&[(0x0c, 0x0f)]), ANY, ANY, ANY, ANY, ANY, ANY, ANY),
+                8,
+                4,
+            ),
+            m(
+                "j addr",
+                pat!(r(&[(0x08, 0x0b)]), ANY, ANY, ANY, ANY, ANY, ANY, ANY),
+                8,
+                4,
+            ),
         ]
     } else {
         vec![
-            m("jalr $v[0-1]|$a[0-3]", pat!(f(0x09), f(0xf8), r(V0_A3), f(0x00), ANY, ANY, ANY, ANY), 8, 4),
-            m("jalr $t[0-7]|$s[0-7]", pat!(f(0x09), f(0xf8), r(T0_S7), r(R01_02), ANY, ANY, ANY, ANY), 8, 4),
-            m("jalr $t[8-9]|$s8|$ra", pat!(f(0x09), f(0xf8), r(T8_RA), f(0x03), ANY, ANY, ANY, ANY), 8, 4),
-            m("jr $v[0-1]|$a[0-3]", pat!(f(0x08), f(0x00), r(V0_A3), f(0x00), ANY, ANY, ANY, ANY), 8, 4),
-            m("jr $t[0-7]|$s[0-7]", pat!(f(0x08), f(0x00), r(T0_S7), r(R01_02), ANY, ANY, ANY, ANY), 8, 4),
-            m("jr $t[8-9]|$s8|$ra", pat!(f(0x08), f(0x00), r(T8_RA), f(0x03), ANY, ANY, ANY, ANY), 8, 4),
-            m("jal addr", pat!(ANY, ANY, ANY, r(&[(0x0c, 0x0f)]), ANY, ANY, ANY, ANY), 8, 4),
-            m("j addr", pat!(ANY, ANY, ANY, r(&[(0x08, 0x0b)]), ANY, ANY, ANY, ANY), 8, 4),
+            m(
+                "jalr $v[0-1]|$a[0-3]",
+                pat!(f(0x09), f(0xf8), r(V0_A3), f(0x00), ANY, ANY, ANY, ANY),
+                8,
+                4,
+            ),
+            m(
+                "jalr $t[0-7]|$s[0-7]",
+                pat!(f(0x09), f(0xf8), r(T0_S7), r(R01_02), ANY, ANY, ANY, ANY),
+                8,
+                4,
+            ),
+            m(
+                "jalr $t[8-9]|$s8|$ra",
+                pat!(f(0x09), f(0xf8), r(T8_RA), f(0x03), ANY, ANY, ANY, ANY),
+                8,
+                4,
+            ),
+            m(
+                "jr $v[0-1]|$a[0-3]",
+                pat!(f(0x08), f(0x00), r(V0_A3), f(0x00), ANY, ANY, ANY, ANY),
+                8,
+                4,
+            ),
+            m(
+                "jr $t[0-7]|$s[0-7]",
+                pat!(f(0x08), f(0x00), r(T0_S7), r(R01_02), ANY, ANY, ANY, ANY),
+                8,
+                4,
+            ),
+            m(
+                "jr $t[8-9]|$s8|$ra",
+                pat!(f(0x08), f(0x00), r(T8_RA), f(0x03), ANY, ANY, ANY, ANY),
+                8,
+                4,
+            ),
+            m(
+                "jal addr",
+                pat!(ANY, ANY, ANY, r(&[(0x0c, 0x0f)]), ANY, ANY, ANY, ANY),
+                8,
+                4,
+            ),
+            m(
+                "j addr",
+                pat!(ANY, ANY, ANY, r(&[(0x08, 0x0b)]), ANY, ANY, ANY, ANY),
+                8,
+                4,
+            ),
         ]
     }
 }
@@ -456,13 +617,29 @@ fn arm64_jop(be: bool) -> Vec<Anchor> {
 fn arm_jop(thumb: bool, be: bool) -> Vec<Anchor> {
     if thumb {
         const BX: &[(u8, u8)] = &[
-            (0x00, 0x00), (0x08, 0x08), (0x10, 0x10), (0x18, 0x18), (0x20, 0x20),
-            (0x28, 0x28), (0x30, 0x30), (0x38, 0x38), (0x40, 0x40), (0x48, 0x48),
+            (0x00, 0x00),
+            (0x08, 0x08),
+            (0x10, 0x10),
+            (0x18, 0x18),
+            (0x20, 0x20),
+            (0x28, 0x28),
+            (0x30, 0x30),
+            (0x38, 0x38),
+            (0x40, 0x40),
+            (0x48, 0x48),
             (0x70, 0x70),
         ];
         const BLX: &[(u8, u8)] = &[
-            (0x80, 0x80), (0x88, 0x88), (0x90, 0x90), (0x98, 0x98), (0xa0, 0xa0),
-            (0xa8, 0xa8), (0xb0, 0xb0), (0xb8, 0xb8), (0xc0, 0xc0), (0xc8, 0xc8),
+            (0x80, 0x80),
+            (0x88, 0x88),
+            (0x90, 0x90),
+            (0x98, 0x98),
+            (0xa0, 0xa0),
+            (0xa8, 0xa8),
+            (0xb0, 0xb0),
+            (0xb8, 0xb8),
+            (0xc0, 0xc0),
+            (0xc8, 0xc8),
             (0xf0, 0xf0),
         ];
         const LDM_W: &[(u8, u8)] = &[(0x90, 0x9f), (0xb0, 0xbf)];
@@ -472,16 +649,36 @@ fn arm_jop(thumb: bool, be: bool) -> Vec<Anchor> {
                 m("bx reg", pat!(f(0x47), r(BX)), 2, 2),
                 m("blx reg", pat!(f(0x47), r(BLX)), 2, 2),
                 m("pop {,pc}", pat!(f(0xbd), ANY), 2, 2),
-                m("ldm.w reg{!}, {,pc}", pat!(f(0xe8), r(LDM_W), ANY, ANY, ANY, ANY), 4, 2),
-                m("ldmdb reg{!}, {,pc}", pat!(f(0xe9), r(LDMDB), ANY, ANY, ANY, ANY), 4, 2),
+                m(
+                    "ldm.w reg{!}, {,pc}",
+                    pat!(f(0xe8), r(LDM_W), ANY, ANY, ANY, ANY),
+                    4,
+                    2,
+                ),
+                m(
+                    "ldmdb reg{!}, {,pc}",
+                    pat!(f(0xe9), r(LDMDB), ANY, ANY, ANY, ANY),
+                    4,
+                    2,
+                ),
             ]
         } else {
             vec![
                 m("bx reg", pat!(r(BX), f(0x47)), 2, 2),
                 m("blx reg", pat!(r(BLX), f(0x47)), 2, 2),
                 m("pop {,pc}", pat!(ANY, f(0xbd)), 2, 2),
-                m("ldm.w reg{!}, {,pc}", pat!(r(LDM_W), f(0xe8), ANY, ANY, ANY, ANY), 4, 2),
-                m("ldmdb reg{!}, {,pc}", pat!(r(LDMDB), f(0xe9), ANY, ANY, ANY, ANY), 4, 2),
+                m(
+                    "ldm.w reg{!}, {,pc}",
+                    pat!(r(LDM_W), f(0xe8), ANY, ANY, ANY, ANY),
+                    4,
+                    2,
+                ),
+                m(
+                    "ldmdb reg{!}, {,pc}",
+                    pat!(r(LDMDB), f(0xe9), ANY, ANY, ANY, ANY),
+                    4,
+                    2,
+                ),
             ]
         }
     } else {
@@ -489,8 +686,14 @@ fn arm_jop(thumb: bool, be: bool) -> Vec<Anchor> {
         const BLX: &[(u8, u8)] = &[(0x30, 0x39), (0x3e, 0x3e)];
         const E8_E9: &[(u8, u8)] = &[(0xe8, 0xe9)];
         const LDM_MID: &[(u8, u8)] = &[
-            (0x10, 0x1e), (0x30, 0x3e), (0x50, 0x5e), (0x70, 0x7e), (0x90, 0x9e),
-            (0xb0, 0xbe), (0xd0, 0xde), (0xf0, 0xfe),
+            (0x10, 0x1e),
+            (0x30, 0x3e),
+            (0x50, 0x5e),
+            (0x70, 0x7e),
+            (0x90, 0x9e),
+            (0xb0, 0xbe),
+            (0xd0, 0xde),
+            (0xf0, 0xfe),
         ];
         const HI: &[(u8, u8)] = &[(0x80, 0xff)];
         if be {
@@ -520,9 +723,21 @@ fn arm_sys(thumb: bool, be: bool) -> Vec<Anchor> {
     } else {
         // svc{cond} imm24: condition nibble 0x0f..0xef in the top byte.
         const SVC: &[(u8, u8)] = &[
-            (0x0f, 0x0f), (0x1f, 0x1f), (0x2f, 0x2f), (0x3f, 0x3f), (0x4f, 0x4f),
-            (0x5f, 0x5f), (0x6f, 0x6f), (0x7f, 0x7f), (0x8f, 0x8f), (0x9f, 0x9f),
-            (0xaf, 0xaf), (0xbf, 0xbf), (0xcf, 0xcf), (0xdf, 0xdf), (0xef, 0xef),
+            (0x0f, 0x0f),
+            (0x1f, 0x1f),
+            (0x2f, 0x2f),
+            (0x3f, 0x3f),
+            (0x4f, 0x4f),
+            (0x5f, 0x5f),
+            (0x6f, 0x6f),
+            (0x7f, 0x7f),
+            (0x8f, 0x8f),
+            (0x9f, 0x9f),
+            (0xaf, 0xaf),
+            (0xbf, 0xbf),
+            (0xcf, 0xcf),
+            (0xdf, 0xdf),
+            (0xef, 0xef),
         ];
         if be {
             vec![m("svc{cond} imm24", pat!(r(SVC), ANY, ANY, ANY), 4, 4)]
@@ -540,23 +755,73 @@ fn riscv_jop(be: bool) -> Vec<Anchor> {
     const A0_FF: &[(u8, u8)] = &[(0xa0, 0xff)];
     // c.j | c.beqz | c.bnez selector bytes (three tables in gadgets.py).
     const CJ1: &[(u8, u8)] = &[
-        (0xa1, 0xa1), (0xa5, 0xa5), (0xa9, 0xa9), (0xad, 0xad), (0xb1, 0xb1),
-        (0xb5, 0xb5), (0xb9, 0xb9), (0xbd, 0xbd), (0xc1, 0xc1), (0xc5, 0xc5),
-        (0xc9, 0xc9), (0xcd, 0xcd), (0xd1, 0xd1), (0xd5, 0xd5), (0xd9, 0xd9),
-        (0xdd, 0xdd), (0xe1, 0xe1), (0xe5, 0xe5), (0xe9, 0xe9), (0xed, 0xed),
-        (0xf1, 0xf1), (0xf5, 0xf5), (0xf9, 0xf9), (0xfd, 0xfd),
+        (0xa1, 0xa1),
+        (0xa5, 0xa5),
+        (0xa9, 0xa9),
+        (0xad, 0xad),
+        (0xb1, 0xb1),
+        (0xb5, 0xb5),
+        (0xb9, 0xb9),
+        (0xbd, 0xbd),
+        (0xc1, 0xc1),
+        (0xc5, 0xc5),
+        (0xc9, 0xc9),
+        (0xcd, 0xcd),
+        (0xd1, 0xd1),
+        (0xd5, 0xd5),
+        (0xd9, 0xd9),
+        (0xdd, 0xdd),
+        (0xe1, 0xe1),
+        (0xe5, 0xe5),
+        (0xe9, 0xe9),
+        (0xed, 0xed),
+        (0xf1, 0xf1),
+        (0xf5, 0xf5),
+        (0xf9, 0xf9),
+        (0xfd, 0xfd),
     ];
     const CJ2: &[(u8, u8)] = &[
-        (0x01, 0x01), (0x05, 0x05), (0x09, 0x09), (0x0d, 0x0d), (0x11, 0x11),
-        (0x15, 0x15), (0x19, 0x19), (0x1d, 0x1d), (0x21, 0x21), (0x25, 0x25),
-        (0x29, 0x29), (0x2d, 0x2d), (0x31, 0x31), (0x35, 0x35), (0x39, 0x39),
-        (0x3d, 0x3d), (0x41, 0x41), (0x45, 0x45), (0x49, 0x49), (0x4d, 0x4d),
-        (0x51, 0x51), (0x55, 0x55), (0x59, 0x59), (0x5d, 0x5d),
+        (0x01, 0x01),
+        (0x05, 0x05),
+        (0x09, 0x09),
+        (0x0d, 0x0d),
+        (0x11, 0x11),
+        (0x15, 0x15),
+        (0x19, 0x19),
+        (0x1d, 0x1d),
+        (0x21, 0x21),
+        (0x25, 0x25),
+        (0x29, 0x29),
+        (0x2d, 0x2d),
+        (0x31, 0x31),
+        (0x35, 0x35),
+        (0x39, 0x39),
+        (0x3d, 0x3d),
+        (0x41, 0x41),
+        (0x45, 0x45),
+        (0x49, 0x49),
+        (0x4d, 0x4d),
+        (0x51, 0x51),
+        (0x55, 0x55),
+        (0x59, 0x59),
+        (0x5d, 0x5d),
     ];
     const CJ3: &[(u8, u8)] = &[
-        (0x61, 0x61), (0x65, 0x65), (0x69, 0x69), (0x6d, 0x6d), (0x71, 0x71),
-        (0x75, 0x75), (0x79, 0x79), (0x7d, 0x7d), (0x81, 0x81), (0x85, 0x85),
-        (0x89, 0x89), (0x8d, 0x8d), (0x91, 0x91), (0x95, 0x95), (0x99, 0x99),
+        (0x61, 0x61),
+        (0x65, 0x65),
+        (0x69, 0x69),
+        (0x6d, 0x6d),
+        (0x71, 0x71),
+        (0x75, 0x75),
+        (0x79, 0x79),
+        (0x7d, 0x7d),
+        (0x81, 0x81),
+        (0x85, 0x85),
+        (0x89, 0x89),
+        (0x8d, 0x8d),
+        (0x91, 0x91),
+        (0x95, 0x95),
+        (0x99, 0x99),
         (0x9d, 0x9d),
     ];
     const CJR_RD: &[(u8, u8)] = &[(0x02, 0x02), (0x82, 0x82)];
