@@ -1,5 +1,66 @@
 [
   {
+    "description": "Build a ROP chain. target must be \"linux-execve\" (ELF x86/x64 only, ported from ROPgadget's ropmaker: x86 int 0x80 / x64 syscall, \"/bin//sh\" written to a writable section). Returns the chain IR as JSON (words with kinds gadget / immediate / data / padding plus the referenced gadget table), the equivalent python exploit script, arch, description and word_count. Fails with a structured chain_error when the binary lacks the required gadgets. Chain builds bypass the gadget cache.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "badbytes": {
+          "description": "Reject chain words whose packed value contains these bytes\n(e.g. \"0a|0d\" or \"00-1f\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base": {
+          "description": "Rebase the image base at load time (hex string, e.g. \"0x400000\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "binary_path": {
+          "description": "Path to the binary; must be inside an allowed directory.",
+          "type": "string"
+        },
+        "depth": {
+          "description": "Search depth (default 10).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Offset added to gadget and data-section addresses (hex string).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target": {
+          "description": "Chain target; only \"linux-execve\" is supported (ELF x86/x64).",
+          "type": "string"
+        },
+        "timeout_secs": {
+          "description": "Per-request timeout in seconds (default 60, max 300).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "binary_path",
+        "target"
+      ],
+      "type": "object"
+    },
+    "name": "build_rop_chain"
+  },
+  {
     "description": "Find ROP gadgets in a binary (ret-terminated). Returns up to max_results gadgets (default 1000) plus total_count and a truncated flag. The binary path must be inside an allowed directory (server cwd by default).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",

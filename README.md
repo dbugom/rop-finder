@@ -16,7 +16,8 @@ crates/
   rf-scan/      # anchor tables, per-start decode cache, filters, dedup,
                 # iced-x86 (x86/x64) + capstone-rs (all other arches), rayon
   rf-classify/  # (Phase 5) semantic classification of gadgets
-  rf-chain/     # (Phase 4) ROP chain builders
+  rf-chain/     # Chain IR + Linux execve chain builders (x86 int 0x80,
+                # x64 syscall), ported from ROPgadget's ropmaker
   rf-cli/       # `rop-finder` command line tool (clap) + shared scan
                 # orchestration library (ScanRequest → scan_bytes/info_bytes)
   rf-mcp/       # `rop-finder-mcp` MCP server (rmcp SDK, stdio only)
@@ -33,7 +34,8 @@ tests/
 | **1. Engine** | All ROPgadget arches (capstone-rs), PE/Mach-O/Universal/Raw loaders, rayon parallelism | **done** (trie index, fuzz corpus pending) |
 | 2. Features | `--section`, `--base` hardening, `--info` structured binary info | **done** |
 | 3. MCP server | `rf-mcp` stdio tools | **done** |
-| 4a/4b. Chains | Chain IR, Linux execve chains, Windows VirtualProtect chains | planned |
+| 4a. Chains | Chain IR, Linux execve chains (x86 int 0x80, x64 syscall) | **done** |
+| 4b. Chains | Windows VirtualProtect chains | planned |
 | 5. Differentiators | Semantic classification + ranking, chain DSL, dispatcher analysis | planned |
 
 ## Building
@@ -56,6 +58,7 @@ rop-finder --binary tests/fixtures/raw-x86.raw --rawArch=x86 --rawMode=32
 rop-finder --binary tests/fixtures/elf-ARMv7-ls --thumb
 rop-finder --binary ./ntoskrnl.exe --section .text --base 0   # ring0: RVAs, .text only
 rop-finder --binary ./prog --info                           # metadata JSON, no scan
+rop-finder --binary tests/fixtures/elf-Linux-x64 --ropchain # execve("/bin/sh") chain script
 ```
 
 Formats are detected by magic bytes (ELF, PE, Mach-O, Universal/fat Mach-O);
@@ -134,6 +137,46 @@ Universal binaries emit `{"format": "universal", "slices": [<per-slice macho
 info>, ...]}`. Addresses are hex strings (consistent with gadget vaddrs),
 sizes are numbers.
 
+## ROP chain generation (Phase 4a)
+
+`--ropchain` builds a Linux `execve("/bin/sh", 0, 0)` chain — x86 via
+`int 0x80`, x64 via `syscall` — ported faithfully from ROPgadget's
+`ropmakerx86.py` / `ropmakerx64.py` (same gadget search order, same
+write-what-where backtracking, same tab-indented padding rendering):
+
+```sh
+rop-finder --binary tests/fixtures/elf-Linux-x64 --ropchain          # python script
+rop-finder --binary tests/fixtures/elf-Linux-x64 --ropchain --json   # chain IR as JSON
+```
+
+Only ELF x86/x64 are supported (matching ROPgadget's `ropmaker.py`
+dispatch); anything else exits 1 with a "not supported yet for the rop
+chain generation" usage error. `--depth`, `--badbytes`, `--base`,
+`--offset` and `--section` all apply to the underlying scan; `--badbytes`
+additionally rejects chain words (data-section addresses included) whose
+packed bytes contain a banned byte.
+
+The chain is first built as a target-independent IR (`rf-chain` crate):
+a `RopChain` is a word list where each word is tagged `gadget` /
+`immediate` / `data` / `padding`, plus a table of the referenced gadgets
+with their disassembly. `RopChain::validate` checks the build-time
+invariants (every gadget word exists in the scan output; every non-gadget
+word is badbyte-free), and `validate_with` accepts per-target invariant
+hooks — the Phase 4b extension point. Two renderers emit the IR:
+`to_python()` (ROPgadget-compatible exploit script) and `to_json()`.
+
+Unlike ROPgadget, which prints gadget dumps and step logs around the
+script, `--ropchain` prints only the script (or the IR with `--json`),
+and "can't find a suitable gadget" situations are structured errors
+rather than best-effort output.
+
+Parity vs `ROPgadget.py --ropchain` across the eight x86/x64 ELF fixtures
+(`python tests/chain_parity.py`): 2 byte-identical scripts
+(elf-Linux-x86, elf-Linux-x86-NDH-chall), 2 payload-identical
+(elf-Linux-x64, Linux_lib64.so — every `pack()` word identical, only the
+iced-vs-capstone comment text differs: `add rax, 0x1` vs `add rax, 1`),
+and 4 where both tools fail to find the required gadgets (error parity).
+
 ## MCP server
 
 `rop-finder-mcp` (crate `rf-mcp`) exposes the engine to AI agent hosts over
@@ -152,7 +195,7 @@ scraping.
 
 ### Tools
 
-All six tools return structured JSON (`structuredContent` + text content);
+All seven tools return structured JSON (`structuredContent` + text content);
 errors are `{error: {code, message}}` with the MCP `isError` flag.
 
 | Tool | Purpose |
@@ -163,6 +206,13 @@ errors are `{error: {code, message}}` with the MCP `isError` flag.
 | `get_binary_info` | The `--info` payload (format/arch/sections/imports), no scan |
 | `search_gadgets_by_pattern` | Regex over gadget text (invalid regex → literal substring), full scan |
 | `run_ropgadget_command` | Flag passthrough, restricted to the allowlist below |
+| `build_rop_chain` | Linux execve ROP chain (`target: "linux-execve"`, ELF x86/x64); returns the chain IR, the python script, arch and word_count |
+
+`build_rop_chain` takes `{"binary_path": ..., "target": "linux-execve",
+"depth"?, "base"?, "offset"?, "badbytes"?, "timeout_secs"?}`. It shares the
+CLI's `chain_bytes` pipeline (no stdout scraping), confined to the same
+directory allowlist; missing gadgets surface as a `chain_error`, and an
+unknown `target` is a `usage_error`. Chain builds bypass the gadget cache.
 
 Example JSON-RPC exchange (newline-delimited over stdio):
 
@@ -212,6 +262,7 @@ The server would otherwise be a local arbitrary-file-read primitive, so:
 ```sh
 python tests/parity.py            # uses debug binary
 python tests/parity.py --release  # uses release binary + timing comparison
+python tests/chain_parity.py      # --ropchain parity (ELF x86/x64 fixtures)
 ```
 
 Compares post-dedup `(vaddr, bytes)` gadget sets against
@@ -271,3 +322,19 @@ MIPS/PPC/SPARC/RISC-V/Universal/raw/Mach-O-PPC/x64.
 - `--filter`: ROPgadget anchors the regex with `re.match("(…)$")`, i.e.
   effectively full-mnemonic equality; Phase 0 uses suffix matching on `|`
   parts (close enough for the flag's purpose; not used by the parity harness).
+- `--ropchain` (Phase 4a) intentional deviations from ropmaker:
+  - the write-what-where register regex in `ropmakerx64.py:29` /
+    `ropmakerx86.py:29` is a buggy Python char class (`[a-z]`-style ranges
+    that also match `;`, `0`…); we implement the *intended* register sets
+    (REGS64/REGS32) with explicit operand parsing and the same backtracking.
+  - `ropmakerx64.py:79` hardcodes `.data`; we fall back to the first
+    writable non-executable section when no section is named `.data`
+    (mirrors how ROPgadget's `getDataSections` already treats every
+    non-exec section as a candidate).
+  - iced-x86 renders single-digit immediates as hex (`add rax, 0x1`) where
+    capstone prints decimal (`add rax, 1`); the builder matches both forms
+    (the comment text in the generated script keeps our iced rendering —
+    payloads are byte-identical).
+  - the CLI prints only the python script (not ROPgadget's surrounding
+    gadget dump and step logs), and missing gadgets are a structured
+    `chain_error` instead of print-and-return.

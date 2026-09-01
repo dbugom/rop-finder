@@ -95,6 +95,12 @@ pub struct Cli {
     #[arg(long)]
     pub info: bool,
 
+    /// Generate a Linux execve ROP chain (ELF x86/x64 only); default output
+    /// is the ROPgadget-compatible Python exploit script, with --json the
+    /// JSON Chain IR
+    #[arg(long)]
+    pub ropchain: bool,
+
     /// Scan only the named executable section(s); repeatable and
     /// comma-separated, `*` globbing allowed (e.g. --section .text or
     /// --section ".init*,.plt")
@@ -603,12 +609,15 @@ pub enum ScanError {
     Usage(String),
     /// Malformed/unsupported binary or scan-time failure.
     Binary(String),
+    /// Chain generation failure (unsupported target, missing gadgets,
+    /// violated IR invariant). Maps to CLI exit 1.
+    Chain(String),
 }
 
 impl fmt::Display for ScanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ScanError::Usage(m) | ScanError::Binary(m) => f.write_str(m),
+            ScanError::Usage(m) | ScanError::Binary(m) | ScanError::Chain(m) => f.write_str(m),
         }
     }
 }
@@ -820,6 +829,112 @@ pub fn info_bytes(
     Ok(info_json(&target, new_base))
 }
 
+// ---------------------------------------------------------------------------
+// --ropchain (Phase 4a, PLAN.md §6.2): Linux execve chain generation.
+// ---------------------------------------------------------------------------
+
+/// Format name for chain dispatch / errors.
+pub fn target_format(target: &Target) -> &'static str {
+    match target {
+        Target::Elf(_) => "elf",
+        Target::Pe(_) => "pe",
+        Target::MachO(_) => "macho",
+        Target::Universal(_) => "universal",
+        Target::Raw(_) => "raw",
+    }
+}
+
+/// A generated chain plus the scan it was built from.
+pub struct ChainOutcome {
+    pub chain: rf_chain::RopChain,
+    pub outcome: ScanOutcome,
+}
+
+fn chain_err(e: rf_chain::ChainError) -> ScanError {
+    match e {
+        rf_chain::ChainError::Unsupported { .. } => ScanError::Usage(e.to_string()),
+        other => ScanError::Chain(other.to_string()),
+    }
+}
+
+/// `--ropchain` pipeline: options → load → dispatch (ELF x86/x64 only,
+/// mirroring ropmaker.py:23-40) → rebase → scan → chain build.
+pub fn chain_bytes(
+    bytes: &[u8],
+    raw: Option<RawSpec>,
+    req: &ScanRequest,
+) -> Result<ChainOutcome, ScanError> {
+    let opts = request_options(req, raw)?;
+    let mut target = load_target(bytes, raw)?;
+
+    let format = target_format(&target);
+    let arch = match &target {
+        Target::Elf(b) => Image::arch(b),
+        t => Image::arch(&build_view(t)), // non-ELF: only used for the error
+    };
+    if !matches!(&target, Target::Elf(_)) || !matches!(arch, Arch::X86 | Arch::X64) {
+        return Err(chain_err(rf_chain::ChainError::Unsupported {
+            arch: rf_chain::arch_name(arch),
+            format: format.to_string(),
+        }));
+    }
+
+    // Rebase the TARGET (not just the view) so the writable sections used
+    // for the .data string write carry the rebased vaddrs too.
+    let base = req
+        .base
+        .as_deref()
+        .map(|b| parse_hex(b, "--base"))
+        .transpose()
+        .map_err(ScanError::Usage)?;
+    if let Target::Elf(b) = &mut target {
+        if let Some(base) = base {
+            b.rebase(base);
+        }
+    }
+
+    let prepared = prepare_view(&target, None, &req.section)?;
+    let universal_arch = prepared.view.universal.then_some(prepared.view.arch());
+    let gadgets = rf_scan::scan_binary(&prepared.view, &opts)
+        .map_err(|e| ScanError::Binary(e.to_string()))?;
+
+    // ROPgadget's getDataSections (elf.py:323-334): non-executable
+    // sections; .data is picked by name inside the builder.
+    let Target::Elf(elf) = &target else {
+        unreachable!("dispatched above")
+    };
+    let data_sections: Vec<rf_chain::DataSection> = elf
+        .sections()
+        .iter()
+        .filter(|s| !s.executable)
+        .map(|s| rf_chain::DataSection {
+            name: s.name.clone(),
+            // + opts.offset mirrors ropmaker's liboffset (the --offset
+            // emission-time slide applies to .data too).
+            vaddr: s.vaddr.wrapping_add(opts.offset),
+            writable: s.writable,
+        })
+        .collect();
+
+    let chain =
+        rf_chain::build_linux_execve(&gadgets, &data_sections, arch, format, &opts.badbytes)
+            .map_err(chain_err)?;
+
+    Ok(ChainOutcome {
+        chain,
+        outcome: ScanOutcome {
+            result: ScanResult {
+                gadgets,
+                addr_size: prepared.view.addr_size(),
+                universal_arch,
+                selected_sections: prepared.selected_sections,
+            },
+            opts,
+            fallback_names: prepared.fallback_names,
+        },
+    })
+}
+
 fn run(cli: Cli) -> Result<i32, String> {
     // Error precedence mirrors the pre-refactor CLI exactly: depth → file
     // read → raw spec → option parsing → binary load → (--info | --base →
@@ -849,7 +964,7 @@ fn run(cli: Cli) -> Result<i32, String> {
     let opts = match request_options(&req, raw) {
         Ok(o) => o,
         Err(ScanError::Usage(e)) => return Err(e),
-        Err(ScanError::Binary(e)) => return Err(e), // unreachable
+        Err(ScanError::Binary(e) | ScanError::Chain(e)) => return Err(e), // unreachable
     };
     let target = match load_target(&bytes, raw) {
         Ok(t) => t,
@@ -857,7 +972,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             eprintln!("[Error] {e}");
             return Ok(2);
         }
-        Err(ScanError::Usage(e)) => return Err(e), // unreachable
+        Err(ScanError::Usage(e) | ScanError::Chain(e)) => return Err(e), // unreachable
     };
 
     // --info: metadata only, no scanning. --base is honoured.
@@ -874,6 +989,34 @@ fn run(cli: Cli) -> Result<i32, String> {
         return Ok(0);
     }
 
+    // --ropchain: Linux execve chain (ELF x86/x64 only). Unlike ROPgadget,
+    // which dumps the gadget list and step logs first, we print only the
+    // exploit script (or the JSON Chain IR with --json).
+    if cli.ropchain {
+        let outcome = match chain_bytes(&bytes, raw, &req) {
+            Ok(o) => o,
+            Err(ScanError::Usage(e)) | Err(ScanError::Chain(e)) => return Err(e),
+            Err(ScanError::Binary(e)) => {
+                eprintln!("[Error] {e}");
+                return Ok(2);
+            }
+        };
+        if outcome.outcome.fallback_names {
+            eprintln!(
+                "[Warning] binary has no section names (stripped ELF?);                  executable segments are named PT_LOAD#n"
+            );
+        }
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&outcome.chain.to_json()).unwrap()
+            );
+        } else {
+            print!("{}", outcome.chain.to_python());
+        }
+        return Ok(0);
+    }
+
     let base = cli
         .base
         .as_deref()
@@ -882,7 +1025,7 @@ fn run(cli: Cli) -> Result<i32, String> {
     let prepared = match prepare_view(&target, base, &cli.section) {
         Ok(v) => v,
         Err(ScanError::Usage(e)) => return Err(e),
-        Err(ScanError::Binary(e)) => return Err(e), // unreachable
+        Err(ScanError::Binary(e) | ScanError::Chain(e)) => return Err(e), // unreachable
     };
     let view = prepared.view;
     if prepared.fallback_names {
@@ -1009,6 +1152,7 @@ mod tests {
             offset: None,
             base: None,
             info: false,
+            ropchain: false,
             section: Vec::new(),
             thumb,
             raw_arch: raw_arch.map(Into::into),
@@ -1505,5 +1649,141 @@ mod tests {
         assert_eq!(info["format"], "raw");
         assert_eq!(info["arch"], "x86");
         assert_eq!(info["image_base"], "0x0");
+    }
+
+    // -- --ropchain (Phase 4a) ------------------------------------------------
+
+    fn chain_fixture(fixture: &str) -> ChainOutcome {
+        match chain_bytes(&fixture_bytes(fixture), None, &ScanRequest::default()) {
+            Ok(o) => o,
+            Err(e) => panic!("chain build failed for {fixture}: {e}"),
+        }
+    }
+
+    /// vaddr universe for `RopChain::validate`: the scan's gadget vaddrs.
+    fn scan_universe(out: &ChainOutcome) -> std::collections::HashSet<u64> {
+        out.outcome
+            .result
+            .gadgets
+            .iter()
+            .map(|g| g.vaddr.wrapping_add(out.outcome.opts.offset))
+            .collect()
+    }
+
+    #[test]
+    fn chain_builds_on_linux_x64() {
+        let out = chain_fixture("elf-Linux-x64");
+        let chain = &out.chain;
+        assert_eq!(chain.arch, "x64");
+        assert_eq!(chain.word_size, 8);
+        chain.validate(&scan_universe(&out), &[]).unwrap();
+        // Renderers: python script has the ropmaker header; every word
+        // except string immediates renders as a pack line (padding is
+        // tab-indented); JSON exposes the full IR.
+        let py = chain.to_python();
+        assert!(py.starts_with("#!/usr/bin/env python3\n# execve generated by ROPgadget\n"));
+        assert!(py.contains("p += b'/bin//sh'"));
+        assert_eq!(
+            py.matches("p += pack('<Q',").count(),
+            chain
+                .words
+                .iter()
+                .filter(|w| w.kind != rf_chain::WordKind::Immediate)
+                .count()
+        );
+        let json = chain.to_json();
+        assert_eq!(json["arch"], "x64");
+        assert_eq!(json["words"].as_array().unwrap().len(), chain.words.len());
+    }
+
+    #[test]
+    fn chain_builds_on_linux_x86() {
+        let out = chain_fixture("elf-Linux-x86");
+        let chain = &out.chain;
+        assert_eq!(chain.arch, "x86");
+        assert_eq!(chain.word_size, 4);
+        chain.validate(&scan_universe(&out), &[]).unwrap();
+        assert!(chain.to_python().contains("pack('<I',"));
+    }
+
+    #[test]
+    fn chain_gadget_addrs_come_from_scan() {
+        // Property test: every GadgetAddr word references a vaddr the scan
+        // actually produced, and the chain's gadget table agrees.
+        let out = chain_fixture("elf-Linux-x64");
+        let universe = scan_universe(&out);
+        for w in &out.chain.words {
+            if w.kind == rf_chain::WordKind::GadgetAddr {
+                let g = &out.chain.gadgets[w.source_gadget.unwrap()];
+                assert_eq!(g.vaddr, w.value);
+                assert!(
+                    universe.contains(&w.value),
+                    "chain gadget {:#x} not in scan output",
+                    w.value
+                );
+            }
+        }
+        // The execve chain must end in a syscall gadget.
+        let last = out.chain.gadgets.last().unwrap();
+        assert!(last.text.contains("syscall"));
+    }
+
+    #[test]
+    fn chain_rejects_unsupported_targets() {
+        // PE x64 → Usage error ("not supported"), mirroring ropmaker.py's
+        // dispatch which only knows ELF x86/x64.
+        let err = match chain_bytes(
+            &fixture_bytes("pe-x64-cmd-v6.1.7601"),
+            None,
+            &ScanRequest::default(),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("PE chain build unexpectedly succeeded"),
+        };
+        match err {
+            ScanError::Usage(m) => assert!(m.contains("not supported"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+        // ELF but wrong arch (ARM64) → same structured refusal.
+        let err = match chain_bytes(
+            &fixture_bytes("elf-ARM64-bash"),
+            None,
+            &ScanRequest::default(),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("ARM64 chain build unexpectedly succeeded"),
+        };
+        assert!(matches!(err, ScanError::Usage(_)));
+    }
+
+    #[test]
+    fn chain_missing_gadgets_is_structured_error() {
+        // elf-x64-bash lacks a "mov qword ptr [r64], r64" gadget — ROPgadget
+        // prints "Can't find ..." and gives up; we return ScanError::Chain.
+        let err = match chain_bytes(
+            &fixture_bytes("elf-x64-bash-v4.1.5.1"),
+            None,
+            &ScanRequest::default(),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("bash chain build unexpectedly succeeded"),
+        };
+        match err {
+            ScanError::Chain(m) => assert!(m.contains("mov qword ptr"), "{m}"),
+            other => panic!("expected Chain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chain_honours_badbytes() {
+        // elf-Linux-x64's image base is 0x400000; banning 0x40 must make
+        // the build fail (every gadget address contains it), proving the
+        // badbytes constraint reaches the chain builder.
+        let req = ScanRequest {
+            badbytes: Some("40".into()),
+            ..ScanRequest::default()
+        };
+        let res = chain_bytes(&fixture_bytes("elf-Linux-x64"), None, &req);
+        assert!(matches!(res, Err(ScanError::Chain(_))));
     }
 }

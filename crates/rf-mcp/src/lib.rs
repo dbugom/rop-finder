@@ -291,6 +291,25 @@ pub struct InfoQuery {
     pub base: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ChainQuery {
+    /// Path to the binary; must be inside an allowed directory.
+    pub binary_path: String,
+    /// Chain target; only "linux-execve" is supported (ELF x86/x64).
+    pub target: String,
+    /// Search depth (default 10).
+    pub depth: Option<usize>,
+    /// Rebase the image base at load time (hex string, e.g. "0x400000").
+    pub base: Option<String>,
+    /// Offset added to gadget and data-section addresses (hex string).
+    pub offset: Option<String>,
+    /// Reject chain words whose packed value contains these bytes
+    /// (e.g. "0a|0d" or "00-1f").
+    pub badbytes: Option<String>,
+    /// Per-request timeout in seconds (default 60, max 300).
+    pub timeout_secs: Option<u64>,
+}
+
 // ---------------------------------------------------------------------------
 // Request shaping helpers (unit-tested)
 // ---------------------------------------------------------------------------
@@ -581,12 +600,72 @@ impl RopFinderMcp {
             )),
         }
     }
+
+    /// Build a ROP chain with confinement + timeout. Unlike scans, chain
+    /// builds are not cache-backed (a chain is a single compact artifact,
+    /// and its inputs — the scan — would have to be re-validated anyway).
+    async fn run_chain(&self, q: ChainQuery) -> Result<Value, ToolError> {
+        if q.target != "linux-execve" {
+            return Err(ToolError::new(
+                "usage_error",
+                format!(
+                    "unknown chain target {:?}; only \"linux-execve\" is supported",
+                    q.target
+                ),
+            ));
+        }
+        let path = confine_path(&self.config.allow_dirs, &q.binary_path)?;
+        let timeout = clamp_timeout(q.timeout_secs, self.config.timeout);
+        let req = rf_cli::ScanRequest {
+            depth: q.depth.unwrap_or(10),
+            rop: true,
+            jop: true,
+            sys: true,
+            multibr: false,
+            only: None,
+            filter: None,
+            range: None,
+            badbytes: q.badbytes.clone(),
+            offset: q.offset.clone(),
+            base: q.base.clone(),
+            section: Vec::new(),
+            thumb: false,
+        };
+
+        let work = move || -> Result<Value, ToolError> {
+            let bytes = std::fs::read(&path)
+                .map_err(|e| ToolError::new("io_error", format!("cannot read {path:?}: {e}")))?;
+            let outcome = rf_cli::chain_bytes(&bytes, None, &req).map_err(scan_err_to_tool)?;
+            let chain = &outcome.chain;
+            Ok(json!({
+                "chain": chain.to_json(),
+                "python": chain.to_python(),
+                "arch": chain.arch,
+                "description": chain.description,
+                "word_count": chain.words.len(),
+                "binary_sha256": sha256_hex(&bytes),
+            }))
+        };
+
+        match tokio::time::timeout(timeout, tokio::task::spawn_blocking(work)).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(join_err)) => Err(ToolError::new(
+                "internal",
+                format!("chain worker failed: {join_err}"),
+            )),
+            Err(_) => Err(ToolError::new(
+                "timeout",
+                format!("chain build exceeded the {} s timeout", timeout.as_secs()),
+            )),
+        }
+    }
 }
 
 fn scan_err_to_tool(e: rf_cli::ScanError) -> ToolError {
     match e {
         rf_cli::ScanError::Usage(m) => ToolError::new("usage_error", m),
         rf_cli::ScanError::Binary(m) => ToolError::new("binary_error", m),
+        rf_cli::ScanError::Chain(m) => ToolError::new("chain_error", m),
     }
 }
 
@@ -752,6 +831,25 @@ impl RopFinderMcp {
         }
     }
 
+    /// Build a Linux execve("/bin/sh") ROP chain (ELF x86/x64 only).
+    #[tool(
+        description = "Build a ROP chain. target must be \"linux-execve\" (ELF x86/x64 only, \
+        ported from ROPgadget's ropmaker: x86 int 0x80 / x64 syscall, \"/bin//sh\" written \
+        to a writable section). Returns the chain IR as JSON (words with kinds gadget / \
+        immediate / data / padding plus the referenced gadget table), the equivalent python \
+        exploit script, arch, description and word_count. Fails with a structured chain_error \
+        when the binary lacks the required gadgets. Chain builds bypass the gadget cache."
+    )]
+    async fn build_rop_chain(
+        &self,
+        Parameters(q): Parameters<ChainQuery>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.run_chain(q).await {
+            Ok(v) => tool_ok(v),
+            Err(e) => tool_error(e),
+        }
+    }
+
     /// Flag passthrough restricted to the PLAN §6.1 allowlist.
     #[tool(
         description = "Run a ROPgadget-style scan with explicit flags. args is a list like \
@@ -788,7 +886,8 @@ impl RopFinderMcp {
 #[tool_handler(
     name = "rop-finder-mcp",
     version = "0.1.0",
-    instructions = "ROP/JOP/SYS gadget search via rop-finder. binary_path values are confined \
+    instructions = "ROP/JOP/SYS gadget search via rop-finder, plus Linux execve ROP chain \
+        generation (build_rop_chain, ELF x86/x64). binary_path values are confined \
         to allowed directories (server cwd by default, extend with --allow-dir). All tools \
         return structured JSON with gadgets sampled to max_results plus total_count/truncated; \
         errors are {error: {code, message}}."

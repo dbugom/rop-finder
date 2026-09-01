@@ -1,6 +1,13 @@
 [package]
 name = "rf-chain"
-description = "ROP chain builders (stub)"
+description = "ROP chain builders: Chain IR + Linux execve (x86/x64)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+rf-core = { path = "../rf-core" }
+rf-scan = { path = "../rf-scan" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

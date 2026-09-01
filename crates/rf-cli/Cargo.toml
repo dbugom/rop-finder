@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 rf-core = { path = "../rf-core" }
 rf-scan = { path = "../rf-scan" }
+rf-chain = { path = "../rf-chain" }
 clap.workspace = true
 globset = "0.4"
 serde.workspace = true
