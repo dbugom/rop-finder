@@ -1,0 +1,411 @@
+[
+  {
+    "description": "Find ROP gadgets in a binary (ret-terminated). Returns up to max_results gadgets (default 1000) plus total_count and a truncated flag. The binary path must be inside an allowed directory (server cwd by default).",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "badbytes": {
+          "description": "Reject gadgets whose final address contains these bytes\n(e.g. \"0a|0d\" or \"00-1f\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base": {
+          "description": "Rebase the image base at load time (hex string, e.g. \"0x400000\";\n\"0\" for RVA-style addresses).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "binary_path": {
+          "description": "Path to the binary; must be inside an allowed directory.",
+          "type": "string"
+        },
+        "depth": {
+          "description": "Search depth (default 10).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_results": {
+          "description": "Maximum gadgets returned (default 1000, hard max 50000).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Offset added to gadget addresses after any rebase (hex string).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "only": {
+          "description": "Keep only gadgets containing these instructions (e.g. \"pop|ret\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "range": {
+          "description": "Address range to scan, \"0xSTART-0xEND\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "section": {
+          "description": "Executable section name(s) to scan; comma-separated, `*` globbing\n(e.g. \".text\" or \".init*,.plt\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_secs": {
+          "description": "Per-request timeout in seconds (default 60, max 300).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "binary_path"
+      ],
+      "type": "object"
+    },
+    "name": "find_gadgets"
+  },
+  {
+    "description": "Find JOP gadgets in a binary (jmp/call-terminated). Same parameters and caps as find_gadgets.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "badbytes": {
+          "description": "Reject gadgets whose final address contains these bytes\n(e.g. \"0a|0d\" or \"00-1f\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base": {
+          "description": "Rebase the image base at load time (hex string, e.g. \"0x400000\";\n\"0\" for RVA-style addresses).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "binary_path": {
+          "description": "Path to the binary; must be inside an allowed directory.",
+          "type": "string"
+        },
+        "depth": {
+          "description": "Search depth (default 10).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_results": {
+          "description": "Maximum gadgets returned (default 1000, hard max 50000).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Offset added to gadget addresses after any rebase (hex string).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "only": {
+          "description": "Keep only gadgets containing these instructions (e.g. \"pop|ret\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "range": {
+          "description": "Address range to scan, \"0xSTART-0xEND\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "section": {
+          "description": "Executable section name(s) to scan; comma-separated, `*` globbing\n(e.g. \".text\" or \".init*,.plt\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_secs": {
+          "description": "Per-request timeout in seconds (default 60, max 300).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "binary_path"
+      ],
+      "type": "object"
+    },
+    "name": "find_jop_gadgets"
+  },
+  {
+    "description": "Find SYS gadgets in a binary (syscall/sysenter/int). Same parameters and caps as find_gadgets.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "badbytes": {
+          "description": "Reject gadgets whose final address contains these bytes\n(e.g. \"0a|0d\" or \"00-1f\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base": {
+          "description": "Rebase the image base at load time (hex string, e.g. \"0x400000\";\n\"0\" for RVA-style addresses).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "binary_path": {
+          "description": "Path to the binary; must be inside an allowed directory.",
+          "type": "string"
+        },
+        "depth": {
+          "description": "Search depth (default 10).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_results": {
+          "description": "Maximum gadgets returned (default 1000, hard max 50000).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Offset added to gadget addresses after any rebase (hex string).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "only": {
+          "description": "Keep only gadgets containing these instructions (e.g. \"pop|ret\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "range": {
+          "description": "Address range to scan, \"0xSTART-0xEND\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "section": {
+          "description": "Executable section name(s) to scan; comma-separated, `*` globbing\n(e.g. \".text\" or \".init*,.plt\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_secs": {
+          "description": "Per-request timeout in seconds (default 60, max 300).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "binary_path"
+      ],
+      "type": "object"
+    },
+    "name": "find_syscall_gadgets"
+  },
+  {
+    "description": "Get binary metadata as JSON: format, arch, endianness, addr_size, image_base, entry, sections (name/vaddr/size/executable/writable) and PE imports. No scan is performed.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "base": {
+          "description": "Rebase the image base before reporting addresses (hex string).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "binary_path": {
+          "description": "Path to the binary; must be inside an allowed directory.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "binary_path"
+      ],
+      "type": "object"
+    },
+    "name": "get_binary_info"
+  },
+  {
+    "description": "Run a ROPgadget-style scan with explicit flags. args is a list like [\"--depth\", \"6\", \"--only\", \"pop|ret\"]. Allowlist: --depth --norop --nojop --nosys --only --filter --re --range --section --base --offset --badbytes --align --multibr --json; anything else (--string, --dump, --console, ...) is rejected. Output is always structured JSON.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "args": {
+          "description": "ROPgadget-style flags, e.g. [\"--depth\", \"6\", \"--only\", \"pop|ret\"].\nRestricted to the allowlist: --depth --norop --nojop --nosys --only\n--filter --re --range --section --base --offset --badbytes --align\n--multibr --json. Anything else is rejected.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "binary_path": {
+          "description": "Path to the binary; must be inside an allowed directory.",
+          "type": "string"
+        },
+        "max_results": {
+          "description": "Maximum gadgets returned (default 1000, hard max 50000).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "timeout_secs": {
+          "description": "Per-request timeout in seconds (default 60, max 300).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "binary_path",
+        "args"
+      ],
+      "type": "object"
+    },
+    "name": "run_ropgadget_command"
+  },
+  {
+    "description": "Search gadgets by pattern: regex matched against gadget text (e.g. \"pop r.*; ret\"); invalid regexes fall back to literal substring match. Runs a full ROP+JOP+SYS scan, then filters. Same caps as find_gadgets.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "badbytes": {
+          "description": "Reject gadgets whose final address contains these bytes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base": {
+          "description": "Rebase the image base at load time (hex string).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "binary_path": {
+          "description": "Path to the binary; must be inside an allowed directory.",
+          "type": "string"
+        },
+        "depth": {
+          "description": "Search depth (default 10).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_results": {
+          "description": "Maximum gadgets returned (default 1000, hard max 50000).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Offset added to gadget addresses (hex string).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pattern": {
+          "description": "Regex matched against gadget text (e.g. \"pop r.*; ret\"); if the\npattern is not a valid regex it is matched as a literal substring.",
+          "type": "string"
+        },
+        "range": {
+          "description": "Address range to scan, \"0xSTART-0xEND\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "section": {
+          "description": "Executable section name(s); comma-separated, `*` globbing.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_secs": {
+          "description": "Per-request timeout in seconds (default 60, max 300).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "binary_path",
+        "pattern"
+      ],
+      "type": "object"
+    },
+    "name": "search_gadgets_by_pattern"
+  }
+]
