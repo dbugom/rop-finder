@@ -295,7 +295,8 @@ pub struct InfoQuery {
 pub struct ChainQuery {
     /// Path to the binary; must be inside an allowed directory.
     pub binary_path: String,
-    /// Chain target; only "linux-execve" is supported (ELF x86/x64).
+    /// Chain target: "linux-execve" (ELF x86/x64) or
+    /// "windows-virtualprotect" (PE x86/x64).
     pub target: String,
     /// Search depth (default 10).
     pub depth: Option<usize>,
@@ -306,6 +307,16 @@ pub struct ChainQuery {
     /// Reject chain words whose packed value contains these bytes
     /// (e.g. "0a|0d" or "00-1f").
     pub badbytes: Option<String>,
+    /// CFG/CET-aware scan: keep only endbr64/endbr32-entering gadgets.
+    pub cfg_aware: Option<bool>,
+    /// windows-virtualprotect: runtime address of the API (hex). Primary
+    /// resolution path; without it the PE must import the API (IAT).
+    pub api_addr: Option<String>,
+    /// windows-virtualprotect: runtime shellcode address (hex; default:
+    /// the binary's writable .data section).
+    pub shellcode_addr: Option<String>,
+    /// windows-virtualprotect: dwSize argument (hex; default 0x1000).
+    pub shellcode_size: Option<String>,
     /// Per-request timeout in seconds (default 60, max 300).
     pub timeout_secs: Option<u64>,
 }
@@ -461,6 +472,7 @@ fn query_to_request(q: &GadgetQuery, rop: bool, jop: bool, sys: bool) -> rf_cli:
         base: q.base.clone(),
         section: split_sections(q.section.as_deref()),
         thumb: false,
+        cfg_aware: false,
     }
 }
 
@@ -605,11 +617,11 @@ impl RopFinderMcp {
     /// builds are not cache-backed (a chain is a single compact artifact,
     /// and its inputs — the scan — would have to be re-validated anyway).
     async fn run_chain(&self, q: ChainQuery) -> Result<Value, ToolError> {
-        if q.target != "linux-execve" {
+        if !matches!(q.target.as_str(), "linux-execve" | "windows-virtualprotect") {
             return Err(ToolError::new(
                 "usage_error",
                 format!(
-                    "unknown chain target {:?}; only \"linux-execve\" is supported",
+                    "unknown chain target {:?}; supported: linux-execve, windows-virtualprotect",
                     q.target
                 ),
             ));
@@ -630,12 +642,20 @@ impl RopFinderMcp {
             base: q.base.clone(),
             section: Vec::new(),
             thumb: false,
+            cfg_aware: q.cfg_aware.unwrap_or(false),
+        };
+        let spec = rf_cli::ChainSpec {
+            target: q.target.clone(),
+            api_addr: q.api_addr.clone(),
+            shellcode_addr: q.shellcode_addr.clone(),
+            shellcode_size: q.shellcode_size.clone(),
         };
 
         let work = move || -> Result<Value, ToolError> {
             let bytes = std::fs::read(&path)
                 .map_err(|e| ToolError::new("io_error", format!("cannot read {path:?}: {e}")))?;
-            let outcome = rf_cli::chain_bytes(&bytes, None, &req).map_err(scan_err_to_tool)?;
+            let outcome =
+                rf_cli::chain_bytes(&bytes, None, &req, &spec).map_err(scan_err_to_tool)?;
             let chain = &outcome.chain;
             Ok(json!({
                 "chain": chain.to_json(),
@@ -814,6 +834,7 @@ impl RopFinderMcp {
             base: q.base.clone(),
             section: split_sections(q.section.as_deref()),
             thumb: false,
+            cfg_aware: false,
         };
         match self
             .run_scan(

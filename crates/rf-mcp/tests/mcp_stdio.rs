@@ -278,19 +278,22 @@ async fn mcp_stdio_end_to_end() {
     );
     assert!(body["description"].as_str().unwrap().contains("execve"));
 
-    // unsupported chain target → clean usage_error
-    let resp = mcp
-        .call_tool(
-            12,
-            "build_rop_chain",
-            json!({"binary_path": linux, "target": "windows-virtualprotect"}),
-        )
-        .await;
-    assert_eq!(resp["result"]["isError"], true);
-    assert_eq!(
-        resp["result"]["structuredContent"]["error"]["code"],
-        "usage_error"
-    );
+    // unknown chain target → clean usage_error; windows target on an ELF →
+    // also usage_error ("not supported" dispatch)
+    for (id, tgt) in [(12u64, "plan9-forkbomb"), (17, "windows-virtualprotect")] {
+        let resp = mcp
+            .call_tool(
+                id,
+                "build_rop_chain",
+                json!({"binary_path": linux, "target": tgt}),
+            )
+            .await;
+        assert_eq!(resp["result"]["isError"], true);
+        assert_eq!(
+            resp["result"]["structuredContent"]["error"]["code"], "usage_error",
+            "target {tgt}"
+        );
+    }
 
     // bash lacks the write-what-where gadget → structured chain_error
     let resp = mcp
@@ -304,6 +307,58 @@ async fn mcp_stdio_end_to_end() {
     let err = &resp["result"]["structuredContent"]["error"];
     assert_eq!(err["code"], "chain_error");
     assert!(err["message"].as_str().unwrap().contains("mov qword ptr"));
+
+    // windows-virtualprotect: pe-x86-cmd stdcall chain via api_addr
+    let pe86 = fixtures_dir().join("pe-x86-cmd-v6.1.7600");
+    let resp = mcp
+        .call_tool(
+            14,
+            "build_rop_chain",
+            json!({"binary_path": pe86, "target": "windows-virtualprotect",
+                   "api_addr": "0x7fff12340000"}),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], Value::Bool(false));
+    let body = structured(&resp);
+    assert_eq!(body["arch"], "x86");
+    assert_eq!(body["word_count"], 6);
+    let py = body["python"].as_str().unwrap();
+    assert!(py.contains("VirtualProtect @ 0x7fff12340000"));
+    assert!(py.contains("ret 0x10"));
+    let words = body["chain"]["words"].as_array().unwrap();
+    assert_eq!(words[0]["kind"], "code_addr");
+
+    // pe-x64-cmd cannot populate rdx/r8/r9 (spike finding) → chain_error
+    let resp = mcp
+        .call_tool(
+            15,
+            "build_rop_chain",
+            json!({"binary_path": pe, "target": "windows-virtualprotect",
+                   "api_addr": "0x7fff12340000"}),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], true);
+    let err = &resp["result"]["structuredContent"]["error"];
+    assert_eq!(err["code"], "chain_error");
+    assert!(err["message"]
+        .as_str()
+        .unwrap()
+        .contains("cannot populate rdx"));
+
+    // pe-x86-cmd without api_addr imports VirtualAlloc but not
+    // VirtualProtect → clean chain_error naming the resolution failure
+    let resp = mcp
+        .call_tool(
+            16,
+            "build_rop_chain",
+            json!({"binary_path": pe86, "target": "windows-virtualprotect"}),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], true);
+    assert_eq!(
+        resp["result"]["structuredContent"]["error"]["code"],
+        "chain_error"
+    );
 }
 
 #[tokio::test]

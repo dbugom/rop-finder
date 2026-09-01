@@ -35,7 +35,7 @@ tests/
 | 2. Features | `--section`, `--base` hardening, `--info` structured binary info | **done** |
 | 3. MCP server | `rf-mcp` stdio tools | **done** |
 | 4a. Chains | Chain IR, Linux execve chains (x86 int 0x80, x64 syscall) | **done** |
-| 4b. Chains | Windows VirtualProtect chains | planned |
+| 4b. Chains | Windows VirtualProtect chains (x64 register ABI + x86 stdcall), anchor/IAT API resolution, alignment invariant, `--cfg-aware` | **done** |
 | 5. Differentiators | Semantic classification + ranking, chain DSL, dispatcher analysis | planned |
 
 ## Building
@@ -59,6 +59,8 @@ rop-finder --binary tests/fixtures/elf-ARMv7-ls --thumb
 rop-finder --binary ./ntoskrnl.exe --section .text --base 0   # ring0: RVAs, .text only
 rop-finder --binary ./prog --info                           # metadata JSON, no scan
 rop-finder --binary tests/fixtures/elf-Linux-x64 --ropchain # execve("/bin/sh") chain script
+rop-finder --binary ./prog.exe --ropchain --chain windows-virtualprotect --api-addr 0x7fff12340000
+rop-finder --binary ./hardened.exe --cfg-aware               # endbr64-entering gadgets only
 ```
 
 Formats are detected by magic bytes (ELF, PE, Mach-O, Universal/fat Mach-O);
@@ -137,33 +139,77 @@ Universal binaries emit `{"format": "universal", "slices": [<per-slice macho
 info>, ...]}`. Addresses are hex strings (consistent with gadget vaddrs),
 sizes are numbers.
 
-## ROP chain generation (Phase 4a)
+## ROP chain generation (Phases 4a/4b)
 
-`--ropchain` builds a Linux `execve("/bin/sh", 0, 0)` chain — x86 via
-`int 0x80`, x64 via `syscall` — ported faithfully from ROPgadget's
-`ropmakerx86.py` / `ropmakerx64.py` (same gadget search order, same
-write-what-where backtracking, same tab-indented padding rendering):
+`--ropchain` builds a chain; `--chain <target>` selects the family
+(default `linux-execve`):
 
 ```sh
 rop-finder --binary tests/fixtures/elf-Linux-x64 --ropchain          # python script
 rop-finder --binary tests/fixtures/elf-Linux-x64 --ropchain --json   # chain IR as JSON
+rop-finder --binary tests/fixtures/pe-x86-cmd-v6.1.7600 --ropchain \
+    --chain windows-virtualprotect --api-addr 0x7fff12340000         # stdcall chain
 ```
 
-Only ELF x86/x64 are supported (matching ROPgadget's `ropmaker.py`
-dispatch); anything else exits 1 with a "not supported yet for the rop
-chain generation" usage error. `--depth`, `--badbytes`, `--base`,
-`--offset` and `--section` all apply to the underlying scan; `--badbytes`
-additionally rejects chain words (data-section addresses included) whose
-packed bytes contain a banned byte.
+### linux-execve (Phase 4a)
+
+A Linux `execve("/bin/sh", 0, 0)` chain — x86 via `int 0x80`, x64 via
+`syscall` — ported faithfully from ROPgadget's `ropmakerx86.py` /
+`ropmakerx64.py` (same gadget search order, same write-what-where
+backtracking, same tab-indented padding rendering). ELF x86/x64 only
+(matching ROPgadget's `ropmaker.py` dispatch); anything else exits 1 with
+a "not supported yet for the rop chain generation" usage error.
+`--depth`, `--badbytes`, `--base`, `--offset` and `--section` all apply
+to the underlying scan; `--badbytes` additionally rejects chain words
+(data-section addresses included) whose packed bytes contain a banned
+byte.
+
+### windows-virtualprotect (Phase 4b)
+
+A Windows `VirtualProtect(shellcode, size, PAGE_EXECUTE_READWRITE, &old)`
+chain for PE x86/x64, designed per PLAN sec. 6.2 after the mandatory
+gadget-inventory spike ([tests/spike-report.md](tests/spike-report.md),
+regenerate with `python tests/spike_inventory.py`):
+
+- **x64**: registers per the Win64 ABI — `rcx`=lpAddress, `rdx`=dwSize,
+  `r8`=0x40, `r9`=&old (a writable `.data` address); 32-byte shadow
+  space; the word after the API transfer is the return address
+  VirtualProtect's own `ret` consumes (second-stack frame → shellcode).
+  Arg population prefers `pop rX` gadgets and falls back to
+  `pop rax` + `mov rX, rax`; when neither exists the build fails with a
+  structured error naming the register and every strategy tried — the
+  spike shows this is the common case (cmd.exe x64 has NO ret-terminated
+  gadget writing rdx/r8/r9; ntoskrnl.exe has the full pop set and builds
+  end-to-end).
+- **x86 (stdcall)**: everything on the stack —
+  `[api][ret→shellcode][lpAddress][dwSize][0x40][&old]`; VirtualProtect's
+  `ret 0x10` continues into the shellcode. Needs no gadgets at all;
+  `--api-addr` is required.
+- **Stack-alignment invariant** (x64): the API transfer word must land at
+  an even word index (chain base assumed 16-aligned at the pivot), so
+  `rsp % 16 == 8` at API entry; the builder auto-inserts an alignment
+  padding word and a `validate_with` hook enforces it.
+- **API resolution order** (anchor-first): (a) `--api-addr <hex>`
+  explicit runtime address; (b) IAT dereference when the PE imports the
+  API (`pop rax ; @IAT ; mov rax, [rax] ; jmp rax`); (c) a structured
+  error explaining why both failed. The spike found cmd.exe imports
+  VirtualAlloc but NOT VirtualProtect — anchor-first is the primary path.
+- Parameters: `--api-addr`, `--shellcode-addr` (default: writable
+  `.data`), `--shellcode-size` (default 0x1000).
+- **`--cfg-aware`**: keeps only gadgets entering on `endbr64`/`endbr32`
+  (CET/IBT-valid targets). goblin does not expose the load-config CET
+  flag, so the filter applies whenever the flag is passed; the CLI warns
+  when a PE advertises GUARD_CF and the flag is absent.
 
 The chain is first built as a target-independent IR (`rf-chain` crate):
 a `RopChain` is a word list where each word is tagged `gadget` /
-`immediate` / `data` / `padding`, plus a table of the referenced gadgets
-with their disassembly. `RopChain::validate` checks the build-time
-invariants (every gadget word exists in the scan output; every non-gadget
-word is badbyte-free), and `validate_with` accepts per-target invariant
-hooks — the Phase 4b extension point. Two renderers emit the IR:
-`to_python()` (ROPgadget-compatible exploit script) and `to_json()`.
+`immediate` / `data` / `code` / `padding`, plus a table of the referenced
+gadgets with their disassembly. `RopChain::validate` checks the
+build-time invariants (every gadget word exists in the scan output; every
+non-gadget word is badbyte-free), and `validate_with` accepts per-target
+invariant hooks (the Win64 stack-alignment rule is implemented as one).
+Two renderers emit the IR: `to_python()` (exploit script) and
+`to_json()`.
 
 Unlike ROPgadget, which prints gadget dumps and step logs around the
 script, `--ropchain` prints only the script (or the IR with `--json`),
@@ -176,6 +222,8 @@ Parity vs `ROPgadget.py --ropchain` across the eight x86/x64 ELF fixtures
 (elf-Linux-x64, Linux_lib64.so — every `pack()` word identical, only the
 iced-vs-capstone comment text differs: `add rax, 0x1` vs `add rax, 1`),
 and 4 where both tools fail to find the required gadgets (error parity).
+Windows chains have no ROPgadget oracle; they are covered by unit and
+integration tests instead.
 
 ## MCP server
 
@@ -206,13 +254,15 @@ errors are `{error: {code, message}}` with the MCP `isError` flag.
 | `get_binary_info` | The `--info` payload (format/arch/sections/imports), no scan |
 | `search_gadgets_by_pattern` | Regex over gadget text (invalid regex → literal substring), full scan |
 | `run_ropgadget_command` | Flag passthrough, restricted to the allowlist below |
-| `build_rop_chain` | Linux execve ROP chain (`target: "linux-execve"`, ELF x86/x64); returns the chain IR, the python script, arch and word_count |
+| `build_rop_chain` | ROP chains: `target: "linux-execve"` (ELF x86/x64) or `"windows-virtualprotect"` (PE x86/x64, with `api_addr`/`shellcode_addr`/`shellcode_size`/`cfg_aware`); returns chain IR + python script |
 
-`build_rop_chain` takes `{"binary_path": ..., "target": "linux-execve",
-"depth"?, "base"?, "offset"?, "badbytes"?, "timeout_secs"?}`. It shares the
-CLI's `chain_bytes` pipeline (no stdout scraping), confined to the same
-directory allowlist; missing gadgets surface as a `chain_error`, and an
-unknown `target` is a `usage_error`. Chain builds bypass the gadget cache.
+`build_rop_chain` takes `{"binary_path": ..., "target": "linux-execve" |
+"windows-virtualprotect", "depth"?, "base"?, "offset"?, "badbytes"?,
+"cfg_aware"?, "api_addr"?, "shellcode_addr"?, "shellcode_size"?,
+"timeout_secs"?}`. It shares the CLI's `chain_bytes` pipeline (no stdout
+scraping), confined to the same directory allowlist; missing gadgets
+surface as a `chain_error`, and an unknown `target` is a `usage_error`.
+Chain builds bypass the gadget cache.
 
 Example JSON-RPC exchange (newline-delimited over stdio):
 
@@ -338,3 +388,21 @@ MIPS/PPC/SPARC/RISC-V/Universal/raw/Mach-O-PPC/x64.
   - the CLI prints only the python script (not ROPgadget's surrounding
     gadget dump and step logs), and missing gadgets are a structured
     `chain_error` instead of print-and-return.
+- `--chain windows-virtualprotect` (Phase 4b) design choices (no ROPgadget
+  oracle exists; per PLAN sec. 6.2):
+  - **anchor-first** API resolution (`--api-addr`) precedes IAT
+    dereference — the spike confirmed the IAT path is not the common case
+    (cmd.exe does not import VirtualProtect).
+  - the x86 IAT dereference path is not implemented; x86 requires
+    `--api-addr` and the error says so.
+  - `call rax`-family transfer gadgets are rejected for the IAT path
+    (`call` pushes a return address that would shadow the second-stack
+    frame); only `jmp rax` is used.
+  - export-table lookup (PLAN sec. 6.2 #3c) is not implemented: the spike
+    showed anchor-first + IAT cover the realistic cases.
+  - multi-call second-stack composition (VirtualAlloc + copy + execute) is
+    future work; the single-call frame (return-into-shellcode) is
+    implemented.
+  - the alignment model assumes a 16-aligned chain base at the pivot —
+    the standard exploit precondition; the invariant reasons about word
+    index parity, not absolute addresses.

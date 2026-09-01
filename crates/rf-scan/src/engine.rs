@@ -65,6 +65,13 @@ pub struct ScanOptions {
     /// scans such binaries in ARM mode unless --thumb is given
     /// (gadgets.py:331, 448).
     pub thumb: bool,
+    /// Phase 4b `--cfg-aware` (PLAN sec. 6.2 #6): keep only gadgets whose
+    /// entry is an `endbr64`/`endbr32` instruction (CET/IBT-valid indirect
+    /// branch targets). Applied unconditionally when set — goblin does not
+    /// expose the load-config CET flag, so callers decide (the CLI warns
+    /// when a PE's DLL characteristics advertise GUARD_CF and the flag is
+    /// absent). x86/x64 only; a no-op for other architectures.
+    pub cfg_aware: bool,
     /// Scan (region × anchor) work items with rayon. Output is identical
     /// either way; serial exists for tests and debugging.
     pub parallel: bool,
@@ -84,6 +91,7 @@ impl Default for ScanOptions {
             filter: Vec::new(),
             offset: 0,
             thumb: false,
+            cfg_aware: false,
             parallel: true,
         }
     }
@@ -258,6 +266,9 @@ pub fn post_process(mut all: Vec<Gadget>, opts: &ScanOptions, addr_size: usize) 
                 .any(|b| packed[..addr_size].contains(b))
         });
     }
+    if opts.cfg_aware {
+        keyed.retain(|(_, g)| is_endbr_entry(g));
+    }
 
     // Alphabetical sort by gadget text (rgutils.alphaSortgadgets).
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
@@ -266,6 +277,14 @@ pub fn post_process(mut all: Vec<Gadget>, opts: &ScanOptions, addr_size: usize) 
 
 fn first_token(s: &str) -> &str {
     s.split_whitespace().next().unwrap_or("")
+}
+
+/// `--cfg-aware`: the gadget's first bytes are `endbr64` (f3 0f 1e fa) or
+/// `endbr32` (f3 0f 1e fb). Bytes, not text, so non-x86 gadgets (whose
+/// bytes never match) are filtered out too — the flag is x86/x64-only by
+/// contract.
+fn is_endbr_entry(g: &Gadget) -> bool {
+    g.bytes.starts_with(&[0xf3, 0x0f, 0x1e, 0xfa]) || g.bytes.starts_with(&[0xf3, 0x0f, 0x1e, 0xfb])
 }
 
 /// ROPgadget `core.py:_sectionInRange`: truncate the section to the range
@@ -620,6 +639,27 @@ mod tests {
         // 64-bit packing checks all 8 LE bytes; 0x10 rejects both.
         o.badbytes = vec![0x10];
         assert!(post_process(all, &o, 8).is_empty());
+    }
+
+    #[test]
+    fn cfg_aware_keeps_only_endbr_entries() {
+        let all = vec![
+            gadget(
+                0x1000,
+                b"\xf3\x0f\x1e\xfa\x59\xc3",
+                &["endbr64", "pop rcx", "ret"],
+            ),
+            gadget(0x1010, b"\xf3\x0f\x1e\xfb\xc3", &["endbr32", "ret"]),
+            gadget(0x1020, b"\x59\xc3", &["pop rcx", "ret"]), // no endbr
+            gadget(0x1030, b"\xc3", &["ret"]),
+        ];
+        let mut o = opts();
+        o.cfg_aware = true;
+        let out = post_process(all.clone(), &o, 8);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|g| g.bytes.starts_with(&[0xf3, 0x0f, 0x1e])));
+        // off by default
+        assert_eq!(post_process(all, &opts(), 8).len(), 4);
     }
 
     #[test]

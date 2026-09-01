@@ -4,6 +4,13 @@
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "api_addr": {
+          "description": "windows-virtualprotect: runtime address of the API (hex). Primary\nresolution path; without it the PE must import the API (IAT).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "badbytes": {
           "description": "Reject chain words whose packed value contains these bytes\n(e.g. \"0a|0d\" or \"00-1f\").",
           "type": [
@@ -22,6 +29,13 @@
           "description": "Path to the binary; must be inside an allowed directory.",
           "type": "string"
         },
+        "cfg_aware": {
+          "description": "CFG/CET-aware scan: keep only endbr64/endbr32-entering gadgets.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "depth": {
           "description": "Search depth (default 10).",
           "format": "uint",
@@ -38,8 +52,22 @@
             "null"
           ]
         },
+        "shellcode_addr": {
+          "description": "windows-virtualprotect: runtime shellcode address (hex; default:\nthe binary's writable .data section).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "shellcode_size": {
+          "description": "windows-virtualprotect: dwSize argument (hex; default 0x1000).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "target": {
-          "description": "Chain target; only \"linux-execve\" is supported (ELF x86/x64).",
+          "description": "Chain target: \"linux-execve\" (ELF x86/x64) or\n\"windows-virtualprotect\" (PE x86/x64).",
           "type": "string"
         },
         "timeout_secs": {

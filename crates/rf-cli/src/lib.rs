@@ -95,11 +95,35 @@ pub struct Cli {
     #[arg(long)]
     pub info: bool,
 
-    /// Generate a Linux execve ROP chain (ELF x86/x64 only); default output
-    /// is the ROPgadget-compatible Python exploit script, with --json the
-    /// JSON Chain IR
+    /// Generate a ROP chain; default output is the Python exploit script,
+    /// with --json the JSON Chain IR. Target selection via --chain
     #[arg(long)]
     pub ropchain: bool,
+
+    /// Chain target for --ropchain: linux-execve (ELF x86/x64, default) or
+    /// windows-virtualprotect (PE x86/x64)
+    #[arg(long, default_value = "linux-execve")]
+    pub chain: String,
+
+    /// Runtime address of the target API for windows-virtualprotect (hex).
+    /// Primary resolution path; without it the PE must import the API
+    /// (IAT dereference)
+    #[arg(long)]
+    pub api_addr: Option<String>,
+
+    /// Runtime address the shellcode will occupy for windows-virtualprotect
+    /// (hex; default: the binary's writable .data section)
+    #[arg(long)]
+    pub shellcode_addr: Option<String>,
+
+    /// dwSize argument for windows-virtualprotect (hex; default 0x1000)
+    #[arg(long)]
+    pub shellcode_size: Option<String>,
+
+    /// CFG/CET-aware scan: keep only gadgets whose entry is an
+    /// endbr64/endbr32 instruction (x86/x64)
+    #[arg(long)]
+    pub cfg_aware: bool,
 
     /// Scan only the named executable section(s); repeatable and
     /// comma-separated, `*` globbing allowed (e.g. --section .text or
@@ -645,6 +669,9 @@ pub struct ScanRequest {
     pub base: Option<String>,
     pub section: Vec<String>,
     pub thumb: bool,
+    /// CFG/CET-aware scan (Phase 4b): keep only endbr64/endbr32-entering
+    /// gadgets.
+    pub cfg_aware: bool,
 }
 
 impl Default for ScanRequest {
@@ -663,6 +690,7 @@ impl Default for ScanRequest {
             base: None,
             section: Vec::new(),
             thumb: false,
+            cfg_aware: false,
         }
     }
 }
@@ -732,6 +760,7 @@ fn request_options(req: &ScanRequest, raw: Option<RawSpec>) -> Result<ScanOption
             None => 0,
         },
         thumb: req.thumb,
+        cfg_aware: req.cfg_aware,
         parallel: true,
     };
     if let Some((_, _, raw_thumb)) = raw {
@@ -830,7 +859,7 @@ pub fn info_bytes(
 }
 
 // ---------------------------------------------------------------------------
-// --ropchain (Phase 4a, PLAN.md §6.2): Linux execve chain generation.
+// --ropchain (Phases 4a/4b, PLAN.md sec. 6.2): chain generation.
 // ---------------------------------------------------------------------------
 
 /// Format name for chain dispatch / errors.
@@ -841,6 +870,27 @@ pub fn target_format(target: &Target) -> &'static str {
         Target::MachO(_) => "macho",
         Target::Universal(_) => "universal",
         Target::Raw(_) => "raw",
+    }
+}
+
+/// Chain target + Windows parameters (the CLI's `--chain`, `--api-addr`,
+/// `--shellcode-addr`, `--shellcode-size`; MCP passes the same).
+#[derive(Debug, Clone, Default)]
+pub struct ChainSpec {
+    /// "linux-execve" (default) or "windows-virtualprotect".
+    pub target: String,
+    pub api_addr: Option<String>,
+    pub shellcode_addr: Option<String>,
+    pub shellcode_size: Option<String>,
+}
+
+impl ChainSpec {
+    /// Default when `--ropchain` is given without `--chain`.
+    pub fn linux() -> Self {
+        ChainSpec {
+            target: "linux-execve".to_string(),
+            ..ChainSpec::default()
+        }
     }
 }
 
@@ -857,12 +907,40 @@ fn chain_err(e: rf_chain::ChainError) -> ScanError {
     }
 }
 
-/// `--ropchain` pipeline: options → load → dispatch (ELF x86/x64 only,
-/// mirroring ropmaker.py:23-40) → rebase → scan → chain build.
+/// Parse the Windows chain parameters (hex strings → WinChainOpts).
+fn win_opts(spec: &ChainSpec) -> Result<rf_chain::WinChainOpts, ScanError> {
+    let usage = |e: String| ScanError::Usage(e);
+    Ok(rf_chain::WinChainOpts {
+        api_addr: spec
+            .api_addr
+            .as_deref()
+            .map(|a| parse_hex(a, "--api-addr"))
+            .transpose()
+            .map_err(usage)?,
+        shellcode_addr: spec
+            .shellcode_addr
+            .as_deref()
+            .map(|a| parse_hex(a, "--shellcode-addr"))
+            .transpose()
+            .map_err(usage)?,
+        shellcode_size: match &spec.shellcode_size {
+            Some(s) => parse_hex(s, "--shellcode-size").map_err(usage)?,
+            None => rf_chain::windows::DEFAULT_SHELLCODE_SIZE,
+        },
+        ..rf_chain::WinChainOpts::default()
+    })
+}
+
+/// `--ropchain` pipeline: options → load → dispatch on `--chain` target →
+/// rebase → scan → chain build.
+///
+///   * `linux-execve` (default): ELF x86/x64, mirroring ropmaker.py:23-40.
+///   * `windows-virtualprotect`: PE x86/x64 (Phase 4b, PLAN sec. 6.2).
 pub fn chain_bytes(
     bytes: &[u8],
     raw: Option<RawSpec>,
     req: &ScanRequest,
+    spec: &ChainSpec,
 ) -> Result<ChainOutcome, ScanError> {
     let opts = request_options(req, raw)?;
     let mut target = load_target(bytes, raw)?;
@@ -870,26 +948,65 @@ pub fn chain_bytes(
     let format = target_format(&target);
     let arch = match &target {
         Target::Elf(b) => Image::arch(b),
-        t => Image::arch(&build_view(t)), // non-ELF: only used for the error
+        Target::Pe(b) => Image::arch(b),
+        t => Image::arch(&build_view(t)), // others: only used for the error
     };
-    if !matches!(&target, Target::Elf(_)) || !matches!(arch, Arch::X86 | Arch::X64) {
-        return Err(chain_err(rf_chain::ChainError::Unsupported {
-            arch: rf_chain::arch_name(arch),
-            format: format.to_string(),
-        }));
+
+    // Target dispatch: format gates the chain family.
+    match spec.target.as_str() {
+        "linux-execve" => {
+            if !matches!(&target, Target::Elf(_)) || !matches!(arch, Arch::X86 | Arch::X64) {
+                return Err(chain_err(rf_chain::ChainError::Unsupported {
+                    arch: rf_chain::arch_name(arch),
+                    format: format.to_string(),
+                }));
+            }
+        }
+        "windows-virtualprotect" => {
+            if !matches!(&target, Target::Pe(_)) || !matches!(arch, Arch::X86 | Arch::X64) {
+                return Err(chain_err(rf_chain::ChainError::Unsupported {
+                    arch: rf_chain::arch_name(arch),
+                    format: format.to_string(),
+                }));
+            }
+        }
+        other => {
+            return Err(ScanError::Usage(format!(
+                "unknown chain target {other:?}; supported: linux-execve, windows-virtualprotect"
+            )));
+        }
     }
 
     // Rebase the TARGET (not just the view) so the writable sections used
-    // for the .data string write carry the rebased vaddrs too.
+    // for the string write / lpflOldProtect carry the rebased vaddrs too.
     let base = req
         .base
         .as_deref()
         .map(|b| parse_hex(b, "--base"))
         .transpose()
         .map_err(ScanError::Usage)?;
-    if let Target::Elf(b) = &mut target {
-        if let Some(base) = base {
-            b.rebase(base);
+    match &mut target {
+        Target::Elf(b) => {
+            if let Some(base) = base {
+                b.rebase(base);
+            }
+        }
+        Target::Pe(b) => {
+            if let Some(base) = base {
+                b.rebase(base);
+            }
+        }
+        _ => {}
+    }
+
+    // CFG/CET guidance (PLAN sec. 6.2 #6): a GUARD_CF-marked PE scanned
+    // without --cfg-aware produces chains that are DOA under enforced IBT.
+    if let Target::Pe(b) = &target {
+        if b.guard_cf() && !req.cfg_aware {
+            eprintln!(
+                "[Warning] PE is GUARD_CF-marked (CFG/CET); generated chains may be blocked \
+                 under enforced IBT — consider --cfg-aware"
+            );
         }
     }
 
@@ -898,13 +1015,14 @@ pub fn chain_bytes(
     let gadgets = rf_scan::scan_binary(&prepared.view, &opts)
         .map_err(|e| ScanError::Binary(e.to_string()))?;
 
-    // ROPgadget's getDataSections (elf.py:323-334): non-executable
-    // sections; .data is picked by name inside the builder.
-    let Target::Elf(elf) = &target else {
-        unreachable!("dispatched above")
+    let sections: &[rf_core::Section] = match &target {
+        Target::Elf(b) => b.sections(),
+        Target::Pe(b) => b.sections(),
+        _ => unreachable!("dispatched above"),
     };
-    let data_sections: Vec<rf_chain::DataSection> = elf
-        .sections()
+    // ROPgadget's getDataSections (elf.py:323-334): non-executable
+    // sections; .data is picked by name inside the builders.
+    let data_sections: Vec<rf_chain::DataSection> = sections
         .iter()
         .filter(|s| !s.executable)
         .map(|s| rf_chain::DataSection {
@@ -916,9 +1034,28 @@ pub fn chain_bytes(
         })
         .collect();
 
-    let chain =
-        rf_chain::build_linux_execve(&gadgets, &data_sections, arch, format, &opts.badbytes)
-            .map_err(chain_err)?;
+    let chain = match spec.target.as_str() {
+        "linux-execve" => {
+            rf_chain::build_linux_execve(&gadgets, &data_sections, arch, format, &opts.badbytes)
+                .map_err(chain_err)?
+        }
+        "windows-virtualprotect" => {
+            let Target::Pe(pe) = &target else {
+                unreachable!("dispatched above")
+            };
+            rf_chain::build_windows_virtualprotect(
+                &gadgets,
+                &data_sections,
+                pe.imports(),
+                arch,
+                format,
+                &win_opts(spec)?,
+                &opts.badbytes,
+            )
+            .map_err(chain_err)?
+        }
+        _ => unreachable!("validated above"),
+    };
 
     Ok(ChainOutcome {
         chain,
@@ -960,6 +1097,7 @@ fn run(cli: Cli) -> Result<i32, String> {
         base: cli.base.clone(),
         section: cli.section.clone(),
         thumb: cli.thumb,
+        cfg_aware: cli.cfg_aware,
     };
     let opts = match request_options(&req, raw) {
         Ok(o) => o,
@@ -989,11 +1127,17 @@ fn run(cli: Cli) -> Result<i32, String> {
         return Ok(0);
     }
 
-    // --ropchain: Linux execve chain (ELF x86/x64 only). Unlike ROPgadget,
-    // which dumps the gadget list and step logs first, we print only the
-    // exploit script (or the JSON Chain IR with --json).
+    // --ropchain: chain generation (--chain selects the target). Unlike
+    // ROPgadget, which dumps the gadget list and step logs first, we print
+    // only the exploit script (or the JSON Chain IR with --json).
     if cli.ropchain {
-        let outcome = match chain_bytes(&bytes, raw, &req) {
+        let spec = ChainSpec {
+            target: cli.chain.clone(),
+            api_addr: cli.api_addr.clone(),
+            shellcode_addr: cli.shellcode_addr.clone(),
+            shellcode_size: cli.shellcode_size.clone(),
+        };
+        let outcome = match chain_bytes(&bytes, raw, &req, &spec) {
             Ok(o) => o,
             Err(ScanError::Usage(e)) | Err(ScanError::Chain(e)) => return Err(e),
             Err(ScanError::Binary(e)) => {
@@ -1153,6 +1297,11 @@ mod tests {
             base: None,
             info: false,
             ropchain: false,
+            chain: "linux-execve".into(),
+            api_addr: None,
+            shellcode_addr: None,
+            shellcode_size: None,
+            cfg_aware: false,
             section: Vec::new(),
             thumb,
             raw_arch: raw_arch.map(Into::into),
@@ -1193,6 +1342,7 @@ mod tests {
             filter: Vec::new(),
             offset: 0,
             thumb: false,
+            cfg_aware: false,
             parallel: true,
         }
     }
@@ -1654,7 +1804,12 @@ mod tests {
     // -- --ropchain (Phase 4a) ------------------------------------------------
 
     fn chain_fixture(fixture: &str) -> ChainOutcome {
-        match chain_bytes(&fixture_bytes(fixture), None, &ScanRequest::default()) {
+        match chain_bytes(
+            &fixture_bytes(fixture),
+            None,
+            &ScanRequest::default(),
+            &ChainSpec::linux(),
+        ) {
             Ok(o) => o,
             Err(e) => panic!("chain build failed for {fixture}: {e}"),
         }
@@ -1736,6 +1891,7 @@ mod tests {
             &fixture_bytes("pe-x64-cmd-v6.1.7601"),
             None,
             &ScanRequest::default(),
+            &ChainSpec::linux(),
         ) {
             Err(e) => e,
             Ok(_) => panic!("PE chain build unexpectedly succeeded"),
@@ -1749,6 +1905,7 @@ mod tests {
             &fixture_bytes("elf-ARM64-bash"),
             None,
             &ScanRequest::default(),
+            &ChainSpec::linux(),
         ) {
             Err(e) => e,
             Ok(_) => panic!("ARM64 chain build unexpectedly succeeded"),
@@ -1764,6 +1921,7 @@ mod tests {
             &fixture_bytes("elf-x64-bash-v4.1.5.1"),
             None,
             &ScanRequest::default(),
+            &ChainSpec::linux(),
         ) {
             Err(e) => e,
             Ok(_) => panic!("bash chain build unexpectedly succeeded"),
@@ -1783,7 +1941,164 @@ mod tests {
             badbytes: Some("40".into()),
             ..ScanRequest::default()
         };
-        let res = chain_bytes(&fixture_bytes("elf-Linux-x64"), None, &req);
+        let res = chain_bytes(
+            &fixture_bytes("elf-Linux-x64"),
+            None,
+            &req,
+            &ChainSpec::linux(),
+        );
         assert!(matches!(res, Err(ScanError::Chain(_))));
+    }
+
+    // -- --chain windows-virtualprotect (Phase 4b) ---------------------------
+
+    fn win_spec() -> ChainSpec {
+        ChainSpec {
+            target: "windows-virtualprotect".into(),
+            api_addr: Some("0x7fff12340000".into()),
+            shellcode_addr: None,
+            shellcode_size: None,
+        }
+    }
+
+    #[test]
+    fn chain_windows_x86_stdcall_full_chain() {
+        // pe-x86-cmd: stdcall needs no gadgets — the chain is
+        // [api][ret→shellcode][4 args] and VirtualProtect's ret 0x10
+        // continues into the shellcode (second-stack frame).
+        let out = chain_bytes(
+            &fixture_bytes("pe-x86-cmd-v6.1.7600"),
+            None,
+            &ScanRequest::default(),
+            &win_spec(),
+        )
+        .unwrap();
+        let chain = &out.chain;
+        assert_eq!(chain.arch, "x86");
+        assert_eq!(chain.word_size, 4);
+        let values: Vec<u64> = chain.words.iter().map(|w| w.value).collect();
+        assert_eq!(values.len(), 6);
+        assert_eq!(values[0], 0x7fff12340000, "api addr (--api-addr)");
+        assert_eq!(
+            values[1], values[2],
+            "return-to and lpAddress both = shellcode"
+        );
+        assert_eq!(values[3], 0x1000, "default dwSize");
+        assert_eq!(values[4], 0x40, "PAGE_EXECUTE_READWRITE");
+        // shellcode defaults to the PE's writable .data
+        assert!(chain.description.contains("VirtualProtect"));
+        chain
+            .validate(&std::collections::HashSet::new(), &[])
+            .unwrap();
+        // python renderer: 6 pack('<I') words
+        assert_eq!(chain.to_python().matches("pack('<I',").count(), 6);
+    }
+
+    #[test]
+    fn chain_windows_x64_cmd_reports_spike_scarcity() {
+        // The spike finding: pe-x64-cmd has NO ret-terminated gadget that
+        // writes rdx/r8/r9. The builder must fail with a structured error
+        // naming the unpopulatable register and the strategies tried.
+        let err = chain_bytes(
+            &fixture_bytes("pe-x64-cmd-v6.1.7601"),
+            None,
+            &ScanRequest::default(),
+            &win_spec(),
+        )
+        .err()
+        .expect("x64 cmd cannot sustain a VirtualProtect chain (spike report)");
+        match err {
+            ScanError::Chain(m) => {
+                assert!(m.contains("cannot populate rdx"), "{m}");
+                assert!(m.contains("pop rdx"), "{m}");
+                assert!(m.contains("mov rdx, rax"), "{m}");
+            }
+            other => panic!("expected Chain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chain_windows_x64_ntoskrnl_full_chain() {
+        // ring0 target from PLAN sec. 6.2 #5; the spike binary is
+        // gitignored, so skip gracefully when absent.
+        let path = format!(
+            "{}/../../tests/spike-binaries/ntoskrnl.exe",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("skipping: tests/spike-binaries/ntoskrnl.exe not present");
+            return;
+        };
+        let out = chain_bytes(&bytes, None, &ScanRequest::default(), &win_spec()).unwrap();
+        let chain = &out.chain;
+        assert_eq!(chain.arch, "x64");
+        assert_eq!(chain.word_size, 8);
+
+        // Structure: 4×(pop gadget + arg word), transfer at an EVEN index
+        // (alignment invariant), then return-to-shellcode + 4 shadow words.
+        let call_idx = chain
+            .words
+            .iter()
+            .position(|w| w.comment.contains("--api-addr"))
+            .unwrap();
+        assert_eq!(call_idx % 2, 0, "alignment invariant");
+        assert_eq!(chain.words.len(), call_idx + 1 + 1 + 4);
+        assert_eq!(chain.words[call_idx].value, 0x7fff12340000);
+        assert_eq!(
+            chain.words[call_idx + 1].value,
+            chain.words[1].value,
+            "return address = shellcode (arg1)"
+        );
+        assert!(chain.words[call_idx + 2..]
+            .iter()
+            .all(|w| w.kind == rf_chain::WordKind::Padding));
+
+        // Property: every gadget word references a real scan gadget.
+        let universe: std::collections::HashSet<u64> = out
+            .outcome
+            .result
+            .gadgets
+            .iter()
+            .map(|g| g.vaddr.wrapping_add(out.outcome.opts.offset))
+            .collect();
+        for w in &chain.words {
+            if w.kind == rf_chain::WordKind::GadgetAddr {
+                assert!(universe.contains(&w.value), "{:#x} not in scan", w.value);
+            }
+        }
+        chain.validate(&universe, &[]).unwrap();
+    }
+
+    #[test]
+    fn chain_windows_rejects_wrong_format_and_unknown_target() {
+        // windows-virtualprotect on an ELF → structured "not supported".
+        let err = chain_bytes(
+            &fixture_bytes("elf-Linux-x64"),
+            None,
+            &ScanRequest::default(),
+            &win_spec(),
+        )
+        .err()
+        .unwrap();
+        match err {
+            ScanError::Usage(m) => assert!(m.contains("not supported"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+        // unknown --chain value → usage error naming valid targets.
+        let err = chain_bytes(
+            &fixture_bytes("elf-Linux-x64"),
+            None,
+            &ScanRequest::default(),
+            &ChainSpec {
+                target: "plan9-forkbomb".into(),
+                ..ChainSpec::default()
+            },
+        )
+        .err()
+        .unwrap();
+        match err {
+            ScanError::Usage(m) => assert!(m.contains("linux-execve"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
     }
 }
