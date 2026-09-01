@@ -1,0 +1,6 @@
+[package]
+name = "rf-classify"
+description = "Semantic classification of gadgets (stub)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

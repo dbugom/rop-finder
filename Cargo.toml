@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rf-core",
+    "crates/rf-scan",
+    "crates/rf-classify",
+    "crates/rf-chain",
+    "crates/rf-cli",
+    "crates/rf-mcp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause"
+rust-version = "1.80"
+
+[workspace.dependencies]
+goblin = "0.10"
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "intel", "instr_info", "fast_fmt"] }
+memchr = "2.7"
+thiserror = "2"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+lto = true
+codegen-units = 1

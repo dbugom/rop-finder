@@ -1,0 +1,12 @@
+[package]
+name = "rf-scan"
+description = "Gadget scanning engine: anchor tables, per-start decode cache, filters, dedup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rf-core = { path = "../rf-core" }
+goblin.workspace = true
+iced-x86.workspace = true
+memchr.workspace = true

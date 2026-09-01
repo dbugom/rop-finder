@@ -1,0 +1,17 @@
+[package]
+name = "rf-cli"
+description = "rop-finder command line interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rop-finder"
+path = "src/main.rs"
+
+[dependencies]
+rf-core = { path = "../rf-core" }
+rf-scan = { path = "../rf-scan" }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true

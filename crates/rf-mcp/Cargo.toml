@@ -1,0 +1,6 @@
+[package]
+name = "rf-mcp"
+description = "MCP server exposing rop-finder (stub)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

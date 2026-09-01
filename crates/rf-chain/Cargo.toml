@@ -1,0 +1,6 @@
+[package]
+name = "rf-chain"
+description = "ROP chain builders (stub)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
