@@ -167,6 +167,8 @@ fn run(cli: Cli) -> Result<i32, String> {
             Some(o) => parse_hex(o, "--offset")?,
             None => 0,
         },
+        thumb: false,
+        parallel: true,
     };
 
     let gadgets = match rf_scan::scan_binary(&bin, &opts) {

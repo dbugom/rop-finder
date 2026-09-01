@@ -7,9 +7,15 @@ For every fixture in tests/fixtures:
   * compare the post-dedup sets of (vaddr, bytes) and report
     |ref|, |ours|, |intersection|, ref-only, ours-only and % overlap.
 
+Coverage policy (Phase 1a): every *ELF* fixture is compared. Fixtures are
+skipped gracefully — never fatal — when:
+  * the file is not an ELF (rf-cli still loads ELF only), or
+  * the ROPgadget oracle cannot handle it (unsupported arch/format), or
+  * rop-finder reports the binary as unsupported (exit code 2).
+
 A small number of diffs is expected and acceptable IF explained:
   * dedup-survivor differences (text dedup with different formatters)
-  * iced-x86 vs capstone decode disagreements
+  * iced-x86 vs capstone decode disagreements (x86/x64 path)
   * ROPgadget scans executable PT_LOAD *segments*; rop-finder scans
     SHF_EXECINSTR *sections* (inter-section padding is not scanned)
 Top 10 examples of each direction are printed for human judgement.
@@ -45,7 +51,8 @@ def find_rop_finder(release: bool) -> str:
 
 
 def run_ref(fixture: str):
-    """Return ({(vaddr, bytes): text}, seconds)."""
+    """Return ({(vaddr, bytes): text}, seconds), or (None, dt) when the
+    oracle itself cannot handle this binary (unsupported arch/format)."""
     t0 = time.perf_counter()
     p = subprocess.run(
         [sys.executable, ROPGADGET, "--binary", fixture, "--depth", str(DEPTH), "--dump"],
@@ -53,7 +60,7 @@ def run_ref(fixture: str):
     )
     dt = time.perf_counter() - t0
     if p.returncode != 0:
-        sys.exit(f"ROPgadget failed on {fixture}:\n{p.stdout}\n{p.stderr}")
+        return None, dt
     gadgets = {}
     for line in p.stdout.splitlines():
         m = REF_LINE.match(line)
@@ -63,7 +70,9 @@ def run_ref(fixture: str):
 
 
 def run_ours(binary: str, fixture: str, runs: int = 1):
-    """Return ({(vaddr, bytes): text}, best-of-N seconds)."""
+    """Return ({(vaddr, bytes): text}, best-of-N seconds), or (None, None)
+    when rop-finder reports the binary as unsupported (exit code 2); other
+    failures stay fatal."""
     gadgets = {}
     best = None
     for _ in range(runs):
@@ -73,6 +82,8 @@ def run_ours(binary: str, fixture: str, runs: int = 1):
             capture_output=True, text=True,
         )
         dt = time.perf_counter() - t0
+        if p.returncode == 2:
+            return None, None  # unsupported arch/format — skip gracefully
         if p.returncode != 0:
             sys.exit(f"rop-finder failed on {fixture}:\n{p.stdout}\n{p.stderr}")
         best = dt if best is None else min(best, dt)
@@ -120,19 +131,36 @@ def main():
 
     totals = [0, 0, 0]
     timing = {}
+    skipped = []
     for name in names:
         path = os.path.join(FIXTURES, name)
+        with open(path, "rb") as fh:
+            if fh.read(4) != b"\x7fELF":
+                skipped.append((name, "not an ELF (rf-cli loads ELF only)"))
+                continue
         ref, t_ref = run_ref(path)
+        if ref is None:
+            skipped.append((name, "ROPgadget oracle cannot handle it"))
+            continue
         ours, t_ours = run_ours(binary, path, runs=3)
+        if ours is None:
+            skipped.append((name, "arch not supported by this rop-finder build"))
+            continue
         timing[name] = (t_ref, t_ours)
         r, o, i = compare(name, ref, ours, args.top)
         totals[0] += r
         totals[1] += o
         totals[2] += i
 
+    if skipped:
+        print("\n=== SKIPPED")
+        for name, why in skipped:
+            print(f"  {name:<32} {why}")
+
     print("\n=== TOTAL")
+    cov = 100.0 * totals[2] / totals[0] if totals[0] else 100.0
     print(f"  |ref|={totals[0]}  |ours|={totals[1]}  |intersection|={totals[2]}"
-          f"  overlap={100.0 * totals[2] / totals[0]:.2f}% of ref")
+          f"  overlap={cov:.2f}% of ref")
 
     print("\n=== TIMING (seconds; ROPgadget single run, rop-finder best of 3)")
     print(f"  {'fixture':<28} {'ROPgadget':>10} {'rop-finder':>11} {'speedup':>8}")

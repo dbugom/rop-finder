@@ -10,13 +10,25 @@
 //! (ropgadget/rgutils.py:9-18). Because our formatter is iced-x86 rather than
 //! capstone, text — and therefore dedup survivor identity in rare ties — can
 //! differ cosmetically; parity is judged on (vaddr, bytes) sets.
+//!
+//! Parallelism (Phase 1a): scanning is split into work items of
+//! `(scan region, anchor)` in exactly the traversal order above. `rayon`
+//! maps over the indexed work list and the per-item result vectors are
+//! concatenated in index order, so the merged output — and therefore the
+//! text-dedup survivor — is byte-identical to the serial run regardless of
+//! thread scheduling. `ScanOptions::parallel = false` selects the serial
+//! path (tests).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::collections::HashMap;
 use std::rc::Rc;
 
-use rf_core::{ElfBinary, Error};
+use rayon::prelude::*;
 
-use crate::anchors::{self, Anchor};
+use rf_core::{Arch, Error, Image};
+
+use crate::anchors::{self, Anchor, TableKind};
+use crate::cs;
 use crate::x86::{self, WinInsn};
 
 /// Scanner configuration.
@@ -47,6 +59,12 @@ pub struct ScanOptions {
     /// ROPgadget --offset: additive slide applied at emission; disassembly
     /// is unaffected.
     pub offset: u64,
+    /// ROPgadget --thumb: disassemble ARM binaries in Thumb mode
+    /// (gadgets.py:331, 448). `Arch::ArmThumb` implies this.
+    pub thumb: bool,
+    /// Scan (region × anchor) work items with rayon. Output is identical
+    /// either way; serial exists for tests and debugging.
+    pub parallel: bool,
 }
 
 impl Default for ScanOptions {
@@ -62,6 +80,8 @@ impl Default for ScanOptions {
             badbytes: Vec::new(),
             filter: Vec::new(),
             offset: 0,
+            thumb: false,
+            parallel: true,
         }
     }
 }
@@ -73,6 +93,12 @@ pub struct Gadget {
     pub bytes: Vec<u8>,
     /// Full formatted text per instruction (mnemonic + operands).
     pub insns: Vec<String>,
+    /// True on delay-slot ISAs (MIPS, SPARC — PLAN.md §4): the instruction
+    /// after the control transfer still executes before the jump takes
+    /// effect, so classification/chains must not treat the text as the full
+    /// executed path. (ROPgadget includes the delay slot in the gadget text
+    /// for MIPS — anchor size 8 — but not for SPARC — anchor size 4.)
+    pub delay_slot: bool,
 }
 
 impl Gadget {
@@ -90,42 +116,107 @@ impl Gadget {
     }
 }
 
-/// Scan a parsed binary. Returns gadgets deduplicated by text and sorted
-/// alphabetically by text (ROPgadget's `alphaSortgadgets`).
-pub fn scan_binary(bin: &ElfBinary, opts: &ScanOptions) -> Result<Vec<Gadget>, Error> {
-    use goblin::elf::header::{EM_386, EM_X86_64};
-    let bits = match (bin.machine(), bin.is_64()) {
-        (EM_386, false) => 32,
-        (EM_X86_64, true) => 64,
-        // goblin reports EM_X86_64 for both; treat other combos by class.
-        (EM_386 | EM_X86_64, is64) => {
-            if is64 {
-                64
-            } else {
-                32
-            }
-        }
-        (m, _) => {
-            return Err(Error::Unsupported(format!(
-                "machine {m:#x} (Phase 0 supports x86/x64 only)"
-            )))
-        }
-    };
+/// Scan a loaded binary of any supported architecture. Dispatch: x86/x64 →
+/// iced-x86 path; every other [`Arch`] → the capstone path.
+///
+/// Works over the format-agnostic [`Image`] contract so ELF, PE, Mach-O and
+/// raw images all share this entry point. Returns gadgets deduplicated by
+/// text and sorted alphabetically (ROPgadget's `alphaSortgadgets`).
+pub fn scan_binary<B: Image + ?Sized>(bin: &B, opts: &ScanOptions) -> Result<Vec<Gadget>, Error> {
+    let arch = bin.arch();
+    let endian = bin.endianness();
+    // PLAN.md §4: delay-slot ISAs.
+    let delay_slot = matches!(
+        arch,
+        Arch::Mips32 | Arch::Mips64 | Arch::Sparc | Arch::Sparc64 | Arch::SparcV9
+    );
 
-    let mut all = Vec::new();
-    // Scan ROPgadget-compatible regions (executable program headers), not
-    // SHF_EXECINSTR sections — the parity oracle ignores section headers.
+    // Scan ROPgadget-compatible regions (executable program headers for ELF),
+    // range-truncated up front (core.py:_sectionInRange).
+    let mut regions: Vec<(Vec<u8>, u64)> = Vec::new();
     for sec in bin.exec_scan_regions() {
-        let (bytes, vaddr) = match opts.range {
-            None => (sec.bytes.clone(), sec.vaddr),
-            Some(_) => match apply_range(sec, opts.range) {
-                Some(x) => x,
-                None => continue,
-            },
+        let r = match opts.range {
+            None => Some((sec.bytes.clone(), sec.vaddr)),
+            Some(_) => apply_range(sec, opts.range),
         };
-        scan_section(&bytes, vaddr, bits, opts, &mut all);
+        if let Some(r) = r {
+            regions.push(r);
+        }
     }
-    Ok(post_process(all, opts, bin.class().addr_size()))
+
+    let thumb = opts.thumb || arch == Arch::ArmThumb;
+    let all = if arch.is_x86_family() {
+        let bits = if arch == Arch::X64 { 64 } else { 32 };
+        let tables = x86_tables(bits, opts);
+        scan_work(&regions, &tables, opts, |code, vaddr, anchor, out| {
+            x86_scan_anchor(code, vaddr, bits, opts, anchor, out);
+        })
+    } else {
+        let spec = cs::spec(arch, endian, thumb)?;
+        // Validate the capstone mode once up front so a bad combination is a
+        // clean error rather than empty per-thread results.
+        let _probe = cs::open(&spec)?;
+        let tables: Vec<Vec<Anchor>> = [
+            opts.rop.then(|| anchors::table(TableKind::Rop, arch, endian, thumb)),
+            opts.jop.then(|| anchors::table(TableKind::Jop, arch, endian, thumb)),
+            opts.sys.then(|| anchors::table(TableKind::Sys, arch, endian, thumb)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        scan_work(&regions, &tables, opts, |code, vaddr, anchor, out| {
+            // capstone-rs 0.13 Capstone is !Send/!Sync: one handle per work
+            // item (already validated above; a failure here yields nothing).
+            if let Ok(handle) = cs::open(&spec) {
+                cs::scan_anchor(&handle, &spec, code, vaddr, anchor, opts, delay_slot, out);
+            }
+        })
+    };
+    Ok(post_process(all, opts, bin.addr_size()))
+}
+
+/// Enabled x86 anchor tables in ROP/JOP/SYS order.
+fn x86_tables(bits: u32, opts: &ScanOptions) -> Vec<Vec<Anchor>> {
+    [
+        opts.rop.then(anchors::rop_anchors),
+        opts.jop.then(|| anchors::jop_anchors(bits == 64)),
+        opts.sys.then(anchors::sys_anchors),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Run the (region × anchor) work list, serially or under rayon.
+///
+/// Work items are enumerated in ROPgadget traversal order (region → table →
+/// anchor); each item's output preserves (anchor-hit, depth) order. Rayon
+/// `collect` over an indexed parallel iterator preserves item order, and the
+/// per-item vectors are concatenated in index order — so the merged stream
+/// is identical to the serial traversal and the text-dedup survivor is
+/// deterministic regardless of thread scheduling (PLAN.md §3.3 invariant).
+fn scan_work(
+    regions: &[(Vec<u8>, u64)],
+    tables: &[Vec<Anchor>],
+    opts: &ScanOptions,
+    f: impl Fn(&[u8], u64, &Anchor, &mut Vec<Gadget>) + Sync,
+) -> Vec<Gadget> {
+    let work: Vec<(&(Vec<u8>, u64), &Anchor)> = regions
+        .iter()
+        .flat_map(|r| tables.iter().flat_map(move |t| t.iter().map(move |a| (r, a))))
+        .collect();
+    let run = |item: &(&(Vec<u8>, u64), &Anchor)| {
+        let ((bytes, vaddr), anchor) = *item;
+        let mut out = Vec::new();
+        f(bytes, *vaddr, anchor, &mut out);
+        out
+    };
+    let chunks: Vec<Vec<Gadget>> = if opts.parallel && work.len() > 1 {
+        work.par_iter().map(run).collect()
+    } else {
+        work.iter().map(run).collect()
+    };
+    chunks.into_iter().flatten().collect()
 }
 
 /// Dedup (text, first-wins) → --only → --badbytes → alphabetical sort.
@@ -197,7 +288,10 @@ fn apply_range(sec: &rf_core::Section, range: Option<(u64, u64)>) -> Option<(Vec
     Some((sec.bytes[byte_start..byte_end].to_vec(), vaddr))
 }
 
-/// Scan one executable buffer. Gadgets are appended in traversal order.
+/// Scan one executable buffer (x86/x64, serial). Gadgets are appended in
+/// traversal order. This is the serial per-section entry point used by
+/// tests; `scan_binary` drives the same per-anchor routine over its work
+/// list (in parallel when `ScanOptions::parallel` is set).
 pub fn scan_section(
     code: &[u8],
     sec_vaddr: u64,
@@ -205,48 +299,51 @@ pub fn scan_section(
     opts: &ScanOptions,
     out: &mut Vec<Gadget>,
 ) {
-    // Anchor tables are built once per section (cheap) so the \x41-prefixed
-    // JOP variants aren't leaked per call.
-    let tables: Vec<Vec<Anchor>> = [
-        opts.rop.then(anchors::rop_anchors),
-        opts.jop.then(|| anchors::jop_anchors(bits == 64)),
-        opts.sys.then(anchors::sys_anchors),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    for table in x86_tables(bits, opts) {
+        for anchor in &table {
+            x86_scan_anchor(code, sec_vaddr, bits, opts, anchor, out);
+        }
+    }
+}
 
-    // Per-start decode cache: decode each candidate start position ONCE
-    // through the maximal window; all anchor-terminated candidates from that
-    // start are derived from the recorded instruction-boundary list
-    // (PLAN.md §3.4).
+/// Scan one x86 anchor over one buffer.
+///
+/// Per-start decode cache: decode each candidate start position ONCE
+/// through the maximal window; all anchor-terminated candidates from that
+/// start are derived from the recorded instruction-boundary list
+/// (PLAN.md §3.4). The cache is pure memoization — serial and parallel
+/// runs produce identical output.
+fn x86_scan_anchor(
+    code: &[u8],
+    sec_vaddr: u64,
+    bits: u32,
+    opts: &ScanOptions,
+    anchor: &Anchor,
+    out: &mut Vec<Gadget>,
+) {
     let mut cache: HashMap<usize, Rc<Vec<WinInsn>>> = HashMap::new();
     let mut fmt = x86::make_formatter();
     let window = opts.depth.saturating_sub(1) + anchors::MAX_ANCHOR_SIZE;
 
-    for table in &tables {
-        for anchor in table {
-            for ref_pos in anchors::find_matches(code, anchor) {
-                let end = ref_pos + anchor.size();
-                if end > code.len() {
-                    continue;
-                }
-                for i in 0..opts.depth {
-                    if ref_pos < i {
-                        continue; // start would be negative
-                    }
-                    let start = ref_pos - i;
-                    let insns = cache
-                        .entry(start)
-                        .or_insert_with(|| {
-                            Rc::new(x86::decode_window(code, start, sec_vaddr, bits, start + window))
-                        })
-                        .clone();
-                    if let Some(g) = try_candidate(code, sec_vaddr, bits, start, end, &insns, opts, &mut fmt)
-                    {
-                        out.push(g);
-                    }
-                }
+    for ref_pos in anchors::find_matches(code, anchor) {
+        let end = ref_pos + anchor.size();
+        if end > code.len() {
+            continue;
+        }
+        for i in 0..opts.depth {
+            if ref_pos < i {
+                continue; // start would be negative
+            }
+            let start = ref_pos - i;
+            let insns = cache
+                .entry(start)
+                .or_insert_with(|| {
+                    Rc::new(x86::decode_window(code, start, sec_vaddr, bits, start + window))
+                })
+                .clone();
+            if let Some(g) = try_candidate(code, sec_vaddr, bits, start, end, &insns, opts, &mut fmt)
+            {
+                out.push(g);
             }
         }
     }
@@ -282,6 +379,7 @@ fn try_candidate(
         vaddr: opts.offset.wrapping_add(sec_vaddr).wrapping_add(start as u64),
         bytes: code[start..end].to_vec(),
         insns: x86::format_gadget(code, start, end, sec_vaddr, bits, fmt),
+        delay_slot: false, // x86/x64 have no delay slots
     })
 }
 
@@ -449,6 +547,7 @@ mod tests {
             vaddr,
             bytes: bytes.to_vec(),
             insns: insns.iter().map(|s| s.to_string()).collect(),
+            delay_slot: false,
         }
     }
 
@@ -532,6 +631,80 @@ mod tests {
             let retexts =
                 crate::x86::format_gadget(&x.bytes, 0, x.bytes.len(), x.vaddr, 64, &mut fmt);
             assert_eq!(retexts, x.insns, "gadget {:#x} bytes do not re-decode", x.vaddr);
+        }
+    }
+
+    fn fixture_bytes(name: &str) -> Vec<u8> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/");
+        std::fs::read(format!("{path}{name}")).unwrap()
+    }
+
+    /// Parallel and serial scans must produce byte-identical output
+    /// (deterministic text-dedup survivor) on real fixtures — x64 (iced-x86
+    /// path) and ARM64 (capstone path).
+    #[test]
+    fn parallel_matches_serial_on_real_fixtures() {
+        for fixture in ["elf-Linux-x64", "elf-ARM64-bash"] {
+            let bytes = fixture_bytes(fixture);
+            let bin = rf_core::Binary::parse(&bytes).unwrap();
+            let mut serial_opts = opts();
+            serial_opts.parallel = false;
+            let serial = scan_binary(&bin, &serial_opts).unwrap();
+            let parallel = scan_binary(&bin, &opts()).unwrap();
+            assert!(!serial.is_empty(), "{fixture}: no gadgets");
+            let key = |g: &Gadget| (g.vaddr, g.bytes.clone(), g.text());
+            let s: Vec<_> = serial.iter().map(key).collect();
+            let p: Vec<_> = parallel.iter().map(key).collect();
+            assert_eq!(s, p, "{fixture}: parallel output differs from serial");
+        }
+    }
+
+    /// Multi-arch smoke test: the capstone path scans real non-x86 fixtures
+    /// and finds gadgets of the expected anchor families.
+    #[test]
+    fn scans_non_x86_real_fixtures() {
+        let cases: &[(&str, &str)] = &[
+            ("elf-ARM64-bash", "ret"),
+            ("elf-ARMv7-ls", "bx"),
+            ("elf-Mips-Defcon-20-pwn100", "jr"),
+            ("elf-PowerPC-bash", "blr"),
+            ("elf-SparcV8-bash", "retl"),
+        ];
+        for (name, want_mnem) in cases {
+            let bytes = fixture_bytes(name);
+            let bin = rf_core::Binary::parse(&bytes).unwrap();
+            let mut o = opts();
+            o.parallel = false; // keep test output deterministic to debug
+            let g = scan_binary(&bin, &o).unwrap();
+            assert!(
+                g.iter().any(|x| x.text().contains(want_mnem)),
+                "{name}: no gadget containing {want_mnem:?} in {} gadgets",
+                g.len()
+            );
+            // Every gadget vaddr lies inside a scanned exec region.
+            let exec = bin.exec_scan_regions();
+            for x in &g {
+                assert!(
+                    exec.iter()
+                        .any(|s| s.vaddr <= x.vaddr && x.vaddr < s.vaddr + s.size),
+                    "{name}: gadget {:#x} outside exec regions",
+                    x.vaddr
+                );
+            }
+        }
+    }
+
+    /// RISC-V fixtures exercise the compressed-instruction size rule on real
+    /// code; also validates the RV32 (ELFCLASS32) capstone mode override.
+    #[test]
+    fn scans_riscv_real_fixtures() {
+        for name in ["elf-Linux-RISCV_32", "elf-Linux-RISCV_64"] {
+            let bytes = fixture_bytes(name);
+            let bin = rf_core::Binary::parse(&bytes).unwrap();
+            let mut o = opts();
+            o.parallel = false;
+            let g = scan_binary(&bin, &o).unwrap();
+            assert!(!g.is_empty(), "{name}: no gadgets found");
         }
     }
 }

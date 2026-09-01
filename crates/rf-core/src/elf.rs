@@ -3,6 +3,7 @@
 use goblin::elf::program_header::{PF_W, PF_X, PT_LOAD};
 use goblin::elf::section_header::{SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS};
 
+use crate::util::slice_clamped;
 use crate::Error;
 
 /// ELF class (32- or 64-bit).
@@ -57,17 +58,6 @@ pub struct ElfBinary {
     sections: Vec<Section>,
     /// ROPgadget-compatible scan regions: program headers with `PF_X`.
     exec_regions: Vec<Section>,
-}
-
-/// Entry point mirroring ROPgadget's loader dispatch: parse raw bytes into a
-/// binary. Phase 0 supports ELF only.
-pub struct Binary;
-
-impl Binary {
-    /// Parse an ELF binary, returning a structured error on malformed input.
-    pub fn parse(bytes: &[u8]) -> Result<ElfBinary, Error> {
-        ElfBinary::parse(bytes)
-    }
 }
 
 impl ElfBinary {
@@ -260,18 +250,6 @@ impl crate::Image for ElfBinary {
     }
 }
 
-/// Clamp a file range to what the file actually contains. Never panics,
-/// never reads out of bounds; truncated sections yield truncated bytes.
-fn slice_clamped(bytes: &[u8], offset: u64, size: u64) -> Vec<u8> {
-    let start = usize::try_from(offset).unwrap_or(usize::MAX);
-    let size = usize::try_from(size).unwrap_or(usize::MAX);
-    if start >= bytes.len() {
-        return Vec::new();
-    }
-    let end = start.saturating_add(size).min(bytes.len());
-    bytes[start..end].to_vec()
-}
-
 fn sections_from_headers(elf: &goblin::elf::Elf, bytes: &[u8]) -> Vec<Section> {
     let mut out = Vec::with_capacity(elf.section_headers.len());
     for shdr in &elf.section_headers {
@@ -327,6 +305,7 @@ fn sections_from_segments(elf: &goblin::elf::Elf, bytes: &[u8]) -> Vec<Section> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Binary;
 
     fn fixture_path(name: &str) -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

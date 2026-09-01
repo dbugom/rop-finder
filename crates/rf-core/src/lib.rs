@@ -1,24 +1,31 @@
-//! rf-core — binary loading (ELF via goblin), the section model, and rebasing.
+//! rf-core — binary loading (ELF, PE, Mach-O, Universal, Raw via goblin),
+//! the section model, and rebasing.
 //!
-//! Phase 0 scope: ELF32/ELF64, little- and big-endian, parsed with goblin.
-//! All malformed input produces a structured [`Error`] — the loader never
-//! panics.
+//! All malformed input produces a structured [`Error`] — the loaders never
+//! panic.
 //!
-//! Section model: names and flags come from the ELF section headers
-//! (`executable` = `SHF_EXECINSTR`, `writable` = `SHF_WRITE`). For ELFs
-//! without section headers we fall back to executable `PT_LOAD` segments with
-//! synthesized names (`PT_LOAD#n`).
-//!
-//! Note on scan granularity: ROPgadget's ELF loader scans executable
-//! `PT_LOAD` *segments*; rop-finder scans `SHF_EXECINSTR` *sections* (with the
-//! segment fallback above). See README "Semantic notes".
+//! Section model: names and flags come from each format's section headers
+//! (ELF `SHF_EXECINSTR`, PE `IMAGE_SCN_MEM_EXECUTE`, Mach-O instruction
+//! attributes). Scan regions mirror ROPgadget's loaders: executable
+//! `PT_LOAD` *segments* for ELF, executable *sections* for PE/Mach-O/Raw.
 
 #![forbid(unsafe_code)]
 
 mod arch;
+mod binary;
 mod elf;
 mod error;
+mod macho;
+mod pe;
+mod raw;
+mod universal;
+mod util;
 
 pub use arch::{Arch, Endianness, Image};
-pub use elf::{Binary, ElfBinary, ElfClass, Section};
+pub use binary::{Binary, Format, LoadedBinary};
+pub use elf::{ElfBinary, ElfClass, Section};
 pub use error::Error;
+pub use macho::MachOBinary;
+pub use pe::{PeBinary, PeImport};
+pub use raw::RawBinary;
+pub use universal::UniversalBinary;

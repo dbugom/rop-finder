@@ -10,3 +10,10 @@ rf-core = { path = "../rf-core" }
 goblin.workspace = true
 iced-x86.workspace = true
 memchr.workspace = true
+# capstone-rs 0.13.0 (wraps capstone-sys 0.17.0, bundling the C capstone
+# "auto-sync" 5.0.x core: API 5.0 + RISC-V from the next branch — the same
+# core generation as the parity oracle's python capstone 5.0.7). PINNED
+# EXACTLY: capstone disassembly text drifts between releases and is a known
+# parity risk — do not upgrade without re-running tests/parity.py.
+capstone = "=0.13.0"
+rayon = "1.10"

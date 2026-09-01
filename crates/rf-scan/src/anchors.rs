@@ -1,13 +1,23 @@
-//! x86/x64 anchor tables, ported faithfully from ROPgadget's
-//! `ropgadget/gadgets.py` (`addROPGadgets` lines 137-145, `addJOPGadgets`
-//! lines 217-274, `addSYSGadgets` lines 407-420).
+//! Anchor tables for all architectures, ported faithfully from ROPgadget's
+//! `ropgadget/gadgets.py` (x86: `addROPGadgets` lines 137-145, `addJOPGadgets`
+//! lines 217-274, `addSYSGadgets` lines 407-420; other arches: lines 147-202,
+//! 275-392, 422-479).
 //!
 //! Each anchor is a pattern of byte matchers. Matching replicates Python
 //! `re.finditer` semantics per pattern: matches are leftmost and
 //! **non-overlapping** — after a match at `p` of length `L`, scanning resumes
 //! at `p + L`.
+//!
+//! NOTE: an anchor's *gadget size* (`size`, ROPgadget's `gad_size`) can differ
+//! from its *pattern length*: the Thumb `ldm.w`/`ldmdb` anchors match 6 bytes
+//! but the gadget ends 4 bytes after the anchor start (gadgets.py:337-338,
+//! 345-346 — the trailing `[\x00-\xff]{4}` is a ROPgadget quirk, ported
+//! verbatim). `align` is ROPgadget's `gad_align` used for aligned backward
+//! stepping (gadgets.py:74-89).
 
 use std::borrow::Cow;
+
+use rf_core::{Arch, Endianness};
 
 /// A single pattern position: fixed byte, wildcard, or a set of inclusive
 /// byte ranges (regex character class).
@@ -34,11 +44,20 @@ pub struct Anchor {
     /// Human-readable comment from the Python source.
     pub name: &'static str,
     pub pattern: Cow<'static, [BytePat]>,
+    /// Gadget size (`gad_size`): gadget end = anchor offset + size. May be
+    /// smaller than `pattern.len()` (Thumb ldm.w/ldmdb quirk, see module docs).
+    pub size: usize,
+    /// Backward-stepping alignment (`gad_align`): candidate starts are
+    /// `anchor_pos - i*align` (aligned path, gadgets.py:75-81).
+    pub align: usize,
 }
 
 impl Anchor {
     pub fn size(&self) -> usize {
-        self.pattern.len()
+        self.size
+    }
+    pub fn align(&self) -> usize {
+        self.align
     }
 }
 
@@ -56,10 +75,24 @@ macro_rules! pat {
     }};
 }
 
+/// x86 anchor constructor: gadget size == pattern length, align == 1
+/// (all x86 tables in gadgets.py use align 1).
 fn a(name: &'static str, pattern: &'static [BytePat]) -> Anchor {
     Anchor {
         name,
+        size: pattern.len(),
         pattern: Cow::Borrowed(pattern),
+        align: 1,
+    }
+}
+
+/// Multi-arch anchor constructor: explicit gadget size and align.
+fn m(name: &'static str, pattern: &'static [BytePat], size: usize, align: usize) -> Anchor {
+    Anchor {
+        name,
+        pattern: Cow::Borrowed(pattern),
+        size,
+        align,
     }
 }
 
@@ -114,7 +147,9 @@ pub fn jop_anchors(is64: bool) -> Vec<Anchor> {
             p.extend_from_slice(&anchor.pattern);
             v.push(Anchor {
                 name: anchor.name,
+                size: anchor.size + 1,
                 pattern: Cow::Owned(p),
+                align: anchor.align,
             });
         }
     }
@@ -151,14 +186,421 @@ pub fn sys_anchors() -> Vec<Anchor> {
 /// Largest anchor size across all tables (decode-window sizing).
 pub const MAX_ANCHOR_SIZE: usize = 8;
 
+/* ===================== multi-arch tables (capstone path) =====================
+ *
+ * Ported from gadgets.py `addROPGadgets`/`addJOPGadgets`/`addSYSGadgets` for
+ * the non-x86 arches: MIPS (147-148, 275-297, 422-430), PPC (149-163,
+ * 298-306, 431-441), SPARC (165-178, 308-317, 443-444), ARM64 (182-191,
+ * 318-329, 445-446), ARM/Thumb (180-181, 330-362, 447-467), RISCV
+ * (193-202, 363-392, 468-479). Byte order variants follow ROPgadget's
+ * `arch_endian` branches. SPARC SYS and ARM64 SYS are empty in ROPgadget
+ * (marked TODO there) — replicated as empty tables.
+ */
+
+/// Which ROPgadget anchor table (`addROPGadgets` / `addJOPGadgets` /
+/// `addSYSGadgets`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableKind {
+    Rop,
+    Jop,
+    Sys,
+}
+
+/// The anchor table for one (kind, arch, endianness, thumb) combination,
+/// in ROPgadget's table order. Empty where ROPgadget's table is empty.
+pub fn table(kind: TableKind, arch: Arch, endian: Endianness, thumb: bool) -> Vec<Anchor> {
+    let be = endian == Endianness::Big;
+    use TableKind::*;
+    match arch {
+        Arch::X86 | Arch::X64 => {
+            let is64 = arch == Arch::X64;
+            match kind {
+                Rop => rop_anchors(),
+                Jop => jop_anchors(is64),
+                Sys => sys_anchors(),
+            }
+        }
+        Arch::Arm | Arch::ArmThumb => {
+            let thumb = thumb || arch == Arch::ArmThumb;
+            match kind {
+                Rop => vec![], // gadgets.py:180-181 — ARM has no RET
+                Jop => arm_jop(thumb, be),
+                Sys => arm_sys(thumb, be),
+            }
+        }
+        Arch::Arm64 => match kind {
+            // gadgets.py:182-191
+            Rop => {
+                if be {
+                    vec![m("ret", pat!(f(0xd6), f(0x5f), f(0x03), f(0xc0)), 4, 4)]
+                } else {
+                    vec![m("ret", pat!(f(0xc0), f(0x03), f(0x5f), f(0xd6)), 4, 4)]
+                }
+            }
+            Jop => arm64_jop(be),
+            Sys => vec![], // gadgets.py:445-446 — TODO in ROPgadget
+        },
+        Arch::Mips32 | Arch::Mips64 => match kind {
+            Rop => vec![], // gadgets.py:147-148 — MIPS has no RET
+            Jop => mips_jop(be),
+            Sys => {
+                // gadgets.py:422-430
+                if be {
+                    vec![m("syscall", pat!(f(0x00), f(0x00), f(0x00), f(0x0c)), 4, 4)]
+                } else {
+                    vec![m("syscall", pat!(f(0x0c), f(0x00), f(0x00), f(0x00)), 4, 4)]
+                }
+            }
+        },
+        Arch::Ppc32 | Arch::Ppc64 => match kind {
+            Rop => ppc_rop(be),
+            Jop => {
+                // gadgets.py:298-306
+                if be {
+                    vec![m("bl", pat!(f(0x48), ANY, ANY, ANY), 4, 4)]
+                } else {
+                    vec![m("bl", pat!(ANY, ANY, ANY, f(0x48)), 4, 4)]
+                }
+            }
+            Sys => {
+                // gadgets.py:431-441
+                if be {
+                    vec![
+                        m("sc", pat!(f(0x44), f(0x00), f(0x00), f(0x02)), 4, 4),
+                        m("scv", pat!(f(0x44), f(0x00), f(0x00), f(0x03)), 4, 4),
+                    ]
+                } else {
+                    vec![
+                        m("sc", pat!(f(0x02), f(0x00), f(0x00), f(0x44)), 4, 4),
+                        m("scv", pat!(f(0x03), f(0x00), f(0x00), f(0x44)), 4, 4),
+                    ]
+                }
+            }
+        },
+        Arch::Sparc | Arch::Sparc64 | Arch::SparcV9 => match kind {
+            Rop => sparc_rop(be),
+            Jop => {
+                // gadgets.py:308-317 — jmp %g[0-3]
+                if be {
+                    vec![m(
+                        "jmp %g[0-3]",
+                        pat!(f(0x81), f(0xc0), r(&[(0x00, 0x00), (0x40, 0x40), (0x80, 0x80), (0xc0, 0xc0)]), f(0x00)),
+                        4,
+                        4,
+                    )]
+                } else {
+                    vec![m(
+                        "jmp %g[0-3]",
+                        pat!(f(0x00), r(&[(0x00, 0x00), (0x40, 0x40), (0x80, 0x80), (0xc0, 0xc0)]), f(0xc0), f(0x81)),
+                        4,
+                        4,
+                    )]
+                }
+            }
+            Sys => vec![], // gadgets.py:443-444 — TODO (ta inst) in ROPgadget
+        },
+        Arch::RiscV32 | Arch::RiscV64 => match kind {
+            // gadgets.py:193-202 — ROPgadget uses the same table for RV32/RV64
+            Rop => {
+                if be {
+                    vec![m("c.ret", pat!(f(0x80), f(0x82)), 2, 1)]
+                } else {
+                    vec![m("c.ret", pat!(f(0x82), f(0x80)), 2, 1)]
+                }
+            }
+            Jop => riscv_jop(be),
+            Sys => {
+                // gadgets.py:468-479
+                if be {
+                    vec![m("syscall", pat!(f(0x00), f(0x00), f(0x00), f(0x73)), 4, 2)]
+                } else {
+                    vec![m("syscall", pat!(f(0x73), f(0x00), f(0x00), f(0x00)), 4, 2)]
+                }
+            }
+        },
+    }
+}
+
+/// Shorthand for a character-class matcher.
+const fn r(rs: &'static [(u8, u8)]) -> BytePat {
+    BytePat::Ranges(rs)
+}
+
+/// MIPS register-field byte sets shared by the jalr/jr anchors
+/// (gadgets.py:278-283, 289-294).
+mod mips_sets {
+    /// $v[0-1] | $a[0-3]
+    pub const V0_A3: &[(u8, u8)] = &[
+        (0x40, 0x40),
+        (0x60, 0x60),
+        (0x80, 0x80),
+        (0xa0, 0xa0),
+        (0xc0, 0xc0),
+        (0xe0, 0xe0),
+    ];
+    /// $t[0-7] | $s[0-7]
+    pub const T0_S7: &[(u8, u8)] = &[
+        (0x00, 0x00),
+        (0x20, 0x20),
+        (0x40, 0x40),
+        (0x60, 0x60),
+        (0x80, 0x80),
+        (0xa0, 0xa0),
+        (0xc0, 0xc0),
+        (0xe0, 0xe0),
+    ];
+    /// $t[8-9] | $s8 | $ra
+    pub const T8_RA: &[(u8, u8)] = &[(0x00, 0x00), (0x20, 0x20), (0xc0, 0xc0), (0xe0, 0xe0)];
+    /// $t[0-1] selector byte (high byte of the rs field word half)
+    pub const R01_02: &[(u8, u8)] = &[(0x01, 0x02)];
+}
+
+/// MIPS JOP anchors (gadgets.py:275-297). All size 8 (jump + delay slot),
+/// align 4.
+fn mips_jop(be: bool) -> Vec<Anchor> {
+    use mips_sets::*;
+    if be {
+        vec![
+            m("jalr $v[0-1]|$a[0-3]", pat!(f(0x00), r(V0_A3), f(0xf8), f(0x09), ANY, ANY, ANY, ANY), 8, 4),
+            m("jalr $t[0-7]|$s[0-7]", pat!(r(R01_02), r(T0_S7), f(0xf8), f(0x09), ANY, ANY, ANY, ANY), 8, 4),
+            m("jalr $t[8-9]|$s8|$ra", pat!(f(0x03), r(T8_RA), f(0xf8), f(0x09), ANY, ANY, ANY, ANY), 8, 4),
+            m("jr $v[0-1]|$a[0-3]", pat!(f(0x00), r(V0_A3), f(0x00), f(0x08), ANY, ANY, ANY, ANY), 8, 4),
+            m("jr $t[0-7]|$s[0-7]", pat!(r(R01_02), r(T0_S7), f(0x00), f(0x08), ANY, ANY, ANY, ANY), 8, 4),
+            m("jr $t[8-9]|$s8|$ra", pat!(f(0x03), r(T8_RA), f(0x00), f(0x08), ANY, ANY, ANY, ANY), 8, 4),
+            m("jal addr", pat!(r(&[(0x0c, 0x0f)]), ANY, ANY, ANY, ANY, ANY, ANY, ANY), 8, 4),
+            m("j addr", pat!(r(&[(0x08, 0x0b)]), ANY, ANY, ANY, ANY, ANY, ANY, ANY), 8, 4),
+        ]
+    } else {
+        vec![
+            m("jalr $v[0-1]|$a[0-3]", pat!(f(0x09), f(0xf8), r(V0_A3), f(0x00), ANY, ANY, ANY, ANY), 8, 4),
+            m("jalr $t[0-7]|$s[0-7]", pat!(f(0x09), f(0xf8), r(T0_S7), r(R01_02), ANY, ANY, ANY, ANY), 8, 4),
+            m("jalr $t[8-9]|$s8|$ra", pat!(f(0x09), f(0xf8), r(T8_RA), f(0x03), ANY, ANY, ANY, ANY), 8, 4),
+            m("jr $v[0-1]|$a[0-3]", pat!(f(0x08), f(0x00), r(V0_A3), f(0x00), ANY, ANY, ANY, ANY), 8, 4),
+            m("jr $t[0-7]|$s[0-7]", pat!(f(0x08), f(0x00), r(T0_S7), r(R01_02), ANY, ANY, ANY, ANY), 8, 4),
+            m("jr $t[8-9]|$s8|$ra", pat!(f(0x08), f(0x00), r(T8_RA), f(0x03), ANY, ANY, ANY, ANY), 8, 4),
+            m("jal addr", pat!(ANY, ANY, ANY, r(&[(0x0c, 0x0f)]), ANY, ANY, ANY, ANY), 8, 4),
+            m("j addr", pat!(ANY, ANY, ANY, r(&[(0x08, 0x0b)]), ANY, ANY, ANY, ANY), 8, 4),
+        ]
+    }
+}
+
+/// PPC ROP anchors (gadgets.py:149-163): blr/blrl/bctr/bctrl.
+fn ppc_rop(be: bool) -> Vec<Anchor> {
+    if be {
+        vec![
+            m("blr", pat!(f(0x4e), f(0x80), f(0x00), f(0x20)), 4, 4),
+            m("blrl", pat!(f(0x4e), f(0x80), f(0x00), f(0x21)), 4, 4),
+            m("bctr", pat!(f(0x4e), f(0x80), f(0x04), f(0x20)), 4, 4),
+            m("bctrl", pat!(f(0x4e), f(0x80), f(0x04), f(0x21)), 4, 4),
+        ]
+    } else {
+        vec![
+            m("blr", pat!(f(0x20), f(0x00), f(0x80), f(0x4e)), 4, 4),
+            m("blrl", pat!(f(0x21), f(0x00), f(0x80), f(0x4e)), 4, 4),
+            m("bctr", pat!(f(0x20), f(0x04), f(0x80), f(0x4e)), 4, 4),
+            m("bctrl", pat!(f(0x21), f(0x04), f(0x80), f(0x4e)), 4, 4),
+        ]
+    }
+}
+
+/// SPARC ROP anchors (gadgets.py:165-177): retl/ret/restore.
+fn sparc_rop(be: bool) -> Vec<Anchor> {
+    if be {
+        vec![
+            m("retl", pat!(f(0x81), f(0xc3), f(0xe0), f(0x08)), 4, 4),
+            m("ret", pat!(f(0x81), f(0xc7), f(0xe0), f(0x08)), 4, 4),
+            m("restore", pat!(f(0x81), f(0xe8), f(0x00), f(0x00)), 4, 4),
+        ]
+    } else {
+        vec![
+            m("retl", pat!(f(0x08), f(0xe0), f(0xc3), f(0x81)), 4, 4),
+            m("ret", pat!(f(0x08), f(0xe0), f(0xc7), f(0x81)), 4, 4),
+            m("restore", pat!(f(0x00), f(0x00), f(0xe8), f(0x81)), 4, 4),
+        ]
+    }
+}
+
+/// ARM64 JOP anchors (gadgets.py:318-329): br/blr reg.
+fn arm64_jop(be: bool) -> Vec<Anchor> {
+    // [\x1f\x5f] (N field), [\x00-\x03], register byte set.
+    const N: &[(u8, u8)] = &[(0x1f, 0x1f), (0x5f, 0x5f)];
+    const Z: &[(u8, u8)] = &[(0x00, 0x03)];
+    const RN: &[(u8, u8)] = &[
+        (0x00, 0x00),
+        (0x20, 0x20),
+        (0x40, 0x40),
+        (0x60, 0x60),
+        (0x80, 0x80),
+        (0xa0, 0xa0),
+        (0xc0, 0xc0),
+        (0xe0, 0xe0),
+    ];
+    if be {
+        vec![
+            m("br reg", pat!(f(0xd6), r(N), r(Z), r(RN)), 4, 4),
+            m("blr reg", pat!(f(0xd6), f(0x3f), r(Z), r(RN)), 4, 4),
+        ]
+    } else {
+        vec![
+            m("br reg", pat!(r(RN), r(Z), r(N), f(0xd6)), 4, 4),
+            m("blr reg", pat!(r(RN), r(Z), f(0x3f), f(0xd6)), 4, 4),
+        ]
+    }
+}
+
+/// ARM (A32 and Thumb) JOP anchors (gadgets.py:330-362).
+///
+/// Thumb quirk ported verbatim: the `ldm.w`/`ldmdb` patterns match 6 bytes
+/// but `gad_size` is 4 — the trailing `[\x00-\xff]{4}` only gates the match
+/// (gadgets.py:337-338, 345-346).
+fn arm_jop(thumb: bool, be: bool) -> Vec<Anchor> {
+    if thumb {
+        const BX: &[(u8, u8)] = &[
+            (0x00, 0x00), (0x08, 0x08), (0x10, 0x10), (0x18, 0x18), (0x20, 0x20),
+            (0x28, 0x28), (0x30, 0x30), (0x38, 0x38), (0x40, 0x40), (0x48, 0x48),
+            (0x70, 0x70),
+        ];
+        const BLX: &[(u8, u8)] = &[
+            (0x80, 0x80), (0x88, 0x88), (0x90, 0x90), (0x98, 0x98), (0xa0, 0xa0),
+            (0xa8, 0xa8), (0xb0, 0xb0), (0xb8, 0xb8), (0xc0, 0xc0), (0xc8, 0xc8),
+            (0xf0, 0xf0),
+        ];
+        const LDM_W: &[(u8, u8)] = &[(0x90, 0x9f), (0xb0, 0xbf)];
+        const LDMDB: &[(u8, u8)] = &[(0x10, 0x1f), (0x30, 0x3f)];
+        if be {
+            vec![
+                m("bx reg", pat!(f(0x47), r(BX)), 2, 2),
+                m("blx reg", pat!(f(0x47), r(BLX)), 2, 2),
+                m("pop {,pc}", pat!(f(0xbd), ANY), 2, 2),
+                m("ldm.w reg{!}, {,pc}", pat!(f(0xe8), r(LDM_W), ANY, ANY, ANY, ANY), 4, 2),
+                m("ldmdb reg{!}, {,pc}", pat!(f(0xe9), r(LDMDB), ANY, ANY, ANY, ANY), 4, 2),
+            ]
+        } else {
+            vec![
+                m("bx reg", pat!(r(BX), f(0x47)), 2, 2),
+                m("blx reg", pat!(r(BLX), f(0x47)), 2, 2),
+                m("pop {,pc}", pat!(ANY, f(0xbd)), 2, 2),
+                m("ldm.w reg{!}, {,pc}", pat!(r(LDM_W), f(0xe8), ANY, ANY, ANY, ANY), 4, 2),
+                m("ldmdb reg{!}, {,pc}", pat!(r(LDMDB), f(0xe9), ANY, ANY, ANY, ANY), 4, 2),
+            ]
+        }
+    } else {
+        const BX: &[(u8, u8)] = &[(0x10, 0x19), (0x1e, 0x1e)];
+        const BLX: &[(u8, u8)] = &[(0x30, 0x39), (0x3e, 0x3e)];
+        const E8_E9: &[(u8, u8)] = &[(0xe8, 0xe9)];
+        const LDM_MID: &[(u8, u8)] = &[
+            (0x10, 0x1e), (0x30, 0x3e), (0x50, 0x5e), (0x70, 0x7e), (0x90, 0x9e),
+            (0xb0, 0xbe), (0xd0, 0xde), (0xf0, 0xfe),
+        ];
+        const HI: &[(u8, u8)] = &[(0x80, 0xff)];
+        if be {
+            vec![
+                m("bx reg", pat!(f(0xe1), f(0x2f), f(0xff), r(BX)), 4, 4),
+                m("blx reg", pat!(f(0xe1), f(0x2f), f(0xff), r(BLX)), 4, 4),
+                m("ldm {,pc}", pat!(r(E8_E9), r(LDM_MID), r(HI), ANY), 4, 4),
+            ]
+        } else {
+            vec![
+                m("bx reg", pat!(r(BX), f(0xff), f(0x2f), f(0xe1)), 4, 4),
+                m("blx reg", pat!(r(BLX), f(0xff), f(0x2f), f(0xe1)), 4, 4),
+                m("ldm {,pc}", pat!(ANY, r(HI), r(LDM_MID), r(E8_E9)), 4, 4),
+            ]
+        }
+    }
+}
+
+/// ARM (A32 and Thumb) SYS anchors (gadgets.py:447-467): svc.
+fn arm_sys(thumb: bool, be: bool) -> Vec<Anchor> {
+    if thumb {
+        if be {
+            vec![m("svc imm8", pat!(f(0xdf), ANY), 2, 2)]
+        } else {
+            vec![m("svc imm8", pat!(ANY, f(0xdf)), 2, 2)]
+        }
+    } else {
+        // svc{cond} imm24: condition nibble 0x0f..0xef in the top byte.
+        const SVC: &[(u8, u8)] = &[
+            (0x0f, 0x0f), (0x1f, 0x1f), (0x2f, 0x2f), (0x3f, 0x3f), (0x4f, 0x4f),
+            (0x5f, 0x5f), (0x6f, 0x6f), (0x7f, 0x7f), (0x8f, 0x8f), (0x9f, 0x9f),
+            (0xaf, 0xaf), (0xbf, 0xbf), (0xcf, 0xcf), (0xdf, 0xdf), (0xef, 0xef),
+        ];
+        if be {
+            vec![m("svc{cond} imm24", pat!(r(SVC), ANY, ANY, ANY), 4, 4)]
+        } else {
+            vec![m("svc{cond} imm24", pat!(ANY, ANY, ANY, r(SVC)), 4, 4)]
+        }
+    }
+}
+
+/// RISC-V JOP anchors (gadgets.py:363-392). Size 4 align 2 for 32-bit forms,
+/// size 2 align 2 for the compressed forms.
+fn riscv_jop(be: bool) -> Vec<Anchor> {
+    const JALR: &[(u8, u8)] = &[(0x67, 0x67), (0x6f, 0x6f), (0xe7, 0xe7), (0xef, 0xef)];
+    const BR: &[(u8, u8)] = &[(0x63, 0x63), (0xe3, 0xe3)];
+    const A0_FF: &[(u8, u8)] = &[(0xa0, 0xff)];
+    // c.j | c.beqz | c.bnez selector bytes (three tables in gadgets.py).
+    const CJ1: &[(u8, u8)] = &[
+        (0xa1, 0xa1), (0xa5, 0xa5), (0xa9, 0xa9), (0xad, 0xad), (0xb1, 0xb1),
+        (0xb5, 0xb5), (0xb9, 0xb9), (0xbd, 0xbd), (0xc1, 0xc1), (0xc5, 0xc5),
+        (0xc9, 0xc9), (0xcd, 0xcd), (0xd1, 0xd1), (0xd5, 0xd5), (0xd9, 0xd9),
+        (0xdd, 0xdd), (0xe1, 0xe1), (0xe5, 0xe5), (0xe9, 0xe9), (0xed, 0xed),
+        (0xf1, 0xf1), (0xf5, 0xf5), (0xf9, 0xf9), (0xfd, 0xfd),
+    ];
+    const CJ2: &[(u8, u8)] = &[
+        (0x01, 0x01), (0x05, 0x05), (0x09, 0x09), (0x0d, 0x0d), (0x11, 0x11),
+        (0x15, 0x15), (0x19, 0x19), (0x1d, 0x1d), (0x21, 0x21), (0x25, 0x25),
+        (0x29, 0x29), (0x2d, 0x2d), (0x31, 0x31), (0x35, 0x35), (0x39, 0x39),
+        (0x3d, 0x3d), (0x41, 0x41), (0x45, 0x45), (0x49, 0x49), (0x4d, 0x4d),
+        (0x51, 0x51), (0x55, 0x55), (0x59, 0x59), (0x5d, 0x5d),
+    ];
+    const CJ3: &[(u8, u8)] = &[
+        (0x61, 0x61), (0x65, 0x65), (0x69, 0x69), (0x6d, 0x6d), (0x71, 0x71),
+        (0x75, 0x75), (0x79, 0x79), (0x7d, 0x7d), (0x81, 0x81), (0x85, 0x85),
+        (0x89, 0x89), (0x8d, 0x8d), (0x91, 0x91), (0x95, 0x95), (0x99, 0x99),
+        (0x9d, 0x9d),
+    ];
+    const CJR_RD: &[(u8, u8)] = &[(0x02, 0x02), (0x82, 0x82)];
+    const CJR_RS1: &[(u8, u8)] = &[(0x81, 0x8f)];
+    const CJALR_RS1: &[(u8, u8)] = &[(0x91, 0x9f)];
+    if be {
+        vec![
+            m("jalr/j/jal reg, off", pat!(ANY, ANY, ANY, r(JALR)), 4, 2),
+            m("branch reg, off", pat!(ANY, ANY, ANY, r(BR)), 4, 2),
+            m("c.j|c.beqz|c.bnez (1)", pat!(r(A0_FF), r(CJ1)), 2, 2),
+            m("c.j|c.beqz|c.bnez (2)", pat!(r(A0_FF), r(CJ2)), 2, 2),
+            m("c.j|c.beqz|c.bnez (3)", pat!(r(A0_FF), r(CJ3)), 2, 2),
+            m("c.jr register", pat!(r(CJR_RS1), r(CJR_RD)), 2, 2),
+            m("c.jalr register", pat!(r(CJALR_RS1), r(CJR_RD)), 2, 2),
+        ]
+    } else {
+        vec![
+            m("jalr/j/jal reg, off", pat!(r(JALR), ANY, ANY, ANY), 4, 2),
+            m("branch reg, off", pat!(r(BR), ANY, ANY, ANY), 4, 2),
+            m("c.j|c.beqz|c.bnez (1)", pat!(r(CJ1), r(A0_FF)), 2, 2),
+            m("c.j|c.beqz|c.bnez (2)", pat!(r(CJ2), r(A0_FF)), 2, 2),
+            m("c.j|c.beqz|c.bnez (3)", pat!(r(CJ3), r(A0_FF)), 2, 2),
+            m("c.jr register", pat!(r(CJR_RD), r(CJR_RS1)), 2, 2),
+            m("c.jalr register", pat!(r(CJR_RD), r(CJALR_RS1)), 2, 2),
+        ]
+    }
+}
+
 /// Find all non-overlapping matches of `anchor` in `code`, ascending
 /// (Python `re.finditer` semantics: resume at `match_end` after a hit).
+///
+/// memchr-accelerated when the pattern starts with a fixed byte; falls back
+/// to a linear scan when it starts with a wildcard/class (many fixed-width
+/// ISA anchors do — the buffers are small and anchors are scanned in
+/// parallel, so this stays cheap).
 pub fn find_matches(code: &[u8], anchor: &Anchor) -> Vec<usize> {
-    let first = match anchor.pattern.first() {
-        Some(BytePat::Fixed(b)) => *b,
-        _ => unreachable!("all x86 anchors start with a fixed byte"),
-    };
-    let len = anchor.size();
+    match anchor.pattern.first() {
+        Some(BytePat::Fixed(first)) => find_matches_fixed_head(code, anchor, *first),
+        _ => find_matches_linear(code, anchor),
+    }
+}
+
+fn find_matches_fixed_head(code: &[u8], anchor: &Anchor, first: u8) -> Vec<usize> {
+    let len = anchor.pattern.len();
     let mut hits = Vec::new();
     let mut pos = 0usize;
     while pos < code.len() {
@@ -179,6 +621,26 @@ pub fn find_matches(code: &[u8], anchor: &Anchor) -> Vec<usize> {
             pos = p + len; // non-overlapping, like re.finditer
         } else {
             pos = p + 1;
+        }
+    }
+    hits
+}
+
+fn find_matches_linear(code: &[u8], anchor: &Anchor) -> Vec<usize> {
+    let len = anchor.pattern.len();
+    let mut hits = Vec::new();
+    let mut pos = 0usize;
+    while pos + len <= code.len() {
+        let ok = anchor
+            .pattern
+            .iter()
+            .enumerate()
+            .all(|(i, bp)| bp.matches(code[pos + i]));
+        if ok {
+            hits.push(pos);
+            pos += len; // non-overlapping, like re.finditer
+        } else {
+            pos += 1;
         }
     }
     hits
