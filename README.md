@@ -8,6 +8,10 @@ of magnitude faster on x86/x64.
 The full design rationale lives in [`../PLAN.md`](../PLAN.md). ROPgadget
 remains the parity oracle; its source is cloned at `../ropgadget`.
 
+**📖 User documentation: [MANUAL.md](MANUAL.md)** — installation, concepts,
+CLI reference, and 9 scenario-based use cases (ASLR workflows, ring0 kernel
+ROP, chain generation, MCP/AI-agent setup, …).
+
 ## Layout
 
 ```
