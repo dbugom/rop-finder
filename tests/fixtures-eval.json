@@ -1,0 +1,74 @@
+{
+  "gate": "macro_precision >= 0.90",
+  "held_out": 2872,
+  "macro_precision": 1.0,
+  "macro_recall": 1.0,
+  "passed": true,
+  "per_class": [
+    {
+      "class": "reg-write",
+      "fn": 0,
+      "fp": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 1256
+    },
+    {
+      "class": "stack-pivot",
+      "fn": 0,
+      "fp": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 131
+    },
+    {
+      "class": "mem-read",
+      "fn": 0,
+      "fp": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 1131
+    },
+    {
+      "class": "mem-write",
+      "fn": 0,
+      "fp": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 1094
+    },
+    {
+      "class": "arithmetic",
+      "fn": 0,
+      "fp": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 1586
+    },
+    {
+      "class": "syscall",
+      "fn": 0,
+      "fp": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 22
+    },
+    {
+      "class": "dispatcher",
+      "fn": 0,
+      "fp": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 92
+    },
+    {
+      "class": "other",
+      "fn": 0,
+      "fp": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 639
+    }
+  ],
+  "samples": 5744
+}

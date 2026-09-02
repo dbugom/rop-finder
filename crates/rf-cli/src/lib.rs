@@ -150,10 +150,27 @@ pub struct Cli {
     /// Emit a JSON array of {vaddr, bytes, text} instead of human output
     #[arg(long)]
     pub json: bool,
+
+    /// Semantic classification (Phase 5): --json gadget records gain
+    /// class/labels/regs_written/regs_read/side_effects/quality fields.
+    /// Rules live in TAXONOMY.md; no effect without --json
+    #[arg(long)]
+    pub classify: bool,
+
+    /// Rank gadgets by quality score (best first, ties by address);
+    /// applies to both human and JSON output
+    #[arg(long)]
+    pub rank: bool,
+
+    /// Cache scan results on disk, keyed by the binary's content hash plus
+    /// all scan parameters. Cache directory: ROP_FINDER_CACHE_DIR, else
+    /// %LOCALAPPDATA%/rop-finder/cache (Windows) or ~/.cache/rop-finder
+    #[arg(long)]
+    pub cache: bool,
 }
 
 #[derive(Serialize)]
-struct JsonGadget {
+struct JsonGadget<'a> {
     vaddr: String,
     bytes: String,
     text: String,
@@ -164,6 +181,24 @@ struct JsonGadget {
     /// was used.
     #[serde(skip_serializing_if = "Option::is_none")]
     section: Option<String>,
+    /// Phase 5 --classify fields (TAXONOMY.md): primary class, full label
+    /// set, register effects, side-effect count, and R12 quality score.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    class: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    labels: Option<Vec<&'static str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    regs_written: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    regs_read: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    side_effects: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quality: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatcher: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    low_confidence: Option<bool>,
 }
 
 pub fn parse_hex(s: &str, what: &str) -> Result<u64, String> {
@@ -1180,15 +1215,65 @@ fn run(cli: Cli) -> Result<i32, String> {
     }
     let universal_arch = view.universal.then_some(view.arch());
 
-    let gadgets = match rf_scan::scan_binary(&view, &opts) {
-        Ok(g) => g,
-        Err(e) => {
-            // Scan-time Unsupported errors (e.g. capstone mode) are
-            // binary-level failures, like ROPgadget's loader errors.
-            eprintln!("[Error] {e}");
-            return Ok(2);
+    let do_scan = |view: &RegionView, opts: &ScanOptions| -> Result<Vec<Gadget>, i32> {
+        match rf_scan::scan_binary(view, opts) {
+            Ok(g) => Ok(g),
+            Err(e) => {
+                // Scan-time Unsupported errors (e.g. capstone mode) are
+                // binary-level failures, like ROPgadget's loader errors.
+                eprintln!("[Error] {e}");
+                Err(2)
+            }
         }
     };
+    let mut gadgets = if cli.cache {
+        match cache_dir() {
+            Some(dir) => {
+                let key = cache_key(&bytes, &opts, &cli.section, base);
+                match cache_load(&dir, &key) {
+                    Some(g) => {
+                        eprintln!("[Cache] hit {} ({} gadgets)", &key[..16], g.len());
+                        g
+                    }
+                    None => {
+                        let g = match do_scan(&view, &opts) {
+                            Ok(g) => g,
+                            Err(c) => return Ok(c),
+                        };
+                        match cache_store(&dir, &key, &g) {
+                            Ok(()) => eprintln!(
+                                "[Cache] miss {} — stored {} gadgets",
+                                &key[..16],
+                                g.len()
+                            ),
+                            Err(e) => {
+                                eprintln!("[Cache] miss {} — store failed: {e}", &key[..16])
+                            }
+                        }
+                        g
+                    }
+                }
+            }
+            None => {
+                eprintln!("[Cache] no cache directory (set ROP_FINDER_CACHE_DIR); scanning");
+                match do_scan(&view, &opts) {
+                    Ok(g) => g,
+                    Err(c) => return Ok(c),
+                }
+            }
+        }
+    } else {
+        match do_scan(&view, &opts) {
+            Ok(g) => g,
+            Err(c) => return Ok(c),
+        }
+    };
+    let mut classes: Option<Vec<rf_classify::Classification>> = None;
+    if cli.classify || cli.rank {
+        let (g, c) = classify_gadgets(gadgets, view.arch(), cli.rank);
+        gadgets = g;
+        classes = Some(c);
+    }
     let result = ScanResult {
         gadgets,
         addr_size: view.addr_size(),
@@ -1197,11 +1282,38 @@ fn run(cli: Cli) -> Result<i32, String> {
     };
 
     if cli.json {
-        print_json(&result, opts.offset);
+        // --rank alone reorders but does not add classification fields.
+        print_json(
+            &result,
+            opts.offset,
+            classes.as_deref().filter(|_| cli.classify),
+        );
     } else {
         print_human(&result);
     }
     Ok(0)
+}
+
+/// Phase 5: classify every gadget and, when `rank` is set, sort by
+/// quality descending with vaddr-ascending tie-break (TAXONOMY.md R12).
+fn classify_gadgets(
+    gadgets: Vec<Gadget>,
+    arch: Arch,
+    rank: bool,
+) -> (Vec<Gadget>, Vec<rf_classify::Classification>) {
+    let mut pairs: Vec<(Gadget, rf_classify::Classification)> = gadgets
+        .into_iter()
+        .map(|g| {
+            let c = rf_classify::classify(&g, arch);
+            (g, c)
+        })
+        .collect();
+    if rank {
+        pairs.sort_by(|(ga, ca), (gb, cb)| {
+            cb.quality.cmp(&ca.quality).then(ga.vaddr.cmp(&gb.vaddr))
+        });
+    }
+    pairs.into_iter().unzip()
 }
 
 pub fn fmt_addr(vaddr: u64, addr_size: usize) -> String {
@@ -1229,29 +1341,174 @@ pub fn section_of(selected: &[(String, u64, u64)], vaddr: u64) -> Option<String>
         .map(|(name, _, _)| name.clone())
 }
 
-fn to_json(res: &ScanResult, offset: u64) -> Vec<JsonGadget> {
+#[cfg(test)]
+fn to_json(res: &ScanResult, offset: u64) -> Vec<JsonGadget<'_>> {
+    to_json_classified(res, offset, None)
+}
+
+fn to_json_classified<'a>(
+    res: &'a ScanResult,
+    offset: u64,
+    classes: Option<&'a [rf_classify::Classification]>,
+) -> Vec<JsonGadget<'a>> {
     let arch = res.universal_arch.map(arch_name);
     res.gadgets
         .iter()
-        .map(|g| JsonGadget {
-            vaddr: fmt_addr(g.vaddr, res.addr_size),
-            bytes: g.bytes_hex(),
-            text: g.text(),
-            arch,
-            section: res
-                .selected_sections
-                .as_deref()
-                .and_then(|s| section_of(s, g.vaddr.wrapping_sub(offset))),
+        .enumerate()
+        .map(|(i, g)| {
+            let c = classes.map(|cs| &cs[i]);
+            JsonGadget {
+                vaddr: fmt_addr(g.vaddr, res.addr_size),
+                bytes: g.bytes_hex(),
+                text: g.text(),
+                arch,
+                section: res
+                    .selected_sections
+                    .as_deref()
+                    .and_then(|s| section_of(s, g.vaddr.wrapping_sub(offset))),
+                class: c.map(|c| c.primary.name()),
+                labels: c.map(|c| c.labels.iter().map(|l| l.name()).collect()),
+                regs_written: c.map(|c| c.regs_written.as_slice()),
+                regs_read: c.map(|c| c.regs_read.as_slice()),
+                side_effects: c.map(|c| c.side_effects),
+                quality: c.map(|c| c.quality),
+                dispatcher: c.map(|c| c.dispatcher),
+                low_confidence: c.map(|c| c.low_confidence),
+            }
         })
         .collect()
 }
 
-fn print_json(res: &ScanResult, offset: u64) {
+fn print_json(res: &ScanResult, offset: u64, classes: Option<&[rf_classify::Classification]>) {
     // Serialization of this simple structure cannot fail.
     println!(
         "{}",
-        serde_json::to_string_pretty(&to_json(res, offset)).unwrap()
+        serde_json::to_string_pretty(&to_json_classified(res, offset, classes)).unwrap()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 scan cache (--cache): content-hash + parameter-hash keyed JSON
+// gadget lists on disk.
+// ---------------------------------------------------------------------------
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
+/// Cache directory: ROP_FINDER_CACHE_DIR wins, else the platform default
+/// (%LOCALAPPDATA%/rop-finder/cache on Windows, ~/.cache/rop-finder
+/// elsewhere). None when no base directory can be determined.
+fn cache_dir() -> Option<std::path::PathBuf> {
+    if let Ok(d) = std::env::var("ROP_FINDER_CACHE_DIR") {
+        if !d.is_empty() {
+            return Some(std::path::PathBuf::from(d));
+        }
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .map(|p| std::path::PathBuf::from(p).join("rop-finder").join("cache"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(|p| {
+            std::path::PathBuf::from(p)
+                .join(".cache")
+                .join("rop-finder")
+        })
+    }
+}
+
+/// Cache key: the binary's content hash plus every scan parameter that
+/// can change the output (parallel excluded — output-identical).
+fn cache_key(bytes: &[u8], opts: &ScanOptions, sections: &[String], base: Option<u64>) -> String {
+    let file_hash = sha256_hex(bytes);
+    let param_hash = sha256_hex(
+        format!(
+            "{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{:?}",
+            opts.depth,
+            opts.rop,
+            opts.jop,
+            opts.sys,
+            opts.multibr,
+            opts.only,
+            opts.filter,
+            opts.range,
+            opts.badbytes,
+            opts.offset,
+            opts.thumb,
+            opts.cfg_aware,
+            sections,
+            base
+        )
+        .as_bytes(),
+    );
+    // "--" separator: ':' is not allowed in Windows file names.
+    format!("{file_hash}--{param_hash}")
+}
+
+#[derive(Serialize, serde::Deserialize)]
+struct CacheFile {
+    version: u32,
+    gadgets: Vec<CachedGadget>,
+}
+
+#[derive(Serialize, serde::Deserialize)]
+struct CachedGadget {
+    vaddr: u64,
+    bytes: String,
+    insns: Vec<String>,
+    delay_slot: bool,
+}
+
+fn cache_load(dir: &std::path::Path, key: &str) -> Option<Vec<Gadget>> {
+    let text = std::fs::read_to_string(dir.join(format!("{key}.json"))).ok()?;
+    let parsed: CacheFile = serde_json::from_str(&text).ok()?;
+    if parsed.version != 1 {
+        return None;
+    }
+    parsed
+        .gadgets
+        .into_iter()
+        .map(|c| {
+            if c.bytes.len() % 2 != 0 {
+                return None;
+            }
+            let bytes: Option<Vec<u8>> = (0..c.bytes.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&c.bytes[i..i + 2], 16).ok())
+                .collect();
+            Some(Gadget {
+                vaddr: c.vaddr,
+                bytes: bytes?,
+                insns: c.insns,
+                delay_slot: c.delay_slot,
+            })
+        })
+        .collect()
+}
+
+fn cache_store(dir: &std::path::Path, key: &str, gadgets: &[Gadget]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let payload = CacheFile {
+        version: 1,
+        gadgets: gadgets
+            .iter()
+            .map(|g| CachedGadget {
+                vaddr: g.vaddr,
+                bytes: g.bytes_hex(),
+                insns: g.insns.clone(),
+                delay_slot: g.delay_slot,
+            })
+            .collect(),
+    };
+    // Serialization of this simple structure cannot fail.
+    let text = serde_json::to_string(&payload).unwrap();
+    std::fs::write(dir.join(format!("{key}.json")), text)
 }
 
 pub fn main_entry() -> ExitCode {
@@ -1308,6 +1565,9 @@ mod tests {
             raw_mode: raw_mode.map(Into::into),
             raw_endian: raw_endian.map(Into::into),
             json: false,
+            classify: false,
+            rank: false,
+            cache: false,
         }
     }
 
@@ -1387,6 +1647,120 @@ mod tests {
     /// base-invariant, so the survivor is the same gadget across rebases).
     fn bare_ret_vaddr(gadgets: &[Gadget]) -> Option<u64> {
         gadgets.iter().find(|g| g.text() == "ret").map(|g| g.vaddr)
+    }
+
+    fn scan_result_for(fixture: &str, depth: usize) -> (RegionView, ScanResult) {
+        let (view, gadgets) = scan_fixture(fixture, None, &[], |o| o.depth = depth);
+        let res = ScanResult {
+            gadgets,
+            addr_size: view.addr_size(),
+            universal_arch: None,
+            selected_sections: None,
+        };
+        (view, res)
+    }
+
+    /// Unique temp directory per test (parallel cargo test safe); removed
+    /// on drop.
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "rf-cli-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            TempDir(p)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn cache_roundtrip_and_key_sensitivity() {
+        let (view, res) = scan_result_for("elf-Linux-x64", 4);
+        let bytes = fixture_bytes("elf-Linux-x64");
+        let mut opts = default_opts();
+        opts.depth = 4;
+        let dir = TempDir::new("cache");
+
+        let key = cache_key(&bytes, &opts, &[], None);
+        assert!(cache_load(&dir.0, &key).is_none(), "cold cache misses");
+        cache_store(&dir.0, &key, &res.gadgets).unwrap();
+        let loaded = cache_load(&dir.0, &key).expect("warm cache hits");
+        assert_eq!(loaded.len(), res.gadgets.len());
+        for (a, b) in loaded.iter().zip(res.gadgets.iter()) {
+            assert_eq!(a.vaddr, b.vaddr);
+            assert_eq!(a.bytes, b.bytes);
+            assert_eq!(a.insns, b.insns);
+            assert_eq!(a.delay_slot, b.delay_slot);
+        }
+
+        // Every output-affecting parameter changes the key.
+        let by_depth = cache_key(&bytes, &default_opts(), &[], None);
+        assert_ne!(key, by_depth, "depth is part of the key");
+        let by_base = cache_key(&bytes, &opts, &[], Some(0x400000));
+        assert_ne!(key, by_base, "base rebase is part of the key");
+        let by_section = cache_key(&bytes, &opts, &[".text".to_string()], None);
+        assert_ne!(key, by_section, "section selection is part of the key");
+        let by_bytes = cache_key(b"not the same binary", &opts, &[], None);
+        assert_ne!(key, by_bytes, "file content is part of the key");
+        // Same inputs → same key (determinism).
+        assert_eq!(key, cache_key(&bytes, &opts, &[], None));
+        // ':' would be an invalid Windows file name; keys must avoid it.
+        assert!(!key.contains(':'));
+        drop(view);
+    }
+
+    #[test]
+    fn classify_adds_json_fields() {
+        let (view, res) = scan_result_for("elf-Linux-x64", 5);
+        let (gadgets, classes) = classify_gadgets(res.gadgets, view.arch(), false);
+        let res = ScanResult { gadgets, ..res };
+        let json = to_json_classified(&res, 0, Some(&classes));
+        let pop_rax = json
+            .iter()
+            .find(|j| j.text == "pop rax ; ret")
+            .expect("fixture has pop rax ; ret");
+        assert_eq!(pop_rax.class, Some("reg-write"));
+        assert_eq!(pop_rax.labels.as_deref(), Some(&["reg-write"][..]));
+        assert_eq!(pop_rax.regs_written.unwrap(), &["rax".to_string()]);
+        assert_eq!(pop_rax.side_effects, Some(1));
+        assert_eq!(pop_rax.quality, Some(100));
+        assert_eq!(pop_rax.dispatcher, Some(false));
+        assert_eq!(pop_rax.low_confidence, Some(false));
+        // Without --classify the fields are absent from the JSON text.
+        let plain = serde_json::to_string(&to_json(&res, 0)[0]).unwrap();
+        assert!(!plain.contains("\"class\""));
+        assert!(!plain.contains("\"quality\""));
+    }
+
+    #[test]
+    fn rank_sorts_by_quality_desc_then_vaddr() {
+        let (view, res) = scan_result_for("elf-Linux-x64", 5);
+        let (gadgets, classes) = classify_gadgets(res.gadgets, view.arch(), true);
+        assert_eq!(gadgets.len(), classes.len());
+        for (gw, cw) in gadgets.windows(2).zip(classes.windows(2)) {
+            let (ga, gb, ca, cb) = (&gw[0], &gw[1], &cw[0], &cw[1]);
+            assert!(
+                ca.quality > cb.quality || (ca.quality == cb.quality && ga.vaddr < gb.vaddr),
+                "ordering violated: q{} @ {:#x} before q{} @ {:#x}",
+                ca.quality,
+                ga.vaddr,
+                cb.quality,
+                gb.vaddr
+            );
+        }
+        // The cleanest gadgets score 100 and lead the output.
+        assert_eq!(classes[0].quality, 100);
+        assert!(gadgets[0].text().ends_with(" ; ret") || gadgets[0].text() == "ret");
     }
 
     #[test]

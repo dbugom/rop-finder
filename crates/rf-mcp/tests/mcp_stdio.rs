@@ -184,6 +184,43 @@ async fn mcp_stdio_end_to_end() {
         assert_eq!(g["section"], ".plt");
     }
 
+    // sort_by quality: quality/class fields present, descending order
+    let resp = mcp
+        .call_tool(
+            50,
+            "find_gadgets",
+            json!({"binary_path": elf, "depth": 6, "max_results": 50, "sort_by": "quality"}),
+        )
+        .await;
+    let body = structured(&resp);
+    let gadgets = body["gadgets"].as_array().unwrap();
+    assert_eq!(gadgets.len(), 50);
+    let mut prev: Option<i64> = None;
+    for g in gadgets {
+        let q = g["quality"].as_i64().expect("quality field present");
+        assert!(g["class"].as_str().is_some(), "class field present");
+        if let Some(p) = prev {
+            assert!(p >= q, "quality descending: {p} then {q}");
+        }
+        prev = Some(q);
+    }
+    // the top of a quality-sorted list is a clean 100-score gadget
+    assert_eq!(gadgets[0]["quality"], 100);
+
+    // unsupported sort_by is rejected as a usage error
+    let resp = mcp
+        .call_tool(
+            51,
+            "find_gadgets",
+            json!({"binary_path": elf, "depth": 6, "sort_by": "vaddr"}),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], Value::Bool(true));
+    assert!(resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("sort_by"));
+
     // get_binary_info on a PE fixture
     let resp = mcp
         .call_tool(6, "get_binary_info", json!({"binary_path": pe}))

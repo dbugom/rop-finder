@@ -148,6 +148,13 @@ struct CachedGadget {
     arch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     section: Option<String>,
+    /// Phase 5 quality score (TAXONOMY.md R12), computed once at scan
+    /// time; enables `sort_by: "quality"` without rescanning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quality: Option<i32>,
+    /// Phase 5 primary class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    class: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -239,8 +246,62 @@ pub struct GadgetQuery {
     pub badbytes: Option<String>,
     /// Maximum gadgets returned (default 1000, hard max 50000).
     pub max_results: Option<usize>,
+    /// Result ordering before sampling: "quality" sorts by the Phase 5
+    /// quality score (best gadgets first, ties by address). Anything
+    /// else is rejected.
+    pub sort_by: Option<String>,
     /// Per-request timeout in seconds (default 60, max 300).
     pub timeout_secs: Option<u64>,
+}
+
+/// Scan architecture of a loaded binary (for on-demand classification).
+fn arch_from_bytes(bytes: &[u8]) -> Option<rf_core::Arch> {
+    use rf_core::{Image, LoadedBinary};
+    match rf_core::Binary::load(bytes).ok()? {
+        LoadedBinary::Elf(b) => Some(Image::arch(&b)),
+        LoadedBinary::Pe(b) => Some(Image::arch(&b)),
+        LoadedBinary::MachO(b) => Some(Image::arch(&b)),
+        LoadedBinary::Universal(u) => Some(Image::arch(&u.slices()[0])),
+        LoadedBinary::Raw(b) => Some(Image::arch(&b)),
+    }
+}
+
+/// Reconstruct a scan gadget from its cached form (for on-demand
+/// classification of cache entries that predate quality caching).
+fn gadget_from_cached(c: &CachedGadget) -> Option<rf_scan::Gadget> {
+    if c.bytes.len() % 2 != 0 {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = (0..c.bytes.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&c.bytes[i..i + 2], 16).ok())
+        .collect();
+    let vaddr = u64::from_str_radix(c.vaddr.trim_start_matches("0x"), 16).ok()?;
+    Some(rf_scan::Gadget {
+        vaddr,
+        bytes: bytes?,
+        insns: c.text.split(" ; ").map(str::to_string).collect(),
+        delay_slot: false,
+    })
+}
+
+/// Order gadgets by Phase 5 quality (descending, vaddr-ascending ties,
+/// R12). Quality missing from a cache entry (old cache file) is computed
+/// on demand from the cached bytes; unclassifiable entries sort last.
+fn sort_by_quality(gadgets: Vec<&CachedGadget>, arch: Option<rf_core::Arch>) -> Vec<&CachedGadget> {
+    let mut keyed: Vec<(i32, &CachedGadget)> = gadgets
+        .into_iter()
+        .map(|g| {
+            let q = g.quality.or_else(|| {
+                arch.and_then(|a| {
+                    gadget_from_cached(g).map(|rg| rf_classify::classify(&rg, a).quality)
+                })
+            });
+            (q.unwrap_or(0), g)
+        })
+        .collect();
+    keyed.sort_by(|(qa, ga), (qb, gb)| qb.cmp(qa).then(ga.vaddr.cmp(&gb.vaddr)));
+    keyed.into_iter().map(|(_, g)| g).collect()
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -480,6 +541,17 @@ fn query_to_request(q: &GadgetQuery, rop: bool, jop: bool, sys: bool) -> rf_cli:
 // The server
 // ---------------------------------------------------------------------------
 
+/// Post-scan options applied over the cached gadget set.
+#[derive(Default)]
+struct PostOpts {
+    /// Regex/substring filter over gadget text (`--re`).
+    re: Option<String>,
+    /// Address alignment filter (`--align`).
+    align: Option<u64>,
+    /// Ordering before sampling; only "quality" is supported.
+    sort_by: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct RopFinderMcp {
     config: Arc<ServerConfig>,
@@ -501,11 +573,23 @@ impl RopFinderMcp {
         &self,
         req: rf_cli::ScanRequest,
         binary_path: &str,
-        post_re: Option<String>,
-        post_align: Option<u64>,
+        post: PostOpts,
         max_results: Option<usize>,
         timeout_secs: Option<u64>,
     ) -> Result<Value, ToolError> {
+        let PostOpts {
+            re: post_re,
+            align: post_align,
+            sort_by,
+        } = post;
+        if let Some(sb) = &sort_by {
+            if sb != "quality" {
+                return Err(ToolError::new(
+                    "usage",
+                    format!("unsupported sort_by {sb:?}; only \"quality\" is available"),
+                ));
+            }
+        }
         let path = confine_path(&self.config.allow_dirs, binary_path)?;
         let max = clamp_max_results(max_results, self.config.max_results);
         let timeout = clamp_timeout(timeout_secs, self.config.timeout);
@@ -515,9 +599,12 @@ impl RopFinderMcp {
             let bytes = std::fs::read(&path)
                 .map_err(|e| ToolError::new("io_error", format!("cannot read {path:?}: {e}")))?;
             let file_hash = sha256_hex(&bytes);
+            // base and cfg_aware change the scan output too — they must be
+            // part of the key or different requests would share a cache
+            // entry (cache poisoning).
             let param_hash = sha256_hex(
                 format!(
-                    "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{}",
+                    "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{}|{}|{}",
                     req.depth,
                     req.rop,
                     req.jop,
@@ -529,11 +616,14 @@ impl RopFinderMcp {
                     req.badbytes.as_deref().unwrap_or(""),
                     req.offset.as_deref().unwrap_or(""),
                     req.section,
-                    req.thumb
+                    req.thumb,
+                    req.base.as_deref().unwrap_or(""),
+                    req.cfg_aware
                 )
                 .as_bytes(),
             );
-            let key = format!("{file_hash}:{param_hash}");
+            // "--" separator: ':' is not allowed in Windows file names.
+            let key = format!("{file_hash}--{param_hash}");
             let (scan, cache_status) = match cache.get(&key) {
                 Some(hit) => (hit, "hit"),
                 None => {
@@ -542,10 +632,15 @@ impl RopFinderMcp {
                     let res = &outcome.result;
                     let offset = outcome.opts.offset;
                     let arch = res.universal_arch.map(rf_cli::arch_name);
-                    let gadgets =
-                        res.gadgets
-                            .iter()
-                            .map(|g| CachedGadget {
+                    // Phase 5: classify once at scan time so quality/class
+                    // ride in the cache (sort_by quality needs no rescan).
+                    let class_arch = arch_from_bytes(&bytes);
+                    let gadgets = res
+                        .gadgets
+                        .iter()
+                        .map(|g| {
+                            let cls = class_arch.map(|a| rf_classify::classify(g, a));
+                            CachedGadget {
                                 vaddr: rf_cli::fmt_addr(g.vaddr, res.addr_size),
                                 bytes: g.bytes_hex(),
                                 text: g.text(),
@@ -553,8 +648,11 @@ impl RopFinderMcp {
                                 section: res.selected_sections.as_deref().and_then(|s| {
                                     rf_cli::section_of(s, g.vaddr.wrapping_sub(offset))
                                 }),
-                            })
-                            .collect();
+                                quality: cls.as_ref().map(|c| c.quality),
+                                class: cls.as_ref().map(|c| c.primary.name().to_string()),
+                            }
+                        })
+                        .collect();
                     (
                         cache.put(
                             &key,
@@ -584,6 +682,10 @@ impl RopFinderMcp {
                             .unwrap_or(false)
                     });
                 }
+            }
+            // Phase 5: quality ordering before sampling (top-N by quality).
+            if sort_by.is_some() {
+                gadgets = sort_by_quality(gadgets, arch_from_bytes(&bytes));
             }
 
             let total_count = gadgets.len();
@@ -707,8 +809,10 @@ impl RopFinderMcp {
     /// Find ROP gadgets (return-oriented; ends in ret-like control flow).
     #[tool(
         description = "Find ROP gadgets in a binary (ret-terminated). Returns up to \
-        max_results gadgets (default 1000) plus total_count and a truncated flag. The binary \
-        path must be inside an allowed directory (server cwd by default)."
+        max_results gadgets (default 1000) plus total_count and a truncated flag. Set \
+        sort_by=\"quality\" to rank gadgets by the Phase 5 quality score (cleanest first) \
+        before sampling. The binary path must be inside an allowed directory (server cwd \
+        by default)."
     )]
     async fn find_gadgets(
         &self,
@@ -719,8 +823,10 @@ impl RopFinderMcp {
             .run_scan(
                 req,
                 &q.binary_path,
-                None,
-                None,
+                PostOpts {
+                    sort_by: q.sort_by.clone(),
+                    ..Default::default()
+                },
                 q.max_results,
                 q.timeout_secs,
             )
@@ -745,8 +851,10 @@ impl RopFinderMcp {
             .run_scan(
                 req,
                 &q.binary_path,
-                None,
-                None,
+                PostOpts {
+                    sort_by: q.sort_by.clone(),
+                    ..Default::default()
+                },
                 q.max_results,
                 q.timeout_secs,
             )
@@ -771,8 +879,10 @@ impl RopFinderMcp {
             .run_scan(
                 req,
                 &q.binary_path,
-                None,
-                None,
+                PostOpts {
+                    sort_by: q.sort_by.clone(),
+                    ..Default::default()
+                },
                 q.max_results,
                 q.timeout_secs,
             )
@@ -840,8 +950,10 @@ impl RopFinderMcp {
             .run_scan(
                 req,
                 &q.binary_path,
-                Some(q.pattern.clone()),
-                None,
+                PostOpts {
+                    re: Some(q.pattern.clone()),
+                    ..Default::default()
+                },
                 q.max_results,
                 q.timeout_secs,
             )
@@ -891,8 +1003,11 @@ impl RopFinderMcp {
             .run_scan(
                 parsed.request,
                 &q.binary_path,
-                parsed.re,
-                parsed.align,
+                PostOpts {
+                    re: parsed.re,
+                    align: parsed.align,
+                    sort_by: None,
+                },
                 q.max_results,
                 q.timeout_secs,
             )
@@ -1104,6 +1219,43 @@ mod tests {
     }
 
     #[test]
+    fn sort_by_quality_orders_desc_with_vaddr_ties() {
+        let mk = |vaddr: &str, bytes: &str, text: &str, quality: Option<i32>| CachedGadget {
+            vaddr: vaddr.into(),
+            bytes: bytes.into(),
+            text: text.into(),
+            arch: None,
+            section: None,
+            quality,
+            class: None,
+        };
+        let cached = vec![
+            // messy multi-effect gadget: quality 79
+            mk(
+                "0x1000",
+                "504801d859c3",
+                "push rax ; add rax, rbx ; pop rcx ; ret",
+                None,
+            ),
+            // clean: quality 100
+            mk("0x2000", "58c3", "pop rax ; ret", None),
+            // pre-cached quality rides along without reclassification
+            mk("0x3000", "c3", "ret", Some(85)),
+            // tie on quality 100: lower vaddr first
+            mk("0x0500", "5fc3", "pop rdi ; ret", None),
+        ];
+        let refs: Vec<&CachedGadget> = cached.iter().collect();
+        let sorted = sort_by_quality(refs, Some(rf_core::Arch::X64));
+        let order: Vec<&str> = sorted.iter().map(|g| g.vaddr.as_str()).collect();
+        assert_eq!(order, ["0x0500", "0x2000", "0x3000", "0x1000"]);
+        // None arch + missing quality -> q=0 entries sort last by vaddr
+        let refs: Vec<&CachedGadget> = cached.iter().collect();
+        let sorted = sort_by_quality(refs, None);
+        let order: Vec<&str> = sorted.iter().map(|g| g.vaddr.as_str()).collect();
+        assert_eq!(order, ["0x3000", "0x0500", "0x1000", "0x2000"]);
+    }
+
+    #[test]
     fn cache_roundtrip_mem_and_disk() {
         let t = TempDir::new("cache");
         let cache = Cache::new(Some(t.canon().clone()));
@@ -1114,6 +1266,8 @@ mod tests {
                 text: "ret".into(),
                 arch: None,
                 section: None,
+                quality: None,
+                class: None,
             }],
             fallback_names: false,
         };

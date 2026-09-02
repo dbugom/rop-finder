@@ -89,7 +89,7 @@
     "name": "build_rop_chain"
   },
   {
-    "description": "Find ROP gadgets in a binary (ret-terminated). Returns up to max_results gadgets (default 1000) plus total_count and a truncated flag. The binary path must be inside an allowed directory (server cwd by default).",
+    "description": "Find ROP gadgets in a binary (ret-terminated). Returns up to max_results gadgets (default 1000) plus total_count and a truncated flag. Set sort_by=\"quality\" to rank gadgets by the Phase 5 quality score (cleanest first) before sampling. The binary path must be inside an allowed directory (server cwd by default).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -152,6 +152,13 @@
         },
         "section": {
           "description": "Executable section name(s) to scan; comma-separated, `*` globbing\n(e.g. \".text\" or \".init*,.plt\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sort_by": {
+          "description": "Result ordering before sampling: \"quality\" sorts by the Phase 5\nquality score (best gadgets first, ties by address). Anything\nelse is rejected.",
           "type": [
             "string",
             "null"
@@ -243,6 +250,13 @@
             "null"
           ]
         },
+        "sort_by": {
+          "description": "Result ordering before sampling: \"quality\" sorts by the Phase 5\nquality score (best gadgets first, ties by address). Anything\nelse is rejected.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "timeout_secs": {
           "description": "Per-request timeout in seconds (default 60, max 300).",
           "format": "uint64",
@@ -324,6 +338,13 @@
         },
         "section": {
           "description": "Executable section name(s) to scan; comma-separated, `*` globbing\n(e.g. \".text\" or \".init*,.plt\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sort_by": {
+          "description": "Result ordering before sampling: \"quality\" sorts by the Phase 5\nquality score (best gadgets first, ties by address). Anything\nelse is rejected.",
           "type": [
             "string",
             "null"

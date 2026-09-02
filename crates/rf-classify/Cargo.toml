@@ -1,6 +1,13 @@
 [package]
 name = "rf-classify"
-description = "Semantic classification of gadgets (stub)"
+description = "Semantic classification and quality ranking of gadgets"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+rf-core = { path = "../rf-core" }
+rf-scan = { path = "../rf-scan" }
+iced-x86.workspace = true
+serde.workspace = true
+serde_json.workspace = true

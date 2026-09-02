@@ -36,7 +36,7 @@ tests/
 | 3. MCP server | `rf-mcp` stdio tools | **done** |
 | 4a. Chains | Chain IR, Linux execve chains (x86 int 0x80, x64 syscall) | **done** |
 | 4b. Chains | Windows VirtualProtect chains (x64 register ABI + x86 stdcall), anchor/IAT API resolution, alignment invariant, `--cfg-aware` | **done** |
-| 5. Differentiators | Semantic classification + ranking, chain DSL, dispatcher analysis | planned |
+| 5. Differentiators | Semantic classification + ranking (`rf-classify`, `--classify`/`--rank`), JOP dispatcher analysis, scan cache (`--cache`, MCP `sort_by`) | **done** — chain DSL deferred to future work |
 
 ## Building
 
@@ -61,6 +61,8 @@ rop-finder --binary ./prog --info                           # metadata JSON, no 
 rop-finder --binary tests/fixtures/elf-Linux-x64 --ropchain # execve("/bin/sh") chain script
 rop-finder --binary ./prog.exe --ropchain --chain windows-virtualprotect --api-addr 0x7fff12340000
 rop-finder --binary ./hardened.exe --cfg-aware               # endbr64-entering gadgets only
+rop-finder --binary ./prog --json --classify --rank          # classified, best gadgets first
+rop-finder --binary ./prog --cache                           # reuse a previous scan instantly
 ```
 
 Formats are detected by magic bytes (ELF, PE, Mach-O, Universal/fat Mach-O);
@@ -75,7 +77,9 @@ with endianness from the binary.
 Output format matches ROPgadget: `0x<addr> : insn ; insn ; ...` (human) or a
 JSON array of `{"vaddr", "bytes", "text"}` with `--json` (plus an `arch`
 field per gadget for Universal binaries, and a `section` field per gadget
-when `--section` is used).
+when `--section` is used). `--classify` adds `class`, `labels`,
+`regs_written`, `regs_read`, `side_effects`, `quality`, `dispatcher` and
+`low_confidence` to each JSON record (see Phase 5 below).
 
 Exit codes: `0` success, `1` usage error, `2` malformed/unsupported binary.
 
@@ -225,6 +229,43 @@ and 4 where both tools fail to find the required gadgets (error parity).
 Windows chains have no ROPgadget oracle; they are covered by unit and
 integration tests instead.
 
+## Phase 5: classification, ranking, scan cache
+
+`rf-classify` assigns every gadget a semantic class from iced-x86
+operand metadata (x86/x64, high confidence) or mnemonic heuristics
+(other arches, `low_confidence: true`). The full decision rules
+(R1–R13) live in [TAXONOMY.md](TAXONOMY.md).
+
+- **Classes**: `reg-write`, `stack-pivot`, `mem-read`, `mem-write`,
+  `arithmetic`, `syscall`, `dispatcher`, `other` (multi-label set plus a
+  primary class from the last side-effecting instruction).
+- **JOP dispatcher analysis (R8)**: a gadget ending in a
+  register-indirect jump (`jmp qword ptr [reg]`), or `jmp reg` where an
+  earlier instruction arithmetically steps that register (the classic
+  dispatcher loop form), is labeled `dispatcher` — a documented
+  heuristic, not a proof.
+- **Quality score (R12)**: `max(0, 100 − 15·(side_effects−1) −
+  3·(n_insns−2))`. A clean `pop rdi ; ret` scores 100; each extra
+  side-effecting instruction costs 15, each extra instruction costs 3.
+- **`--classify`**: adds the classification fields to `--json` records.
+- **`--rank`**: sorts output by quality descending (ties by address),
+  for both human and JSON output.
+- **`--cache`**: caches scan results on disk, keyed by SHA-256 of the
+  file plus every scan parameter (depth/modes/filters/sections/base/
+  offset…). Directory: `ROP_FINDER_CACHE_DIR`, else
+  `%LOCALAPPDATA%\rop-finder\cache` (Windows) or `~/.cache/rop-finder`.
+  Hits and misses are reported on stderr.
+- **Evaluation gate**: `cargo test -p rf-classify` samples 5,744 gadgets
+  from three fixtures, labels them with an independent metadata mapping,
+  and requires held-out macro-averaged precision ≥ 0.90 — it currently
+  measures **1.0000** (2,872 held-out samples, per-class P/R all 1.0;
+  see `tests/fixtures-eval.json`, sample in `tests/fixtures-labeled.jsonl`).
+
+**Chain DSL: deferred.** The stretch goal from PLAN §5 (a declarative
+chain-description DSL compiled to the Chain IR) is intentionally not
+shipped in Phase 5 rather than half-shipped; the Chain IR and the two
+chain targets remain the supported interface. Future work.
+
 ## MCP server
 
 `rop-finder-mcp` (crate `rf-mcp`) exposes the engine to AI agent hosts over
@@ -248,9 +289,9 @@ errors are `{error: {code, message}}` with the MCP `isError` flag.
 
 | Tool | Purpose |
 |---|---|
-| `find_gadgets` | ROP gadgets only (ret-terminated) |
-| `find_jop_gadgets` | JOP gadgets only (jmp/call-terminated) |
-| `find_syscall_gadgets` | SYS gadgets only (syscall/sysenter/int/iret) |
+| `find_gadgets` | ROP gadgets only (ret-terminated); `sort_by: "quality"` ranks by the Phase 5 quality score |
+| `find_jop_gadgets` | JOP gadgets only (jmp/call-terminated); also supports `sort_by` |
+| `find_syscall_gadgets` | SYS gadgets only (syscall/sysenter/int/iret); also supports `sort_by` |
 | `get_binary_info` | The `--info` payload (format/arch/sections/imports), no scan |
 | `search_gadgets_by_pattern` | Regex over gadget text (invalid regex → literal substring), full scan |
 | `run_ropgadget_command` | Flag passthrough, restricted to the allowlist below |
@@ -299,12 +340,16 @@ The server would otherwise be a local arbitrary-file-read primitive, so:
   per-request timeout defaults to 60 s (hard cap 300 s). Scans run on
   blocking worker threads; a timed-out request returns a `timeout` error
   while the orphaned worker finishes in the background.
-- **Content-hash cache**: SHA-256 of the file plus the scan parameters keys
-  an in-memory cache (plus optional `--cache-dir` on-disk spill), so
-  repeated queries on the same binary are instant.
+- **Content-hash cache**: SHA-256 of the file plus the scan parameters
+  (including `base` and `cfg_aware`) keys an in-memory cache (plus
+  optional `--cache-dir` on-disk spill), so repeated queries on the same
+  binary are instant.
 - **Sampled responses**: at most `max_results` gadgets plus `total_count`
-  and `truncated`. PLAN calls for "top-N by quality rank"; ranking lands in
-  Phase 5, so v1 returns the first N in deterministic traversal order.
+  and `truncated`. PLAN's "top-N by quality rank" is available via
+  `sort_by: "quality"` on the find tools — quality and primary class are
+  computed once at scan time and ride in the cache, so quality-sorted
+  queries need no rescan; without `sort_by`, the first N in
+  deterministic traversal order are returned.
 - **No panics**: malformed binaries return a `binary_error` tool error.
 
 ## Parity harness
