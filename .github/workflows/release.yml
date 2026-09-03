@@ -1,0 +1,472 @@
+# ENG-01 / ENG-09 — tagged releases, built by CI, checksummed, and smoke-tested
+# on the platform they claim to target.
+#
+# This replaces the 41 MB dist/ directory that used to be committed to git. That
+# directory is the reason the packaging rules below are what they are: git does
+# not record the executable bit for a loose file the way a release consumer
+# needs, so the Linux and macOS binaries in dist/ arrived mode 0666 and simply
+# would not run. Everything Unix here is therefore packaged as .tar.gz, which
+# stores the 0755 mode, and a smoke job downloads the real artifact and asserts
+# `test -x` before anything is published. Windows gets .zip.
+#
+# Targets:
+#   x86_64-unknown-linux-musl   static  - an MCP host may launch this under any
+#   aarch64-unknown-linux-musl  static    glibc, or none; musl removes the
+#                                         question entirely.
+#   universal macOS             lipo    - x86_64 + arm64 in one Mach-O.
+#   x86_64-pc-windows-msvc
+#   aarch64-pc-windows-msvc
+#
+# The musl builds go through `cross` because rf-scan depends on capstone-sys,
+# which compiles 44 MB of vendored C with the `cc` crate: a musl *C* toolchain
+# is required, not just a Rust musl std, and cross's images ship one for both
+# architectures.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  # Manual runs build, package and smoke-test everything but never publish:
+  # the `publish` job below is gated on `github.ref_type == 'tag'`.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(git rev-parse --short HEAD)-dev"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Release version: $version"
+
+  linux:
+    name: linux ${{ matrix.target }}
+    needs: version
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add ${{ matrix.target }}
+          cargo --version
+
+      - name: Cache cross binary
+        id: cross-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cross
+          key: ubuntu-22.04-cross-v1
+
+      - name: Install cross
+        if: steps.cross-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked cross
+
+      # cross runs the build inside a container that carries the musl C
+      # cross-compiler capstone-sys needs. crt-static is the default for musl
+      # targets, so the result is a fully static binary with no libc to match.
+      - name: Build
+        run: cross build --release --locked --workspace --target ${{ matrix.target }}
+
+      - name: Verify the binary is static
+        run: |
+          set -euo pipefail
+          bin=target/${{ matrix.target }}/release/rop-finder
+          file "$bin"
+          # Rust's musl targets default to crt-static, which `file` reports as
+          # "static-pie linked" (position-independent) rather than the older
+          # "statically linked". Accept either; reject a dynamic ELF.
+          file "$bin" | grep -Eq 'static-pie linked|statically linked' \
+            || { echo "::error::$bin is not statically linked"; exit 1; }
+
+      - name: Package
+        id: pkg
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          name="rop-finder-${VERSION}-${TARGET}"
+          mkdir -p "staging/$name"
+          cp "target/${TARGET}/release/rop-finder" "staging/$name/"
+          cp "target/${TARGET}/release/rop-finder-mcp" "staging/$name/"
+          # LICENSE and NOTICE are mandatory in the tarball: a release without
+          # them is not legally distributable (ENG-03). If they are missing the
+          # cp fails and so does this job, which is the intended behaviour.
+          cp LICENSE NOTICE README.md MANUAL.md "staging/$name/"
+          chmod 0755 "staging/$name/rop-finder" "staging/$name/rop-finder-mcp"
+          chmod 0644 "staging/$name/LICENSE" "staging/$name/NOTICE" \
+                     "staging/$name/README.md" "staging/$name/MANUAL.md"
+          mkdir -p dist
+          tar -C staging -czf "dist/$name.tar.gz" "$name"
+          ( cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256" )
+          cat "dist/$name.tar.gz.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    name: macos universal
+    needs: version
+    runs-on: macos-14
+    env:
+      # `secrets` is not one of the contexts available to a step-level `if:`,
+      # but it IS available to a job-level `env:`, so the signing steps below
+      # are guarded on this flag instead of on the secret directly. It has
+      # exactly the effect the plan asks for: on a fork with no secrets the
+      # signing and notarisation steps are skipped and the workflow still
+      # succeeds, producing an unsigned artifact.
+      #
+      # An operator who wants signed, notarised macOS artifacts must add ALL
+      # SIX of these repository secrets:
+      #
+      #   MACOS_CERT_P12         base64 of a "Developer ID Application" .p12
+      #                          (base64 -i cert.p12 | pbcopy)
+      #   MACOS_CERT_PASSWORD    the password that .p12 was exported with
+      #   MACOS_SIGNING_IDENTITY e.g. "Developer ID Application: Some Org (TEAMID)"
+      #   MACOS_NOTARY_APPLE_ID  the Apple ID used for notarytool
+      #   MACOS_NOTARY_TEAM_ID   the 10-character Developer Team ID
+      #   MACOS_NOTARY_PASSWORD  an app-specific password for that Apple ID
+      #
+      # Until they do, the published macOS binary is unsigned, and a user who
+      # downloads it gets it quarantined by Gatekeeper — which for a binary
+      # spawned by Claude Desktop as an MCP server means the spawn fails with
+      # no visible error. That is a real, known gap in this release, not a
+      # theoretical one.
+      MACOS_SIGNING: ${{ secrets.MACOS_CERT_P12 != '' && 'yes' || 'no' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          cargo --version
+
+      - name: Build both architectures
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --workspace --target x86_64-apple-darwin
+          cargo build --release --locked --workspace --target aarch64-apple-darwin
+
+      - name: lipo into a universal binary
+        run: |
+          set -euo pipefail
+          mkdir -p universal
+          for b in rop-finder rop-finder-mcp; do
+            lipo -create -output "universal/$b" \
+              "target/x86_64-apple-darwin/release/$b" \
+              "target/aarch64-apple-darwin/release/$b"
+            lipo -archs "universal/$b"
+            lipo -archs "universal/$b" | grep -q x86_64
+            lipo -archs "universal/$b" | grep -q arm64
+          done
+
+      - name: Import signing certificate
+        if: env.MACOS_SIGNING == 'yes'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          # Ephemeral keychain password: never needs to be a secret, it dies
+          # with the runner.
+          kcpass="$(uuidgen)"
+          security create-keychain -p "$kcpass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kcpass" "$keychain"
+          printf '%s' "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$kcpass" "$keychain" > /dev/null
+          security list-keychain -d user -s "$keychain" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Codesign with hardened runtime
+        if: env.MACOS_SIGNING == 'yes'
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          for b in universal/rop-finder universal/rop-finder-mcp; do
+            codesign --force --options runtime --timestamp \
+              --sign "$MACOS_SIGNING_IDENTITY" "$b"
+            codesign --verify --strict --verbose=2 "$b"
+          done
+
+      - name: Notarize
+        if: env.MACOS_SIGNING == 'yes'
+        env:
+          MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+          MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # notarytool accepts .zip, .dmg and .pkg only, so the two Mach-O
+          # files are submitted inside a ditto archive.
+          /usr/bin/ditto -c -k --keepParent universal "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$MACOS_NOTARY_APPLE_ID" \
+            --team-id "$MACOS_NOTARY_TEAM_ID" \
+            --password "$MACOS_NOTARY_PASSWORD" \
+            --wait
+          # NOT STAPLED, deliberately: `xcrun stapler staple` only understands
+          # app bundles, .dmg and .pkg. A bare Mach-O executable has nowhere to
+          # put the ticket, and stapling one fails with "Error 73". The
+          # notarisation above is still what matters — Gatekeeper resolves the
+          # ticket online on first launch. If offline first launch has to work,
+          # the macOS artifact must become a signed .pkg or .dmg, which is a
+          # packaging change, not a workflow flag.
+          for b in universal/rop-finder universal/rop-finder-mcp; do
+            spctl --assess --type exec --verbose=4 "$b" || true
+          done
+
+      - name: Package
+        id: pkg
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          name="rop-finder-${VERSION}-universal-apple-darwin"
+          mkdir -p "staging/$name"
+          cp universal/rop-finder universal/rop-finder-mcp "staging/$name/"
+          cp LICENSE NOTICE README.md MANUAL.md "staging/$name/"
+          chmod 0755 "staging/$name/rop-finder" "staging/$name/rop-finder-mcp"
+          chmod 0644 "staging/$name/LICENSE" "staging/$name/NOTICE" \
+                     "staging/$name/README.md" "staging/$name/MANUAL.md"
+          mkdir -p dist
+          tar -C staging -czf "dist/$name.tar.gz" "$name"
+          ( cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256" )
+          cat "dist/$name.tar.gz.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    name: windows ${{ matrix.target }}
+    needs: version
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          # Cross-compiled on the x64 runner. The windows-2022 image ships the
+          # VS2022 ARM64 build tools, which capstone-sys needs to compile its
+          # vendored C for this target.
+          - aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add ${{ matrix.target }}
+          cargo --version
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --workspace --target ${{ matrix.target }}
+
+      - name: Package
+        id: pkg
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          name="rop-finder-${VERSION}-${TARGET}"
+          mkdir -p "staging/$name"
+          cp "target/${TARGET}/release/rop-finder.exe" "staging/$name/"
+          cp "target/${TARGET}/release/rop-finder-mcp.exe" "staging/$name/"
+          cp LICENSE NOTICE README.md MANUAL.md "staging/$name/"
+          mkdir -p dist
+          # PowerShell's Compress-Archive, not `zip`, which the image lacks.
+          powershell -NoProfile -Command \
+            "Compress-Archive -Path 'staging/$name' -DestinationPath 'dist/$name.zip'"
+          ( cd dist && sha256sum "$name.zip" > "$name.zip.sha256" )
+          cat "dist/$name.zip.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  smoke:
+    name: smoke ${{ matrix.artifact_suffix }} on ${{ matrix.os }}
+    needs: [version, linux, macos, windows]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact_suffix: x86_64-unknown-linux-musl
+            kind: tar
+          # ubuntu-22.04-arm and windows-11-arm are GitHub-hosted arm64
+          # runners. If they are not available to this repository, the
+          # aarch64 artifacts cannot be executed anywhere in CI: point these
+          # two entries at their x86_64 counterparts and the `--version` step
+          # will have to be dropped, leaving only the mode check. Shipping an
+          # arm64 binary that has never been run once is the thing this job
+          # exists to prevent.
+          - os: ubuntu-22.04-arm
+            artifact_suffix: aarch64-unknown-linux-musl
+            kind: tar
+          - os: macos-14
+            artifact_suffix: universal-apple-darwin
+            kind: tar
+          - os: macos-13
+            artifact_suffix: universal-apple-darwin
+            kind: tar
+          - os: windows-2022
+            artifact_suffix: x86_64-pc-windows-msvc
+            kind: zip
+          - os: windows-11-arm
+            artifact_suffix: aarch64-pc-windows-msvc
+            kind: zip
+    steps:
+      - name: Download this platform's own artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rop-finder-${{ needs.version.outputs.version }}-${{ matrix.artifact_suffix }}
+          path: incoming
+
+      - name: Verify checksum, unpack, assert executable, run --version
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          SUFFIX: ${{ matrix.artifact_suffix }}
+          KIND: ${{ matrix.kind }}
+        run: |
+          set -euo pipefail
+          name="rop-finder-${VERSION}-${SUFFIX}"
+          cd incoming
+
+          if [ "$KIND" = "tar" ]; then
+            archive="$name.tar.gz"
+          else
+            archive="$name.zip"
+          fi
+
+          # The checksum published next to the artifact must match the bytes
+          # that were actually uploaded.
+          if command -v sha256sum > /dev/null; then
+            sha256sum -c "$archive.sha256"
+          else
+            shasum -a 256 -c "$archive.sha256"
+          fi
+
+          if [ "$KIND" = "tar" ]; then
+            tar -xzf "$archive"
+            bin="$name/rop-finder"
+            mcp="$name/rop-finder-mcp"
+            # ENG-09 in one line: the old committed dist/ binaries were mode
+            # 0666 and could not be executed at all.
+            # `test -x` is exactly the `mode & 0o111` assertion: it is what
+            # dist/'s committed 0666 binaries failed. `ls -l` puts the actual
+            # mode in the log so a failure is self-explaining.
+            for f in "$bin" "$mcp"; do
+              ls -l "$f"
+              test -x "$f" || { echo "::error::$f is not executable"; exit 1; }
+            done
+          else
+            powershell -NoProfile -Command \
+              "Expand-Archive -Path '$archive' -DestinationPath . -Force"
+            bin="$name/rop-finder.exe"
+            mcp="$name/rop-finder-mcp.exe"
+            test -f "$bin"
+            test -f "$mcp"
+          fi
+
+          if [ "$SUFFIX" = "universal-apple-darwin" ]; then
+            lipo -archs "$bin" | grep -q x86_64
+            lipo -archs "$bin" | grep -q arm64
+          fi
+
+          "./$bin" --version
+          "./$mcp" --version
+          "./$bin" --help > /dev/null
+
+  publish:
+    name: Publish release
+    needs: [version, smoke]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download every artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: incoming
+          merge-multiple: true
+
+      - name: Build SHA256SUMS and re-verify
+        run: |
+          set -euo pipefail
+          cd incoming
+          cat ./*.sha256 | sort -k2 > SHA256SUMS
+          rm -f ./*.sha256
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            --verify-tag \
+            incoming/*

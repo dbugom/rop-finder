@@ -25,6 +25,7 @@ use std::fmt;
 use std::process::ExitCode;
 
 mod console;
+mod out;
 mod search;
 
 use clap::Parser;
@@ -35,10 +36,44 @@ use rf_core::{
 use rf_scan::{Gadget, ScanOptions};
 use serde::Serialize;
 
+/// `--version` body (CLAIM-10). clap prints `"rop-finder "` in front of
+/// it, so the first line completes the usual `name version` line and the
+/// rest is the provenance a bug report needs.
+///
+/// The capstone version is the one the process is actually linked against,
+/// asked of the library at runtime — PLAN.md:262 names capstone drift the
+/// project's #1 residual parity risk, and a version reprinted from a
+/// Cargo.toml pin would not detect the drift it is supposed to record.
+///
+/// No Cargo.lock hash is printed. Computing one honestly needs a build
+/// script hashing a file that does not exist in a packaged crate or in a
+/// `cargo install` build, and a hash that is silently absent or wrong is
+/// worse than no hash; the lockfile is committed instead (ENG-02).
+///
+/// Returned as `&'static str` (built once in a `OnceLock`) because clap's
+/// `long_version` only accepts a borrowed string unless the `string`
+/// feature is enabled workspace-wide.
+fn long_version() -> &'static str {
+    static LONG_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LONG_VERSION.get_or_init(|| {
+        format!(
+            "{ver}\n\
+             capstone {cs} (bundled; decodes ARM, ARM64, MIPS, PPC, SPARC, RISC-V)\n\
+             iced-x86 (decodes x86/x64)\n\
+             A port of ROPgadget by Jonathan Salwan, Alexey Vishnyakov and \
+             contributors (BSD-3-Clause):\n\
+             https://github.com/JonathanSalwan/ROPgadget",
+            ver = env!("CARGO_PKG_VERSION"),
+            cs = rf_scan::capstone_version(),
+        )
+    })
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "rop-finder",
     version,
+    long_version = long_version(),
     about = "Fast Rust ROP/JOP/SYS gadget finder (ROPgadget rewrite)"
 )]
 pub struct Cli {
@@ -337,8 +372,12 @@ fn parse_raw_spec(cli: &Cli) -> Result<Option<(Arch, Endianness, bool)>, String>
             "invalid --rawMode {mode_s:?} (32|64|arm|thumb|riscv)"
         ));
     }
+    // args.py:128 — the flag that is missing here is --rawEndian, not
+    // --rawArch (which the `let Some(arch_s)` above has already proved
+    // present). CLI-13: this message was a copy-paste of the two guards
+    // above and named the wrong flag.
     if cli.raw_endian.is_none() && arch_s != "x86" {
-        return Err("Specify --rawArch".to_string());
+        return Err("Specify --rawEndian".to_string());
     }
     let endian = match cli.raw_endian.as_deref() {
         None | Some("little") => Endianness::Little,
@@ -1229,7 +1268,12 @@ fn apply_post_filters(
     Ok(())
 }
 
-fn run(cli: Cli) -> Result<i32, String> {
+/// Every byte of stdout goes through `out` — one buffered, locked writer
+/// owned by [`main_entry`] (PERF-07), which also decides what a write
+/// failure means for the exit code (ROB-03). There is deliberately no
+/// `println!` left on any path reachable from here: it would take the
+/// stdout lock again and interleave ahead of what is still buffered.
+fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
     // Error precedence mirrors the pre-refactor CLI exactly: depth → file
     // read → raw spec → option parsing → binary load → (--info | --base →
     // --section → scan).
@@ -1250,12 +1294,11 @@ fn run(cli: Cli) -> Result<i32, String> {
 
     // --console: interactive REPL (binary optional, preloaded when given).
     if cli.console {
-        return console::run_console(&cli);
+        return console::run_console(&cli, out);
     }
 
     let binary = cli.binary.as_deref().unwrap();
-    let bytes =
-        std::fs::read(binary).map_err(|e| format!("cannot read {binary}: {e}"))?;
+    let bytes = std::fs::read(binary).map_err(|e| format!("cannot read {binary}: {e}"))?;
     let raw = parse_raw_spec(&cli)?;
 
     let req = ScanRequest {
@@ -1299,7 +1342,8 @@ fn run(cli: Cli) -> Result<i32, String> {
             .as_deref()
             .map(|b| parse_hex(b, "--base"))
             .transpose()?;
-        println!(
+        let _ = writeln!(
+            out,
             "{}",
             serde_json::to_string_pretty(&info_json(&target, new_base)).unwrap()
         );
@@ -1310,6 +1354,11 @@ fn run(cli: Cli) -> Result<i32, String> {
     // ROPgadget, which dumps the gadget list and step logs first, we print
     // only the exploit script (or the JSON Chain IR with --json).
     if cli.ropchain {
+        // CHWIN-09: warn before doing the work, not after printing a
+        // chain that looks authoritative.
+        if let Some(warning) = chain_experimental_warning(&cli.chain) {
+            eprint!("{warning}");
+        }
         let spec = ChainSpec {
             target: cli.chain.clone(),
             api_addr: cli.api_addr.clone(),
@@ -1330,12 +1379,13 @@ fn run(cli: Cli) -> Result<i32, String> {
             );
         }
         if cli.json {
-            println!(
+            let _ = writeln!(
+                out,
                 "{}",
                 serde_json::to_string_pretty(&outcome.chain.to_json()).unwrap()
             );
         } else {
-            print!("{}", outcome.chain.to_python());
+            let _ = write!(out, "{}", outcome.chain.to_python());
         }
         return Ok(0);
     }
@@ -1369,40 +1419,42 @@ fn run(cli: Cli) -> Result<i32, String> {
         }
         let delta = view.base.wrapping_sub(orig_base);
         let width8 = search::search_width8(&target, view.arch());
-        let mut out = std::io::stdout();
         if let Some(s) = &cli.string {
             let hits = search::find_string(&target, delta, opts.offset, opts.range, s)?;
             if cli.json {
                 // Serialization of this simple structure cannot fail.
-                println!(
+                let _ = writeln!(
+                    out,
                     "{}",
                     serde_json::to_string_pretty(&search::search_json_string(&hits, width8))
                         .unwrap()
                 );
             } else {
-                search::print_string_hits(&hits, width8, &mut out);
+                search::print_string_hits(&hits, width8, out);
             }
         } else if let Some(op) = &cli.opcode {
             let hits = search::find_opcode(&target, delta, opts.offset, opts.range, op)?;
             if cli.json {
-                println!(
+                let _ = writeln!(
+                    out,
                     "{}",
                     serde_json::to_string_pretty(&search::search_json_opcode(&hits, op, width8))
                         .unwrap()
                 );
             } else {
-                search::print_opcode_hits(&hits, op, width8, &mut out);
+                search::print_opcode_hits(&hits, op, width8, out);
             }
         } else if let Some(m) = &cli.memstr {
             let hits = search::find_memstr(&target, delta, opts.offset, opts.range, m);
             if cli.json {
-                println!(
+                let _ = writeln!(
+                    out,
                     "{}",
                     serde_json::to_string_pretty(&search::search_json_memstr(&hits, width8))
                         .unwrap()
                 );
             } else {
-                search::print_memstr_hits(&hits, width8, &mut out);
+                search::print_memstr_hits(&hits, width8, out);
             }
         }
         return Ok(0);
@@ -1463,29 +1515,26 @@ fn run(cli: Cli) -> Result<i32, String> {
             return Ok(0);
         }
         let Some(regexes) = search::compile_mips_regexes(mode) else {
-            println!("Unrecognized option {mode}");
-            println!("Accepted options stackfinder|system|tails|lia0|registers");
+            let _ = writeln!(out, "Unrecognized option {mode}");
+            let _ = writeln!(
+                out,
+                "Accepted options stackfinder|system|tails|lia0|registers"
+            );
             return Ok(1); // analyze() -> False -> exit 1
         };
-        println!("MIPS ROP ({mode})");
-        println!("{}", search::RULE60);
+        let _ = writeln!(out, "MIPS ROP ({mode})");
+        let _ = writeln!(out, "{}", search::RULE60);
         let mut gadgets = match acquire() {
             Ok(g) => g,
             Err(c) => return Ok(c),
         };
-        apply_post_filters(
-            &mut gadgets,
-            &cli.re,
-            cli.call_preceded,
-            view.arch(),
-            &mut std::io::stdout(),
-        )?;
+        apply_post_filters(&mut gadgets, &cli.re, cli.call_preceded, view.arch(), out)?;
         search::print_mips_gadgets(
             &gadgets,
             &regexes,
             cli.dump,
             search::search_width8(&target, view.arch()),
-            &mut std::io::stdout(),
+            out,
         );
         return Ok(0);
     }
@@ -1495,13 +1544,7 @@ fn run(cli: Cli) -> Result<i32, String> {
         Err(c) => return Ok(c),
     };
     // options.py:22-33 — --re then --callPreceded, after the scan.
-    apply_post_filters(
-        &mut gadgets,
-        &cli.re,
-        cli.call_preceded,
-        view.arch(),
-        &mut std::io::stdout(),
-    )?;
+    apply_post_filters(&mut gadgets, &cli.re, cli.call_preceded, view.arch(), out)?;
     let mut classes: Option<Vec<rf_classify::Classification>> = None;
     if cli.classify || cli.rank {
         let (g, c) = classify_gadgets(gadgets, view.arch(), cli.rank);
@@ -1526,9 +1569,10 @@ fn run(cli: Cli) -> Result<i32, String> {
             &result,
             opts.offset,
             classes.as_deref().filter(|_| cli.classify),
+            out,
         );
     } else {
-        print_human(&result, cli.noinstr, cli.dump, &mut std::io::stdout());
+        print_human(&result, cli.noinstr, cli.dump, out);
     }
     Ok(0)
 }
@@ -1581,7 +1625,13 @@ fn print_human(res: &ScanResult, noinstr: bool, dump: bool, out: &mut dyn std::i
         } else {
             String::new()
         };
-        let _ = writeln!(out, "{}{}{}", fmt_addr(g.vaddr, res.addr_size), insts, bytes_str);
+        let _ = writeln!(
+            out,
+            "{}{}{}",
+            fmt_addr(g.vaddr, res.addr_size),
+            insts,
+            bytes_str
+        );
     }
     let _ = writeln!(out, "\nUnique gadgets found: {}", res.gadgets.len());
 }
@@ -1633,9 +1683,15 @@ fn to_json_classified<'a>(
         .collect()
 }
 
-fn print_json(res: &ScanResult, offset: u64, classes: Option<&[rf_classify::Classification]>) {
+fn print_json(
+    res: &ScanResult,
+    offset: u64,
+    classes: Option<&[rf_classify::Classification]>,
+    out: &mut dyn std::io::Write,
+) {
     // Serialization of this simple structure cannot fail.
-    println!(
+    let _ = writeln!(
+        out,
         "{}",
         serde_json::to_string_pretty(&to_json_classified(res, offset, classes)).unwrap()
     );
@@ -1791,21 +1847,70 @@ fn cache_store(dir: &std::path::Path, key: &str, gadgets: &[Gadget]) -> std::io:
     std::fs::write(dir.join(format!("{key}.json")), text)
 }
 
+/// CHWIN-09. The Windows VirtualProtect builder emits a chain that does
+/// not execute (CHWIN-01/02/03); until v0.5 fixes it, saying so out loud —
+/// on stderr, so a piped `--ropchain > exploit.py` still gets a clean
+/// script and the human still gets the warning — is the honest gate.
+/// Returns the warning for a target that has one, `None` otherwise.
+fn chain_experimental_warning(target: &str) -> Option<&'static str> {
+    (target == "windows-virtualprotect").then_some(
+        "[Warning] --chain windows-virtualprotect is EXPERIMENTAL and is known NOT to \
+         execute correctly.\n\
+         [Warning] The script it prints is not a working exploit: see CHWIN-01, CHWIN-02 \
+         and CHWIN-03.\n\
+         [Warning] Fixed in v0.5; until then treat the output as a gadget-selection \
+         sketch only.\n",
+    )
+}
+
+/// clap signals `--help` and `--version` as an `Err` whose `exit_code()`
+/// is 0: they are successful terminations, not usage errors. CLI-06 /
+/// ENG-06 — the old blanket `ExitCode::from(1)` broke the project's own
+/// build script (`set -e` + a final `rop-finder --version`), Homebrew and
+/// dpkg post-install smoke tests, and every CI step that checks a tool is
+/// runnable. ROPgadget exits 0 for both.
+fn clap_exit_code(kind: clap::error::ErrorKind) -> u8 {
+    use clap::error::ErrorKind as K;
+    match kind {
+        K::DisplayHelp | K::DisplayVersion | K::DisplayHelpOnMissingArgumentOrSubcommand => 0,
+        // MANUAL's documented contract: 1 is the usage error (clap's own 2
+        // is deliberately not adopted).
+        _ => 1,
+    }
+}
+
 pub fn main_entry() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(c) => c,
         Err(e) => {
-            // clap exit code 2 -> our usage exit code 1
+            let code = clap_exit_code(e.kind());
+            // clap writes help/version to stdout and errors to stderr.
             let _ = e.print();
-            return ExitCode::from(1);
+            return ExitCode::from(code);
         }
     };
-    match run(cli) {
-        Ok(code) => ExitCode::from(code as u8),
+    // One buffered, locked stdout for the whole run (PERF-07), whose first
+    // I/O error decides the exit code instead of panicking (ROB-03).
+    let mut out = out::StdOut::stdout();
+    let code = match run(cli, &mut out) {
+        Ok(code) => code,
         Err(msg) => {
             eprintln!("[Error] {msg}");
-            ExitCode::from(1)
+            1
         }
+    };
+    match out.finish() {
+        Ok(()) => ExitCode::from(code as u8),
+        // A run that already failed keeps its own exit code; a run that
+        // succeeded into a closed pipe ends at 0, like every other text
+        // tool, rather than at 101 with a panic message.
+        Err(e) => match out::exit_code_for(&e) {
+            Ok(pipe_code) => ExitCode::from(if code == 0 { pipe_code } else { code } as u8),
+            Err(msg) => {
+                eprintln!("[Error] {msg}");
+                ExitCode::from(1)
+            }
+        },
     }
 }
 
@@ -2060,6 +2165,61 @@ mod tests {
         assert!(gadgets[0].text().ends_with(" ; ret") || gadgets[0].text() == "ret");
     }
 
+    /// CLI-06 / ENG-06: clap's help and version terminations are
+    /// successes. Driven through the real parser so a clap upgrade that
+    /// renamed a kind would fail here.
+    #[test]
+    fn help_and_version_exit_zero() {
+        for args in [
+            vec!["rop-finder", "--help"],
+            vec!["rop-finder", "-h"],
+            vec!["rop-finder", "--version"],
+            vec!["rop-finder", "-V"],
+        ] {
+            let e = Cli::try_parse_from(&args).expect_err("clap reports these as Err");
+            assert_eq!(e.exit_code(), 0, "{args:?} is a successful termination");
+            assert_eq!(clap_exit_code(e.kind()), 0, "{args:?} must exit 0");
+        }
+        // ...and a real usage error still exits 1 (MANUAL's contract).
+        let e = Cli::try_parse_from(["rop-finder", "--no-such-flag"]).unwrap_err();
+        assert_eq!(clap_exit_code(e.kind()), 1);
+        assert_eq!(
+            clap_exit_code(clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand),
+            0
+        );
+    }
+
+    /// CLAIM-10: `--version` records the disassembler build and the
+    /// attribution the port owes ROPgadget.
+    #[test]
+    fn long_version_names_capstone_and_ropgadget() {
+        let v = long_version();
+        assert!(v.starts_with(env!("CARGO_PKG_VERSION")), "{v}");
+        assert!(
+            v.contains(&format!("capstone {}", rf_scan::capstone_version())),
+            "{v}"
+        );
+        assert!(v.contains("ROPgadget"), "{v}");
+        assert!(v.contains("Jonathan Salwan"), "{v}");
+        // The version is the linked library's, not a placeholder.
+        assert!(v.contains("capstone 5.0"), "{v}");
+    }
+
+    /// CHWIN-09: the experimental gate fires for the Windows chain and
+    /// only for it.
+    #[test]
+    fn windows_chain_target_is_gated_by_a_warning() {
+        let w = chain_experimental_warning("windows-virtualprotect")
+            .expect("windows-virtualprotect must warn");
+        assert!(w.contains("EXPERIMENTAL"), "{w}");
+        assert!(w.contains("CHWIN-01"), "{w}");
+        assert!(w.contains("CHWIN-02"), "{w}");
+        assert!(w.contains("CHWIN-03"), "{w}");
+        assert!(w.contains("v0.5"), "{w}");
+        assert!(w.ends_with('\n'), "{w:?}");
+        assert!(chain_experimental_warning("linux-execve").is_none());
+    }
+
     #[test]
     fn badbytes_parsing() {
         assert_eq!(parse_badbytes("0a|0d").unwrap(), vec![0x0a, 0x0d]);
@@ -2099,8 +2259,19 @@ mod tests {
         assert!(parse_raw_spec(&cli_with(false, None, None, Some("big"))).is_err());
         // rawArch without mode
         assert!(parse_raw_spec(&cli_with(false, Some("x86"), None, None)).is_err());
-        // rawArch non-x86 without endian
-        assert!(parse_raw_spec(&cli_with(false, Some("arm"), Some("arm"), None)).is_err());
+        // rawArch non-x86 without endian. CLI-13: the message must name
+        // the flag that is missing (--rawEndian), not the one already
+        // given; args.py:128 says "Specify --rawEndian".
+        assert_eq!(
+            parse_raw_spec(&cli_with(false, Some("arm"), Some("arm"), None)).unwrap_err(),
+            "Specify --rawEndian"
+        );
+        // ...while a genuinely missing --rawArch still says --rawArch
+        // (args.py:117-121).
+        assert_eq!(
+            parse_raw_spec(&cli_with(false, None, None, Some("big"))).unwrap_err(),
+            "Specify --rawArch"
+        );
         // thumb conflicting with rawMode
         assert!(parse_raw_spec(&cli_with(true, Some("arm"), Some("arm"), Some("little"))).is_err());
         // unknown mode / arch+mode combo
@@ -2504,8 +2675,9 @@ mod tests {
         assert_eq!(chain.word_size, 8);
         chain.validate(&scan_universe(&out), &[]).unwrap();
         // Renderers: python script has the ropmaker header; every word
-        // except string immediates renders as a pack line (padding is
-        // tab-indented); JSON exposes the full IR.
+        // except string immediates renders as a pack line (padding, like
+        // every other word, renders at column 0 — ROB-05); JSON exposes the
+        // full IR.
         let py = chain.to_python();
         assert!(py.starts_with("#!/usr/bin/env python3\n# execve generated by ROPgadget\n"));
         assert!(py.contains("p += b'/bin//sh'"));

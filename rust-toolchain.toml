@@ -1,0 +1,9 @@
+# Pinned so that everyone — developers, CI, and distro packagers — builds with
+# the same compiler that produced the measurements in docs/measured-2026-09.md.
+# This is the tested toolchain, NOT the support floor. The floor is declared
+# separately as `rust-version = "1.88"` in Cargo.toml and is enforced by the
+# MSRV job in .github/workflows/ci.yml, so the number is executed rather than
+# restated.
+[toolchain]
+channel = "1.89.0"
+components = ["rustfmt", "clippy"]

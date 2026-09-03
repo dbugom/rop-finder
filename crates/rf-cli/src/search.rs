@@ -326,9 +326,7 @@ pub fn apply_re_filter(gadgets: &mut Vec<Gadget>, re: &str) -> Result<(), String
     };
     let mut pats = Vec::with_capacity(pieces.len());
     for p in pieces {
-        pats.push(
-            Regex::new(p).map_err(|e| format!("invalid --re pattern {p:?}: {e}"))?,
-        );
+        pats.push(Regex::new(p).map_err(|e| format!("invalid --re pattern {p:?}: {e}"))?);
     }
     gadgets.retain(|g| {
         let text = g.text();
@@ -476,7 +474,10 @@ mod tests {
             Some((0x1000, &bytes[..]))
         );
         // outside → None
-        assert_eq!(section_in_range(0x1000, &bytes, Some((0x2000, 0x3000))), None);
+        assert_eq!(
+            section_in_range(0x1000, &bytes, Some((0x2000, 0x3000))),
+            None
+        );
         // start-truncation
         let (v, b) = section_in_range(0x1000, &bytes, Some((0x1002, 0x2000))).unwrap();
         assert_eq!(v, 0x1002);
@@ -486,6 +487,9 @@ mod tests {
         assert_eq!(v, 0x1000);
         assert_eq!(b, &[1, 2, 3, 4, 5]);
         // empty result → None
-        assert_eq!(section_in_range(0x1000, &bytes, Some((0x1008, 0x1008))), None);
+        assert_eq!(
+            section_in_range(0x1000, &bytes, Some((0x1008, 0x1008))),
+            None
+        );
     }
 }

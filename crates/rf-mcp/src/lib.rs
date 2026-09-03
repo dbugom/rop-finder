@@ -2,7 +2,7 @@
 //! (PLAN.md §6.1).
 //!
 //! stdio transport only (v1): no network attack surface. The server exposes
-//! six tools, all returning structured JSON:
+//! eight tools, all returning structured JSON:
 //!
 //!   * `find_gadgets` / `find_jop_gadgets` / `find_syscall_gadgets` —
 //!     gadget scans restricted to one anchor family.
@@ -10,29 +10,44 @@
 //!   * `search_gadgets_by_pattern` — regex (or substring) over gadget text.
 //!   * `run_ropgadget_command` — flag passthrough restricted to the PLAN
 //!     §6.1 allowlist.
+//!   * `build_rop_chain` — the PLAN §6.2 chain builder.
+//!   * `get_server_config` — the effective allowlist and caps, so an agent
+//!     never has to guess a path.
 //!
 //! Security model (hardened per PLAN §6.1, review-driven):
-//!   * `binary_path` is confined to a directory allowlist (default: server
-//!     cwd; extend with `--allow-dir`). Paths are canonicalized (symlinks
-//!     and `..` resolved) and must stay inside an allowed directory.
+//!   * `binary_path` is confined to a directory allowlist built *only* from
+//!     `--allow-dir` (MCP-02: there is no cwd default; the server refuses to
+//!     start without one). Confinement is enforced by [`confine`], which
+//!     opens the file from a directory handle pinned at startup and hands the
+//!     rest of the server a HANDLE, never a path — so nothing can be swapped
+//!     between the check and the read (MCP-01).
+//!   * Every rejected path returns exactly one code, `path_denied`, with no
+//!     OS error text, so the error taxonomy cannot be used to enumerate the
+//!     filesystem (MCP-07). `--verbose-path-errors` restores detail inside
+//!     allowed roots only.
 //!   * `run_ropgadget_command` rejects any flag outside the allowlist —
 //!     side-channel flags (`--dump`, `--string`, `--memstr`, `--console`)
 //!     are never accepted.
-//!   * Resource caps: `max_results` (default 1000, hard max 50000) and a
-//!     per-request timeout (default 60 s); scans run on blocking worker
-//!     threads so a timed-out request returns while the orphan thread
-//!     finishes in the background.
+//!   * Resource caps: `max_results` (default 1000, hard max 50000), a
+//!     per-request timeout (default 60 s), `--max-depth` (default 64,
+//!     over-large values are *rejected*, not clamped), `--max-file-bytes`
+//!     (default 256 MiB, enforced by fstat on the confined handle) and
+//!     `--max-concurrent` (default 2, a semaphore held for the lifetime of
+//!     the blocking worker). Together those bound the MCP-03 runaway; real
+//!     cancellation needs the v0.2 engine token and is NOT here.
 //!   * Content-hash cache (SHA-256 of file + parameters): in-memory, with
 //!     an optional on-disk spill via `--cache-dir`.
 //!   * Responses are sampled: up to `max_results` gadgets plus
 //!     `total_count` and `truncated`. (PLAN calls for "top-N by quality
 //!     rank"; ranking lands in Phase 5, so v1 returns the first N in the
 //!     engine's deterministic traversal order.)
-//!   * Errors are structured JSON `{error: {code, message}}` with the MCP
-//!     `isError` flag; the server never panics on malformed input.
+//!   * Errors are structured JSON `{error: {code, message, details?}}` with
+//!     the MCP `isError` flag; the server never panics on malformed input.
+
+pub mod confine;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,10 +59,21 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::Digest;
 
+pub use confine::{AllowRoot, ConfinedFile};
+
 pub const DEFAULT_MAX_RESULTS: usize = 1000;
 pub const HARD_MAX_RESULTS: usize = 50000;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
 pub const HARD_MAX_TIMEOUT_SECS: u64 = 300;
+/// Default `--max-depth`. A request asking for more is rejected with a
+/// `usage_error`, never silently clamped: an agent that quietly gets depth
+/// 64 when it asked for 100000 draws wrong conclusions from the result.
+pub const DEFAULT_MAX_DEPTH: usize = 64;
+/// Default `--max-file-bytes` (256 MiB), enforced by fstat on the confined
+/// handle before a single byte is read.
+pub const DEFAULT_MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
+/// Default `--max-concurrent`: how many scans may run at once.
+pub const DEFAULT_MAX_CONCURRENT: usize = 2;
 
 /// PLAN §6.1 flag allowlist for `run_ropgadget_command`.
 const ALLOWED_FLAGS: &[&str] = &[
@@ -65,33 +91,50 @@ const VALUE_FLAGS: &[&str] = &[
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// Canonicalized allowed directories (default: server process cwd).
+    /// Canonicalized allowed directories. MCP-02: EMPTY by default. The MCP
+    /// host chooses this process's working directory, so seeding the
+    /// allowlist with the cwd granted access to whatever the host happened
+    /// to pick and `--allow-dir` could never narrow it. `--allow-dir` (or
+    /// the explicit `--allow-cwd`) is now the only source.
     pub allow_dirs: Vec<PathBuf>,
     /// Optional on-disk cache spill directory.
     pub cache_dir: Option<PathBuf>,
     pub timeout: Duration,
     pub max_results: usize,
+    /// Largest accepted `depth`. Larger values are rejected, not clamped.
+    pub max_depth: usize,
+    /// Largest binary the server will read, enforced by fstat on the
+    /// confined handle.
+    pub max_file_bytes: u64,
+    /// Concurrently running scans.
+    pub max_concurrent: usize,
+    /// Restore per-reason path error detail INSIDE allowed roots only.
+    pub verbose_path_errors: bool,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        let cwd = std::env::current_dir()
-            .and_then(|p| p.canonicalize())
-            .unwrap_or_else(|_| PathBuf::from("."));
         ServerConfig {
-            allow_dirs: vec![cwd],
+            allow_dirs: Vec::new(),
             cache_dir: None,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             max_results: DEFAULT_MAX_RESULTS,
+            max_depth: DEFAULT_MAX_DEPTH,
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            max_concurrent: DEFAULT_MAX_CONCURRENT,
+            verbose_path_errors: false,
         }
     }
 }
 
-/// Structured tool error, rendered as `{error: {code, message}}`.
+/// Structured tool error, rendered as `{error: {code, message, details?}}`.
 #[derive(Debug)]
 pub struct ToolError {
     pub code: &'static str,
     pub message: String,
+    /// Machine-readable specifics (allow roots, breached limits). Never
+    /// carries an OS error string for a path outside the allowlist.
+    pub details: Option<Value>,
 }
 
 impl ToolError {
@@ -99,39 +142,23 @@ impl ToolError {
         ToolError {
             code,
             message: message.into(),
+            details: None,
+        }
+    }
+    fn with_details(code: &'static str, message: impl Into<String>, details: Value) -> Self {
+        ToolError {
+            code,
+            message: message.into(),
+            details: Some(details),
         }
     }
     fn to_json(&self) -> Value {
-        json!({"error": {"code": self.code, "message": self.message}})
-    }
-}
-
-/// Confine `input` to the allowlist: canonicalize (resolving symlinks and
-/// `..`), require an existing regular file, require containment in one of
-/// `allow_dirs` (themselves canonicalized).
-pub fn confine_path(allow_dirs: &[PathBuf], input: &str) -> Result<PathBuf, ToolError> {
-    let canon = Path::new(input).canonicalize().map_err(|e| {
-        ToolError::new(
-            "path_not_found",
-            format!("cannot canonicalize {input:?}: {e}"),
-        )
-    })?;
-    if !canon.is_file() {
-        return Err(ToolError::new(
-            "not_a_file",
-            format!("{input:?} is not a regular file"),
-        ));
-    }
-    if allow_dirs.iter().any(|d| canon.starts_with(d)) {
-        Ok(canon)
-    } else {
-        Err(ToolError::new(
-            "path_not_allowed",
-            format!(
-                "{input:?} is outside the allowed directories; start the server with \
-                 --allow-dir to grant access"
-            ),
-        ))
+        match &self.details {
+            Some(d) => {
+                json!({"error": {"code": self.code, "message": self.message, "details": d}})
+            }
+            None => json!({"error": {"code": self.code, "message": self.message}}),
+        }
     }
 }
 
@@ -225,7 +252,8 @@ impl Cache {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GadgetQuery {
-    /// Path to the binary; must be inside an allowed directory.
+    /// Absolute path to the binary; must be inside one of the server's
+    /// allow_roots (get_server_config lists them).
     pub binary_path: String,
     /// Search depth (default 10).
     pub depth: Option<usize>,
@@ -307,7 +335,8 @@ fn sort_by_quality(gadgets: Vec<&CachedGadget>, arch: Option<rf_core::Arch>) -> 
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchQuery {
-    /// Path to the binary; must be inside an allowed directory.
+    /// Absolute path to the binary; must be inside one of the server's
+    /// allow_roots (get_server_config lists them).
     pub binary_path: String,
     /// Regex matched against gadget text (e.g. "pop r.*; ret"); if the
     /// pattern is not a valid regex it is matched as a literal substring.
@@ -332,7 +361,8 @@ pub struct SearchQuery {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RawCommandQuery {
-    /// Path to the binary; must be inside an allowed directory.
+    /// Absolute path to the binary; must be inside one of the server's
+    /// allow_roots (get_server_config lists them).
     pub binary_path: String,
     /// ROPgadget-style flags, e.g. ["--depth", "6", "--only", "pop|ret"].
     /// Restricted to the allowlist: --depth --norop --nojop --nosys --only
@@ -347,7 +377,8 @@ pub struct RawCommandQuery {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct InfoQuery {
-    /// Path to the binary; must be inside an allowed directory.
+    /// Absolute path to the binary; must be inside one of the server's
+    /// allow_roots (get_server_config lists them).
     pub binary_path: String,
     /// Rebase the image base before reporting addresses (hex string).
     pub base: Option<String>,
@@ -355,7 +386,8 @@ pub struct InfoQuery {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ChainQuery {
-    /// Path to the binary; must be inside an allowed directory.
+    /// Absolute path to the binary; must be inside one of the server's
+    /// allow_roots (get_server_config lists them).
     pub binary_path: String,
     /// Chain target: "linux-execve" (ELF x86/x64) or
     /// "windows-virtualprotect" (PE x86/x64).
@@ -561,14 +593,130 @@ struct PostOpts {
 pub struct RopFinderMcp {
     config: Arc<ServerConfig>,
     cache: Arc<Cache>,
+    /// Allow roots with their directory handles pinned for the lifetime of
+    /// the process (MCP-01).
+    roots: Arc<Vec<AllowRoot>>,
+    /// MCP-03 interim bound: at most `max_concurrent` scans run at once.
+    /// The permit is moved INTO the blocking closure, so it is released
+    /// when the work actually stops rather than when the await returns —
+    /// otherwise a timed-out request would free a slot while its orphaned
+    /// worker kept burning CPU, which is the measured 398% runaway.
+    inflight: Arc<tokio::sync::Semaphore>,
 }
 
 impl RopFinderMcp {
-    pub fn new(config: ServerConfig) -> Self {
+    /// Build the server, opening and pinning every `config.allow_dirs`
+    /// entry. Fails if a root cannot be opened.
+    pub fn new(config: ServerConfig) -> std::io::Result<Self> {
+        let mut roots = Vec::with_capacity(config.allow_dirs.len());
+        for d in &config.allow_dirs {
+            let root = AllowRoot::open(d)?;
+            if roots.iter().any(|r: &AllowRoot| r.id() == root.id()) {
+                continue;
+            }
+            roots.push(root);
+        }
         let cache = Cache::new(config.cache_dir.clone());
-        RopFinderMcp {
+        let permits = config.max_concurrent.max(1);
+        Ok(RopFinderMcp {
             config: Arc::new(config),
             cache: Arc::new(cache),
+            roots: Arc::new(roots),
+            inflight: Arc::new(tokio::sync::Semaphore::new(permits)),
+        })
+    }
+
+    /// Open `binary_path` confined to the pinned allow roots.
+    fn open_confined(&self, binary_path: &str) -> Result<ConfinedFile, ToolError> {
+        confine::open_confined_with(
+            &self.roots,
+            binary_path,
+            self.config.max_file_bytes,
+            self.config.verbose_path_errors,
+        )
+    }
+
+    /// MCP-03 interim: reject an over-large `depth` instead of clamping it.
+    fn check_depth(&self, depth: Option<usize>) -> Result<usize, ToolError> {
+        let d = depth.unwrap_or(10);
+        if d > self.config.max_depth {
+            return Err(ToolError::with_details(
+                "usage_error",
+                format!(
+                    "depth {d} exceeds the server's max_depth of {}; \
+                     re-send with depth <= {}",
+                    self.config.max_depth, self.config.max_depth
+                ),
+                json!({"limit": "max_depth",
+                       "limit_value": self.config.max_depth,
+                       "got": d}),
+            ));
+        }
+        Ok(d)
+    }
+
+    /// The effective configuration an agent is entitled to know, so it
+    /// never has to guess a path (which is what made the error taxonomy
+    /// worth probing in the first place — MCP-07).
+    fn config_json(&self) -> Value {
+        json!({
+            "allow_roots": self.root_paths(),
+            "max_depth": self.config.max_depth,
+            "max_file_bytes": self.config.max_file_bytes,
+            "max_results": self.config.max_results,
+            "max_concurrent": self.config.max_concurrent,
+            "timeout_secs": self.config.timeout.as_secs(),
+            "cache": self.config.cache_dir.is_some(),
+            "version": env!("CARGO_PKG_VERSION"),
+        })
+    }
+
+    /// The effective allow roots, in operator-facing form.
+    pub fn root_paths(&self) -> Vec<String> {
+        self.roots
+            .iter()
+            .map(|r| r.display_path().display().to_string())
+            .collect()
+    }
+
+    /// [`query_to_request`] with the request-boundary depth check applied.
+    fn gadget_request(
+        &self,
+        q: &GadgetQuery,
+        rop: bool,
+        jop: bool,
+        sys: bool,
+    ) -> Result<rf_cli::ScanRequest, ToolError> {
+        let depth = self.check_depth(q.depth)?;
+        let mut req = query_to_request(q, rop, jop, sys);
+        req.depth = depth;
+        Ok(req)
+    }
+
+    /// Acquire an inflight permit, waiting at most `timeout`.
+    ///
+    /// The permit is then held until the worker stops, not until the await
+    /// returns — that is what makes `--max-concurrent` a real bound on work
+    /// in flight rather than on outstanding awaits. The wait is capped so a
+    /// queued request fails fast with `busy` instead of hanging: until real
+    /// cancellation lands (v0.2 engine token, MCP-03), a worker abandoned by
+    /// its own timeout keeps its permit until it finishes on its own.
+    async fn permit(
+        &self,
+        timeout: Duration,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, ToolError> {
+        match tokio::time::timeout(timeout, self.inflight.clone().acquire_owned()).await {
+            Ok(Ok(p)) => Ok(p),
+            Ok(Err(_)) => Err(ToolError::new("internal", "server is shutting down")),
+            Err(_) => Err(ToolError::with_details(
+                "busy",
+                format!(
+                    "all {} concurrent scan slots are in use; retry, or start the server \
+                     with a larger --max-concurrent",
+                    self.config.max_concurrent
+                ),
+                json!({"limit": "max_concurrent", "limit_value": self.config.max_concurrent}),
+            )),
         }
     }
 
@@ -595,14 +743,17 @@ impl RopFinderMcp {
                 ));
             }
         }
-        let path = confine_path(&self.config.allow_dirs, binary_path)?;
+        // MCP-01: an open HANDLE, not a name, crosses into spawn_blocking.
+        let confined = self.open_confined(binary_path)?;
         let max = clamp_max_results(max_results, self.config.max_results);
         let timeout = clamp_timeout(timeout_secs, self.config.timeout);
         let cache = self.cache.clone();
+        let max_file_bytes = self.config.max_file_bytes;
+        let permit = self.permit(timeout).await?;
 
         let work = move || -> Result<Value, ToolError> {
-            let bytes = std::fs::read(&path)
-                .map_err(|e| ToolError::new("io_error", format!("cannot read {path:?}: {e}")))?;
+            let _permit = permit;
+            let bytes = confined.read_all(max_file_bytes)?;
             let file_hash = sha256_hex(&bytes);
             // base and cfg_aware change the scan output too — they must be
             // part of the key or different requests would share a cache
@@ -733,10 +884,12 @@ impl RopFinderMcp {
                 ),
             ));
         }
-        let path = confine_path(&self.config.allow_dirs, &q.binary_path)?;
+        let depth = self.check_depth(q.depth)?;
+        let confined = self.open_confined(&q.binary_path)?;
         let timeout = clamp_timeout(q.timeout_secs, self.config.timeout);
+        let max_file_bytes = self.config.max_file_bytes;
         let req = rf_cli::ScanRequest {
-            depth: q.depth.unwrap_or(10),
+            depth,
             rop: true,
             jop: true,
             sys: true,
@@ -762,9 +915,10 @@ impl RopFinderMcp {
             shellcode_size: q.shellcode_size.clone(),
         };
 
+        let permit = self.permit(timeout).await?;
         let work = move || -> Result<Value, ToolError> {
-            let bytes = std::fs::read(&path)
-                .map_err(|e| ToolError::new("io_error", format!("cannot read {path:?}: {e}")))?;
+            let _permit = permit;
+            let bytes = confined.read_all(max_file_bytes)?;
             let outcome =
                 rf_cli::chain_bytes(&bytes, None, &req, &spec).map_err(scan_err_to_tool)?;
             let chain = &outcome.chain;
@@ -820,14 +974,18 @@ impl RopFinderMcp {
         description = "Find ROP gadgets in a binary (ret-terminated). Returns up to \
         max_results gadgets (default 1000) plus total_count and a truncated flag. Set \
         sort_by=\"quality\" to rank gadgets by the Phase 5 quality score (cleanest first) \
-        before sampling. The binary path must be inside an allowed directory (server cwd \
-        by default)."
+        before sampling. binary_path must be an absolute path inside one of the server's \
+        allow_roots (call get_server_config to list them); anything else returns \
+        path_denied. depth above max_depth is rejected, not clamped."
     )]
     async fn find_gadgets(
         &self,
         Parameters(q): Parameters<GadgetQuery>,
     ) -> Result<CallToolResult, McpError> {
-        let req = query_to_request(&q, true, false, false);
+        let req = match self.gadget_request(&q, true, false, false) {
+            Ok(r) => r,
+            Err(e) => return tool_error(e),
+        };
         match self
             .run_scan(
                 req,
@@ -855,7 +1013,10 @@ impl RopFinderMcp {
         &self,
         Parameters(q): Parameters<GadgetQuery>,
     ) -> Result<CallToolResult, McpError> {
-        let req = query_to_request(&q, false, true, false);
+        let req = match self.gadget_request(&q, false, true, false) {
+            Ok(r) => r,
+            Err(e) => return tool_error(e),
+        };
         match self
             .run_scan(
                 req,
@@ -883,7 +1044,10 @@ impl RopFinderMcp {
         &self,
         Parameters(q): Parameters<GadgetQuery>,
     ) -> Result<CallToolResult, McpError> {
-        let req = query_to_request(&q, false, false, true);
+        let req = match self.gadget_request(&q, false, false, true) {
+            Ok(r) => r,
+            Err(e) => return tool_error(e),
+        };
         match self
             .run_scan(
                 req,
@@ -912,21 +1076,35 @@ impl RopFinderMcp {
         &self,
         Parameters(q): Parameters<InfoQuery>,
     ) -> Result<CallToolResult, McpError> {
-        let result = confine_path(&self.config.allow_dirs, &q.binary_path).and_then(|path| {
+        let result = async {
+            let confined = self.open_confined(&q.binary_path)?;
             let base = q
                 .base
                 .as_deref()
                 .map(|b| rf_cli::parse_hex(b, "--base"))
                 .transpose()
                 .map_err(|e| ToolError::new("usage_error", e))?;
-            let bytes = std::fs::read(&path)
-                .map_err(|e| ToolError::new("io_error", format!("cannot read {path:?}: {e}")))?;
+            let _permit = self.permit(self.config.timeout).await?;
+            let bytes = confined.read_all(self.config.max_file_bytes)?;
             rf_cli::info_bytes(&bytes, None, base).map_err(scan_err_to_tool)
-        });
+        }
+        .await;
         match result {
             Ok(v) => tool_ok(v),
             Err(e) => tool_error(e),
         }
+    }
+
+    /// The effective allowlist and caps, so an agent never has to guess.
+    #[tool(
+        description = "Report the server's effective configuration: allow_roots (the only \
+        directories binary_path may name), max_depth, max_file_bytes, max_results, \
+        max_concurrent, timeout_secs, whether an on-disk cache is enabled, and the server \
+        version. Call this first: paths outside allow_roots are refused with a single \
+        path_denied code that deliberately reveals nothing about the target."
+    )]
+    async fn get_server_config(&self) -> Result<CallToolResult, McpError> {
+        tool_ok(self.config_json())
     }
 
     /// Regex/substring search over the gadget text of a full scan.
@@ -939,8 +1117,12 @@ impl RopFinderMcp {
         &self,
         Parameters(q): Parameters<SearchQuery>,
     ) -> Result<CallToolResult, McpError> {
+        let depth = match self.check_depth(q.depth) {
+            Ok(d) => d,
+            Err(e) => return tool_error(e),
+        };
         let req = rf_cli::ScanRequest {
-            depth: q.depth.unwrap_or(10),
+            depth,
             rop: true,
             jop: true,
             sys: true,
@@ -1012,6 +1194,11 @@ impl RopFinderMcp {
             Ok(p) => p,
             Err(e) => return tool_error(e),
         };
+        // MCP-03 interim: --depth is unbounded in ROPgadget's own CLI, so
+        // the passthrough is exactly where `--depth 100000` arrived.
+        if let Err(e) = self.check_depth(Some(parsed.request.depth)) {
+            return tool_error(e);
+        }
         match self
             .run_scan(
                 parsed.request,
@@ -1032,39 +1219,76 @@ impl RopFinderMcp {
     }
 }
 
-#[tool_handler(
-    name = "rop-finder-mcp",
-    version = "0.1.0",
-    instructions = "ROP/JOP/SYS gadget search via rop-finder, plus Linux execve ROP chain \
-        generation (build_rop_chain, ELF x86/x64). binary_path values are confined \
-        to allowed directories (server cwd by default, extend with --allow-dir). All tools \
-        return structured JSON with gadgets sampled to max_results plus total_count/truncated; \
-        errors are {error: {code, message}}."
-)]
-impl ServerHandler for RopFinderMcp {}
+#[tool_handler(name = "rop-finder-mcp", version = "0.1.0")]
+impl ServerHandler for RopFinderMcp {
+    /// `instructions` is built at runtime rather than baked into the macro
+    /// so it can name the *effective* allowlist. An agent that is told the
+    /// roots has no reason to guess paths, which is what turned the old
+    /// error taxonomy into a filesystem oracle (MCP-07).
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        rmcp::model::ServerInfo::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+        )
+        .with_server_info(rmcp::model::Implementation::new("rop-finder-mcp", "0.1.0"))
+        .with_instructions(self.instructions())
+    }
+}
+
+impl RopFinderMcp {
+    /// The initialize-time `instructions` string, including the effective
+    /// allowlist and caps.
+    pub fn instructions(&self) -> String {
+        let roots = self.root_paths();
+        let allowed = if roots.is_empty() {
+            "(none — every binary_path will be refused)".to_string()
+        } else {
+            roots.join(", ")
+        };
+        format!(
+            "ROP/JOP/SYS gadget search via rop-finder, plus Linux execve ROP chain \
+             generation (build_rop_chain, ELF x86/x64).\n\
+             binary_path MUST be an absolute path inside one of these directories: {allowed}. \
+             Anything else — including a path that merely starts with one of those strings, a \
+             relative path, or one containing \"..\" — is refused with a single `path_denied` \
+             code that deliberately reveals nothing about the target, so probing for files is \
+             pointless. Call get_server_config for the machine-readable allowlist and caps.\n\
+             Caps: depth <= {} (larger values are REJECTED, not clamped), binaries <= {} bytes, \
+             max_results default {} (hard max {}), {} scan(s) at a time, default timeout {} s.\n\
+             All tools return structured JSON with gadgets sampled to max_results plus \
+             total_count/truncated; errors are {{error: {{code, message, details?}}}}.",
+            self.config.max_depth,
+            self.config.max_file_bytes,
+            self.config.max_results,
+            HARD_MAX_RESULTS,
+            self.config.max_concurrent,
+            self.config.timeout.as_secs(),
+        )
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Unique temp dir per test, cleaned up on drop.
-    struct TempDir(PathBuf, PathBuf); // (raw, canonical)
+    struct TempDir(PathBuf);
     impl TempDir {
         fn new(tag: &str) -> Self {
             let raw =
                 std::env::temp_dir().join(format!("rf-mcp-test-{}-{}", tag, std::process::id()));
             let _ = std::fs::remove_dir_all(&raw);
             std::fs::create_dir_all(&raw).unwrap();
-            let canon = raw.canonicalize().unwrap();
-            TempDir(raw, canon)
+            TempDir(raw.canonicalize().unwrap())
         }
         fn canon(&self) -> &PathBuf {
-            &self.1
+            &self.0
         }
     }
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.1);
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -1072,77 +1296,86 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    /// MCP-02: the default configuration allows NOTHING. Seeding the
+    /// allowlist with the process cwd is what made `--allow-dir` unable to
+    /// narrow anything; a default of "nothing" fails closed instead.
     #[test]
-    fn confine_path_accepts_inside_allowlist() {
-        let t = TempDir::new("confine-ok");
-        let f = t.canon().join("a.bin");
-        std::fs::write(&f, b"MZ").unwrap();
-        let got = confine_path(std::slice::from_ref(t.canon()), f.to_str().unwrap()).unwrap();
-        assert_eq!(got, f.canonicalize().unwrap());
+    fn default_config_allows_nothing() {
+        let c = ServerConfig::default();
+        assert!(c.allow_dirs.is_empty());
+        assert_eq!(c.max_depth, DEFAULT_MAX_DEPTH);
+        assert_eq!(c.max_concurrent, DEFAULT_MAX_CONCURRENT);
+        assert_eq!(c.max_file_bytes, DEFAULT_MAX_FILE_BYTES);
+        assert!(!c.verbose_path_errors);
+
+        let server = RopFinderMcp::new(c).unwrap();
+        assert!(server.root_paths().is_empty());
+        // Every path is refused, with the one code and no OS text.
+        let err = server.open_confined("/etc/shadow").unwrap_err();
+        assert_eq!(err.code, "path_denied");
+        assert!(!err.message.contains("os error"), "{err:?}");
     }
 
+    /// MCP-03 interim: an over-large depth is REJECTED, not clamped, so an
+    /// agent cannot mistake a depth-64 result for a depth-100000 one.
     #[test]
-    fn confine_path_rejects_traversal_and_outside() {
-        let outer = TempDir::new("confine-outer");
-        let allowed = outer.1.join("allowed");
-        let other = outer.1.join("other");
-        std::fs::create_dir_all(&allowed).unwrap();
-        std::fs::create_dir_all(&other).unwrap();
-        let inside = allowed.join("in.bin");
-        let outside = other.join("out.bin");
-        std::fs::write(&inside, b"x").unwrap();
-        std::fs::write(&outside, b"x").unwrap();
-        let allowed = allowed.canonicalize().unwrap();
-        let outside_canon = outside.canonicalize().unwrap();
-
-        // ../.. escape attempt (built from the RAW temp path: Windows
-        // canonicalize() rejects verbatim \\?\ paths containing "..").
-        let raw_allowed = outer.0.join("allowed");
-        let traversal = format!("{}/../other/out.bin", raw_allowed.display());
-        let err = confine_path(std::slice::from_ref(&allowed), &traversal).unwrap_err();
-        assert_eq!(err.code, "path_not_allowed", "{err:?}");
-
-        // absolute path outside the allowlist
-        let err = confine_path(
-            std::slice::from_ref(&allowed),
-            outside_canon.to_str().unwrap(),
-        )
-        .unwrap_err();
-        assert_eq!(err.code, "path_not_allowed");
-
-        // nonexistent path
-        let err = confine_path(std::slice::from_ref(&allowed), "no/such/file.bin").unwrap_err();
-        assert_eq!(err.code, "path_not_found");
-
-        // directory is not a file
-        let err =
-            confine_path(std::slice::from_ref(&allowed), allowed.to_str().unwrap()).unwrap_err();
-        assert_eq!(err.code, "not_a_file");
+    fn depth_over_max_is_rejected_not_clamped() {
+        let server = RopFinderMcp::new(ServerConfig::default()).unwrap();
+        assert_eq!(server.check_depth(None).unwrap(), 10);
+        assert_eq!(server.check_depth(Some(64)).unwrap(), 64);
+        let err = server.check_depth(Some(100_000)).unwrap_err();
+        assert_eq!(err.code, "usage_error");
+        let d = err.details.expect("structured details");
+        assert_eq!(d["limit"], "max_depth");
+        assert_eq!(d["limit_value"], 64);
+        assert_eq!(d["got"], 100_000);
+        // usize::MAX, the value the audit actually sent, is rejected too.
+        assert_eq!(
+            server.check_depth(Some(usize::MAX)).unwrap_err().code,
+            "usage_error"
+        );
     }
 
+    /// Duplicate `--allow-dir` entries naming the same directory collapse
+    /// to one root, so the published allowlist is not misleading.
     #[test]
-    fn confine_path_rejects_symlink_escape() {
-        let outer = TempDir::new("confine-symlink");
-        let allowed = outer.canon().join("allowed");
-        let secret = outer.canon().join("secret");
-        std::fs::create_dir_all(&allowed).unwrap();
-        std::fs::create_dir_all(&secret).unwrap();
-        let target = secret.join("s.bin");
-        std::fs::write(&target, b"x").unwrap();
-        let link = allowed.join("link.bin");
-        #[cfg(windows)]
-        let linked = std::os::windows::fs::symlink_file(&target, &link);
-        #[cfg(not(windows))]
-        let linked = std::os::unix::fs::symlink(&target, &link);
-        match linked {
-            Ok(()) => {
-                let allowed = allowed.canonicalize().unwrap();
-                let err = confine_path(std::slice::from_ref(&allowed), link.to_str().unwrap())
-                    .unwrap_err();
-                assert_eq!(err.code, "path_not_allowed", "symlink resolved outside");
-            }
-            Err(e) => eprintln!("symlink creation unavailable ({e}); skipping"),
+    fn duplicate_roots_collapse() {
+        let t = TempDir::new("dup-roots");
+        let c = ServerConfig {
+            allow_dirs: vec![t.canon().clone(), t.canon().clone()],
+            ..Default::default()
+        };
+        let server = RopFinderMcp::new(c).unwrap();
+        assert_eq!(server.root_paths().len(), 1);
+    }
+
+    /// The allowlist and the caps are published, so a legitimate agent
+    /// never has to guess a path (MCP-07's pressure valve).
+    #[test]
+    fn server_config_and_instructions_publish_the_allowlist() {
+        let t = TempDir::new("publish");
+        let c = ServerConfig {
+            allow_dirs: vec![t.canon().clone()],
+            ..Default::default()
+        };
+        let server = RopFinderMcp::new(c).unwrap();
+        let cfg = server.config_json();
+        for key in [
+            "allow_roots",
+            "max_depth",
+            "max_file_bytes",
+            "max_results",
+            "max_concurrent",
+            "cache",
+            "version",
+        ] {
+            assert!(cfg.get(key).is_some(), "missing {key} in {cfg}");
         }
+        assert_eq!(cfg["allow_roots"].as_array().unwrap().len(), 1);
+        assert_eq!(cfg["cache"], false);
+        let root = server.root_paths()[0].clone();
+        assert!(server.instructions().contains(&root));
+        assert!(server.instructions().contains("get_server_config"));
     }
 
     #[test]

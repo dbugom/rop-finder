@@ -1,0 +1,37 @@
+# tests/fixtures/MANIFEST.sha256
+#
+# SHA-256 of the 24 third-party binaries in this directory. These files are NOT
+# covered by the repository LICENSE; see PROVENANCE.md for the origin and
+# license of each one.
+#
+# The same 24 files, byte for byte, are ROPgadget's test-suite-binaries/ at
+# commit b6e3fe31af46d7e045fef99a3ab19ccbcea5c2f6 of
+# https://github.com/JonathanSalwan/ROPgadget
+#
+# Verify:   sha256sum -c MANIFEST.sha256        (run from tests/fixtures/)
+#   or:     python tests/fetch_fixtures.py --verify-only   (run from the repo root)
+#
+5d86e0aec4d7ba2e1c043848aaa143178073675a21a93259d4ff81dd963d1da6 *Linux_lib32.so
+6c4b3ed6e699264a498e31b0bd32c7931117a5fda18c0cd287f28228404b6c76 *Linux_lib64.so
+0e11dcdc203cee5bb59652bd971305fe8893559779ec1d6ad3f9b3234efa55d0 *UNIVERSAL-x86-x64-libSystem.B.dylib
+6e20e83235cf0837864df06ed0e2765d9b6728eeded4d6b099457633cff9e652 *elf-ARM64-bash
+e68c62b49184ed764f324fb4722481d60e1bf321b722238d95247f391960605c *elf-ARMv7-ls
+83ec8f5939beff868afeec147ecb277e77b8f4ac1d68f5c6d01ac00eaa2153e1 *elf-FreeBSD-x86
+1654962c574d7f603732d8bd4953741d2a4ab2011e936f01e98f53633558a148 *elf-Linux-RISCV_32
+b0f604bff373bae73f215b8bab41a35582938d257d5c20623e26917c626d98f3 *elf-Linux-RISCV_64
+6d440623405fadb76b0d01bf95d16b345189e15b5e34572eb947963fa9718649 *elf-Linux-x64
+761b2e7857789adffc8caedf6003194d46c35b27a0a55cf9a1c6cfdb0de6a0ca *elf-Linux-x86
+447e91f7d424adac00c614d66f1e39cdd930c5bc8b2ba49cd73a92ccae792477 *elf-Linux-x86-NDH-chall
+0a1f06f2ad07080a6f64d02f8d0fb11c01fb4131523a35778454510808dad705 *elf-Mips-Defcon-20-pwn100
+9097150c62d185e7e9837480050d80cb469205d8421a0a29885f8764ec660c52 *elf-PPC64-bash
+806f92e6b916bdb51b99f531275182b126829e1a26412ee841969590b87a86d4 *elf-PowerPC-bash
+4cf46aa4ba194cfeecdec185a927c07f6c1d97ec3f358fccf8798d9ab06eac30 *elf-SparcV8-bash
+0146420bfadda5d983ef52e52ab07adc53a0c2abe52f6e2b2648607da02dd65e *elf-x64-bash-v4.1.5.1
+8caafee194d1eb897a24a46f34b606a7f5bbe402f21fb33ae8f263e97dc727ec *elf-x86-bash-v4.1.5.1
+06b0515f7779a51a8362a32428d4f8de1bd30021ed2ab5092cb8f9a87a0fe4fd *macho-ppc-openssl
+bb38e04ca01881df5e6b92e2231f3173ee6d610b32af3068e8fe6b001c51a10f *macho-x64-ls
+f6192f91dbf2bb98d846a0e409bcd2895cb8e04016f0476c3c4d22af3713f5e0 *macho-x86-ls
+61b8de652029b12dfa01feb9d52688842b89af62692468fff5a7c045c691456c *pe-Windows-ARMv7-Thumb2LE-HelloWorld
+db06c3534964e3fc79d2763144ba53742d7fa250ca336f4a0fe724b75aaff386 *pe-x64-cmd-v6.1.7601
+785c974152976525e46b032c30378e457d069f30ac3f0fe9613e5e142ce7e8b2 *pe-x86-cmd-v6.1.7600
+dc5a3c8ae17028c5693a41ee2dc0267e941b15c0940721b0b2626a7b3b32f8b9 *raw-x86.raw

@@ -3,6 +3,7 @@
 //! its stdio pipes, exactly like an MCP host would.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -14,10 +15,50 @@ const SCHEMA_FILE: &str = concat!(
     "/tests/expected_tools_schema.json"
 );
 
+/// Strip a Windows verbatim (`\\?\`) prefix.
+///
+/// `canonicalize` yields verbatim paths on Windows, and the server refuses
+/// those outright (they bypass Win32 path normalization). An agent sends the
+/// ordinary absolute paths the server publishes in `allow_roots`, so the
+/// harness must too.
+fn plain(p: &Path) -> PathBuf {
+    let s = p.as_os_str().to_string_lossy().into_owned();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) => PathBuf::from(rest),
+        None => p.to_path_buf(),
+    }
+}
+
 fn fixtures_dir() -> PathBuf {
-    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures"))
-        .canonicalize()
-        .unwrap()
+    plain(
+        &Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures"))
+            .canonicalize()
+            .unwrap(),
+    )
+}
+
+/// Unique temp directory, removed on drop.
+struct TempTree(PathBuf);
+
+impl TempTree {
+    fn new(tag: &str) -> Self {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let p =
+            std::env::temp_dir().join(format!("rf-mcp-it-{}-{}-{}", tag, std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        TempTree(plain(&p.canonicalize().unwrap()))
+    }
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempTree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 struct McpChild {
@@ -26,25 +67,42 @@ struct McpChild {
     child: Child,
     stdin: ChildStdin,
     lines: Lines<BufReader<ChildStdout>>,
+    /// The server's working directory, deliberately chosen and deliberately
+    /// NOT in the allowlist. It holds `probe.bin`, a byte-for-byte copy of a
+    /// real ELF fixture: before MCP-02 was fixed the cwd was always allowed,
+    /// so `get_binary_info` on it succeeded.
+    cwd: TempTree,
 }
 
 impl McpChild {
     async fn spawn() -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_rop-finder-mcp"))
-            .arg("--allow-dir")
+        Self::spawn_with(&[]).await
+    }
+
+    async fn spawn_with(extra: &[&str]) -> Self {
+        let cwd = TempTree::new("cwd");
+        std::fs::copy(
+            fixtures_dir().join("elf-Linux-x64"),
+            cwd.path().join("probe.bin"),
+        )
+        .expect("stage probe.bin in the server cwd");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rop-finder-mcp"));
+        cmd.arg("--allow-dir")
             .arg(fixtures_dir())
+            .args(extra)
+            .current_dir(cwd.path())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn rop-finder-mcp");
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().expect("spawn rop-finder-mcp");
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let mut mcp = McpChild {
             child,
             stdin,
             lines: BufReader::new(stdout).lines(),
+            cwd,
         };
         mcp.rpc(
             1,
@@ -117,7 +175,8 @@ fn structured(resp: &Value) -> &Value {
 async fn mcp_stdio_end_to_end() {
     let mut mcp = McpChild::spawn().await;
 
-    // tools/list: the six PLAN §6.1 scan tools plus build_rop_chain (§6.2)
+    // tools/list: the six PLAN §6.1 scan tools, build_rop_chain (§6.2) and
+    // get_server_config (MCP-02 fix #2 item 6)
     let resp = mcp.rpc(2, "tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -129,10 +188,11 @@ async fn mcp_stdio_end_to_end() {
         "search_gadgets_by_pattern",
         "run_ropgadget_command",
         "build_rop_chain",
+        "get_server_config",
     ] {
         assert!(names.contains(&want), "missing tool {want}: {names:?}");
     }
-    assert_eq!(tools.len(), 7, "unexpected extra tools: {names:?}");
+    assert_eq!(tools.len(), 8, "unexpected extra tools: {names:?}");
     for t in tools {
         assert!(t["description"].is_string());
         assert_eq!(t["inputSchema"]["type"], "object");
@@ -411,21 +471,22 @@ async fn mcp_rejects_traversal_and_disallowed_flags() {
     let result = &resp["result"];
     assert_eq!(result["isError"], true);
     let err = &result["structuredContent"]["error"];
-    assert_eq!(err["code"], "path_not_allowed", "{result}");
+    assert_eq!(err["code"], "path_denied", "{result}");
 
-    // absolute path outside the allowlist (workspace-root Cargo.toml:
-    // outside both the fixtures dir and the server's cwd, crates/rf-mcp)
-    let outside = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../Cargo.toml")
-        .canonicalize()
-        .unwrap();
+    // absolute path outside the allowlist (workspace-root Cargo.toml)
+    let outside = plain(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../Cargo.toml")
+            .canonicalize()
+            .unwrap(),
+    );
     let resp = mcp
         .call_tool(21, "find_gadgets", json!({"binary_path": outside}))
         .await;
     assert_eq!(resp["result"]["isError"], true);
     assert_eq!(
         resp["result"]["structuredContent"]["error"]["code"],
-        "path_not_allowed"
+        "path_denied"
     );
 
     // nonexistent path
@@ -436,9 +497,11 @@ async fn mcp_rejects_traversal_and_disallowed_flags() {
             json!({"binary_path": fixtures.join("no-such.bin")}),
         )
         .await;
+    // MCP-07: an absent path inside the allowlist is refused with the SAME
+    // code as one outside it. Nothing distinguishes absent from denied.
     assert_eq!(
         resp["result"]["structuredContent"]["error"]["code"],
-        "path_not_found"
+        "path_denied"
     );
 
     // side-channel flags are rejected
@@ -501,4 +564,386 @@ async fn tools_schema_snapshot() {
         *tools, expected,
         "tools/list schema drifted from {SCHEMA_FILE}; regenerate with UPDATE_SCHEMA=1"
     );
+}
+
+// ---------------------------------------------------------------------------
+// MCP-02 — the allowlist is exactly --allow-dir, and nothing else
+// ---------------------------------------------------------------------------
+
+/// The server's working directory is NOT in the allowlist.
+///
+/// Before this fix `ServerConfig::default()` seeded `allow_dirs` with the
+/// process cwd and `main.rs` only appended to it, so `--allow-dir` could
+/// never narrow anything. The old `mcp_rejects_traversal_and_disallowed_flags`
+/// only appeared to test this: it passed because the harness's cwd
+/// (`crates/rf-mcp`) happened not to contain the probe file. Here the cwd is
+/// chosen deliberately and does contain a readable ELF.
+#[tokio::test]
+async fn allowlist_is_exactly_allow_dir() {
+    let mut mcp = McpChild::spawn().await;
+    let probe = mcp.cwd.path().join("probe.bin");
+    assert!(probe.is_file(), "probe.bin must exist in the server cwd");
+
+    for (id, tool) in [(70u64, "get_binary_info"), (71, "find_gadgets")] {
+        let resp = mcp.call_tool(id, tool, json!({"binary_path": probe})).await;
+        assert_eq!(resp["result"]["isError"], true, "{tool}: {resp}");
+        assert_eq!(
+            resp["result"]["structuredContent"]["error"]["code"], "path_denied",
+            "{tool}: {resp}"
+        );
+    }
+
+    // ...and the allowlist the server publishes is exactly --allow-dir.
+    let resp = mcp.call_tool(72, "get_server_config", json!({})).await;
+    let cfg = structured(&resp);
+    let roots: Vec<&str> = cfg["allow_roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    assert_eq!(roots.len(), 1, "{cfg}");
+    assert!(
+        Path::new(roots[0]).ends_with("fixtures"),
+        "allow_roots is the --allow-dir value: {cfg}"
+    );
+    assert_eq!(cfg["max_depth"], 64);
+    assert_eq!(cfg["max_concurrent"], 2);
+    assert!(cfg["max_file_bytes"].as_u64().unwrap() > 0);
+    assert!(cfg["version"].is_string());
+}
+
+/// The effective allowlist also rides in `initialize`'s instructions, so a
+/// legitimate agent never has to guess a path.
+#[tokio::test]
+async fn initialize_instructions_name_the_allowlist() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rop-finder-mcp"))
+        .arg("--allow-dir")
+        .arg(fixtures_dir())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn rop-finder-mcp");
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut mcp = McpChild {
+        child,
+        stdin,
+        lines: BufReader::new(stdout).lines(),
+        cwd: TempTree::new("instr"),
+    };
+    let resp = mcp
+        .rpc(
+            1,
+            "initialize",
+            json!({
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "rf-mcp-test", "version": "0.1.0"},
+            }),
+        )
+        .await;
+    let instructions = resp["result"]["instructions"].as_str().unwrap_or_default();
+    assert!(
+        instructions.contains(&fixtures_dir().display().to_string())
+            || instructions.contains("fixtures"),
+        "instructions must name the effective allowlist: {instructions}"
+    );
+    assert!(instructions.contains("get_server_config"), "{instructions}");
+}
+
+/// Failing closed: with no root at all the server must not come up.
+#[tokio::test]
+async fn no_allow_dir_refuses_to_start() {
+    let out = Command::new(env!("CARGO_BIN_EXE_rop-finder-mcp"))
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .expect("run rop-finder-mcp");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("refusing to start"), "{stderr}");
+    assert!(stderr.contains("--allow-dir"), "{stderr}");
+}
+
+/// A filesystem/drive root is refused without the explicit wide-allowlist
+/// opt-in.
+#[tokio::test]
+async fn a_wide_allowlist_needs_an_explicit_opt_in() {
+    #[cfg(windows)]
+    let wide = "C:\\";
+    #[cfg(not(windows))]
+    let wide = "/";
+    let out = Command::new(env!("CARGO_BIN_EXE_rop-finder-mcp"))
+        .arg("--allow-dir")
+        .arg(wide)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .expect("run rop-finder-mcp");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("refusing to start"), "{stderr}");
+    assert!(stderr.contains("--i-accept-a-wide-allowlist"), "{stderr}");
+}
+
+/// A cache directory inside a scannable root muddles the trust boundary.
+#[tokio::test]
+async fn cache_dir_inside_an_allow_root_is_refused() {
+    let out = Command::new(env!("CARGO_BIN_EXE_rop-finder-mcp"))
+        .arg("--allow-dir")
+        .arg(fixtures_dir())
+        .arg("--cache-dir")
+        .arg(fixtures_dir().join("rf-cache"))
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .expect("run rop-finder-mcp");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("--cache-dir"), "{stderr}");
+    assert!(
+        !fixtures_dir().join("rf-cache").exists(),
+        "the refused cache dir must not have been created"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MCP-07 — the error taxonomy is not an existence oracle
+// ---------------------------------------------------------------------------
+
+/// An existing file, an existing directory and an absent path — all outside
+/// the allowlist — must be indistinguishable.
+///
+/// The old taxonomy answered `not_a_file` for a directory, `path_not_allowed`
+/// for an existing file and `path_not_found` (echoing errno) for an absent
+/// one, for ANY absolute path on the machine. That is a whole-filesystem
+/// existence oracle; it was confirmed live against ~/.ssh and ~/.aws.
+#[tokio::test]
+async fn error_taxonomy_is_not_an_existence_oracle() {
+    let outside = TempTree::new("oracle");
+    std::fs::create_dir_all(outside.path().join("a-directory")).unwrap();
+    std::fs::write(outside.path().join("a-file"), b"\x7fELF").unwrap();
+
+    let mut mcp = McpChild::spawn().await;
+    let mut bodies = Vec::new();
+    for (i, name) in ["a-file", "a-directory", "absent"].iter().enumerate() {
+        let resp = mcp
+            .call_tool(
+                80 + i as u64,
+                "get_binary_info",
+                json!({"binary_path": outside.path().join(name)}),
+            )
+            .await;
+        assert_eq!(resp["result"]["isError"], true, "{name}: {resp}");
+        bodies.push(resp["result"]["structuredContent"].clone());
+    }
+
+    // Byte-identical: same code, same message, same details. The input is
+    // not echoed at all, so there is nothing left to differ.
+    assert_eq!(bodies[0], bodies[1], "file vs directory must not differ");
+    assert_eq!(bodies[1], bodies[2], "directory vs absent must not differ");
+    for b in &bodies {
+        let text = b.to_string();
+        assert_eq!(b["error"]["code"], "path_denied", "{text}");
+        for leak in [
+            "No such file",
+            "os error",
+            "canonicalize",
+            "is not a regular file",
+        ] {
+            assert!(!text.contains(leak), "leaked {leak:?}: {text}");
+        }
+    }
+
+    // The same holds inside the allowlist: an absent fixture is refused with
+    // exactly the body an out-of-allowlist path gets.
+    let resp = mcp
+        .call_tool(
+            83,
+            "get_binary_info",
+            json!({"binary_path": fixtures_dir().join("no-such.bin")}),
+        )
+        .await;
+    assert_eq!(resp["result"]["structuredContent"], bodies[0]);
+}
+
+// ---------------------------------------------------------------------------
+// MCP-03 (interim) — depth is bounded at the request boundary
+// ---------------------------------------------------------------------------
+
+/// `depth=100000` is REJECTED, not silently clamped: an agent that quietly
+/// received depth 64 would draw wrong conclusions from the result. This is
+/// the request that reached 54.8 GB RSS against the live server.
+#[tokio::test]
+async fn depth_over_max_is_rejected_not_clamped() {
+    let mut mcp = McpChild::spawn().await;
+    let elf = fixtures_dir().join("elf-x64-bash-v4.1.5.1");
+
+    let calls = [
+        (
+            90u64,
+            "find_gadgets",
+            json!({"binary_path": elf, "depth": 100000}),
+        ),
+        (
+            91,
+            "find_jop_gadgets",
+            json!({"binary_path": elf, "depth": 100000}),
+        ),
+        (
+            92,
+            "find_syscall_gadgets",
+            json!({"binary_path": elf, "depth": 100000}),
+        ),
+        (
+            93,
+            "search_gadgets_by_pattern",
+            json!({"binary_path": elf, "pattern": "ret", "depth": 100000}),
+        ),
+        (
+            94,
+            "build_rop_chain",
+            json!({"binary_path": elf, "target": "linux-execve", "depth": 100000}),
+        ),
+        (
+            95,
+            "run_ropgadget_command",
+            json!({"binary_path": elf, "args": ["--depth", "100000"]}),
+        ),
+    ];
+    for (id, tool, argsv) in calls {
+        let resp = mcp.call_tool(id, tool, argsv).await;
+        assert_eq!(resp["result"]["isError"], true, "{tool}: {resp}");
+        let err = &resp["result"]["structuredContent"]["error"];
+        assert_eq!(err["code"], "usage_error", "{tool}: {err}");
+        assert_eq!(err["details"]["limit"], "max_depth", "{tool}: {err}");
+        assert_eq!(err["details"]["limit_value"], 64, "{tool}: {err}");
+        assert_eq!(err["details"]["got"], 100000, "{tool}: {err}");
+    }
+
+    // The server is unharmed and still answers a legal request.
+    let resp = mcp
+        .call_tool(
+            96,
+            "find_gadgets",
+            json!({"binary_path": elf, "depth": 4, "max_results": 3}),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], Value::Bool(false));
+}
+
+/// `--max-concurrent` is a real bound: the permit is held for the lifetime
+/// of the blocking worker, so overlapping scans serialize instead of
+/// multiplying.
+#[tokio::test]
+async fn concurrent_requests_queue_rather_than_multiply() {
+    let mut mcp = McpChild::spawn_with(&["--max-concurrent", "1"]).await;
+    let elf = fixtures_dir().join("elf-x64-bash-v4.1.5.1");
+    let resp = mcp.call_tool(100, "get_server_config", json!({})).await;
+    assert_eq!(structured(&resp)["max_concurrent"], 1);
+
+    for id in 101..103u64 {
+        let resp = mcp
+            .call_tool(
+                id,
+                "find_gadgets",
+                json!({"binary_path": elf, "depth": 4, "max_results": 3}),
+            )
+            .await;
+        assert_eq!(resp["result"]["isError"], Value::Bool(false), "{resp}");
+    }
+}
+
+/// `--allow-cwd` is the deliberate opt-in that restores the old, implicit
+/// behaviour for `cargo run` and CI. It has to be asked for by name.
+#[tokio::test]
+async fn allow_cwd_is_an_explicit_opt_in() {
+    let cwd = TempTree::new("allow-cwd");
+    std::fs::copy(
+        fixtures_dir().join("elf-Linux-x64"),
+        cwd.path().join("probe.bin"),
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rop-finder-mcp"))
+        .arg("--allow-cwd")
+        .current_dir(cwd.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn rop-finder-mcp");
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut mcp = McpChild {
+        child,
+        stdin,
+        lines: BufReader::new(stdout).lines(),
+        cwd: TempTree::new("allow-cwd-unused"),
+    };
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "rf-mcp-test", "version": "0.1.0"},
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    let resp = mcp
+        .call_tool(
+            200,
+            "get_binary_info",
+            json!({"binary_path": cwd.path().join("probe.bin")}),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], Value::Bool(false), "{resp}");
+    assert_eq!(structured(&resp)["format"], "elf");
+}
+
+/// `--audit-log` is validated for containment but refuses to start rather
+/// than accepting a flag that would silently record nothing.
+#[tokio::test]
+async fn audit_log_is_validated_and_refused_as_unimplemented() {
+    // Inside an allow root: the containment refusal wins and names the flag.
+    let out = Command::new(env!("CARGO_BIN_EXE_rop-finder-mcp"))
+        .arg("--allow-dir")
+        .arg(fixtures_dir())
+        .arg("--audit-log")
+        .arg(fixtures_dir().join("calls.jsonl"))
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .expect("run rop-finder-mcp");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("--audit-log"), "{stderr}");
+    assert!(stderr.contains("inside the allow root"), "{stderr}");
+
+    // Outside every root: still refused, but for being unimplemented.
+    let elsewhere = TempTree::new("audit");
+    let out = Command::new(env!("CARGO_BIN_EXE_rop-finder-mcp"))
+        .arg("--allow-dir")
+        .arg(fixtures_dir())
+        .arg("--audit-log")
+        .arg(elsewhere.path().join("calls.jsonl"))
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .expect("run rop-finder-mcp");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("not implemented"), "{stderr}");
 }

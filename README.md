@@ -1,16 +1,40 @@
 # rop-finder
 
 A Rust rewrite of [ROPgadget](https://github.com/JonathanSalwan/ROPgadget) —
-a fast, memory-safe ROP/JOP/SYS gadget finder with structured internals,
-aiming for output parity with the original Python tool while being an order
-of magnitude faster on x86/x64.
+a memory-safe ROP/JOP/SYS gadget finder with structured internals, aiming
+for output parity with the original Python tool.
+
+**Measured speed vs ROPgadget 7.7** (`--depth 10`, macOS/Apple Silicon,
+rustc 1.89.0, ROPgadget on CPython 3.11 + capstone 5.0.7; rop-finder
+best-of-3, ROPgadget best-of-2 — full method and raw timings in
+[`docs/measured-2026-09.md`](docs/measured-2026-09.md)):
+
+| Fixture | ROPgadget | rop-finder | Speedup |
+|---|---:|---:|---:|
+| elf-Linux-x86 | 0.56 s | 0.09 s | 6.2x |
+| elf-x64-bash-v4.1.5.1 | 0.57 s | 0.10 s | 5.7x |
+| elf-ARM64-bash | 0.48 s | 0.23 s | 2.1x |
+| elf-Mips-Defcon-20-pwn100 | 2.54 s | 1.52 s | 1.7x |
+| elf-PowerPC-bash | 0.76 s | 0.60 s | 1.3x |
+
+So: roughly 6x on x86/x64, and between 1.3x and 2.1x on the
+capstone-backed architectures. PLAN.md's Phase-1 exit criterion asked for a
+tenfold speedup on x86/x64 and a fourfold one elsewhere; **neither is met**,
+and PLAN.md now records that criterion as NOT MET. Earlier revisions of this README
+advertised "an order of magnitude faster on x86/x64" — that sentence was
+not supported by any measurement and has been removed. The small fixtures
+(raw-x86.raw, the RISC-V pair, pe-ARMv7) do show 10-12x, but those runs are
+dominated by CPython's interpreter startup rather than scan work and are
+not evidence for a headline claim.
 
 The full design rationale lives in [`../PLAN.md`](../PLAN.md). ROPgadget
 remains the parity oracle; its source is cloned at `../ropgadget`.
 
 **📖 User documentation: [MANUAL.md](MANUAL.md)** — installation, concepts,
 CLI reference, and 9 scenario-based use cases (ASLR workflows, ring0 kernel
-ROP, chain generation, MCP/AI-agent setup, …).
+gadget discovery, chain generation, MCP/AI-agent setup, …). It also carries
+the [ROPgadget flag-coverage table](MANUAL.md#ropgadget-flag-coverage) and
+the [list of known divergences](MANUAL.md#known-divergences) from the oracle.
 
 ## Layout
 
@@ -35,12 +59,12 @@ tests/
 | Phase | Deliverable | Status |
 |---|---|---|
 | **0. Spike** | `rf-core` + `rf-scan` MVP: x86/x64 ELF only, memchr anchors, per-start decode cache, JSON out; parity harness | done |
-| **1. Engine** | All ROPgadget arches (capstone-rs), PE/Mach-O/Universal/Raw loaders, rayon parallelism | **done** (trie index, fuzz corpus pending) |
+| **1. Engine** | All ROPgadget arches (capstone-rs), PE/Mach-O/Universal/Raw loaders, rayon parallelism | **partial** — engine and parity done (99.93% over 24 fixtures); the perf exit criterion is NOT MET (see the table above), and the trie index and fuzz corpus are not built |
 | 2. Features | `--section`, `--base` hardening, `--info` structured binary info | **done** |
 | 3. MCP server | `rf-mcp` stdio tools | **done** |
 | 4a. Chains | Chain IR, Linux execve chains (x86 int 0x80, x64 syscall) | **done** |
-| 4b. Chains | Windows VirtualProtect chains (x64 register ABI + x86 stdcall), anchor/IAT API resolution, alignment invariant, `--cfg-aware` | **done** |
-| 5. Differentiators | Semantic classification + ranking (`rf-classify`, `--classify`/`--rank`), JOP dispatcher analysis, scan cache (`--cache`, MCP `sort_by`) | **done** — chain DSL deferred to future work |
+| 4b. Chains | Windows VirtualProtect chains (x64 register ABI + x86 stdcall), anchor/IAT API resolution, alignment invariant, `--cfg-aware` | **partial** — the builder and the spike report exist, but two of the three PLAN exit criteria have no artifact: there is no emulator harness (no generated Windows chain has ever been executed against a CPU) and no CET-marked PE fixture, so `--cfg-aware` is untested against a real hardened binary. The harness lands in v0.5, the fixture in v0.2 |
+| 5. Differentiators | Semantic classification + ranking (`rf-classify`, `--classify`/`--rank`), JOP dispatcher analysis, scan cache (`--cache`, MCP `sort_by`) | **partial** — classification, ranking, dispatcher analysis and the cache ship; the chain DSL and ARM64 PAC awareness do not, and both have been dropped from the roadmap rather than left as silent debt |
 
 ## Building
 
@@ -51,6 +75,13 @@ cargo test             # unit tests (rf-core, rf-scan, rf-cli)
 cargo clippy -- -D warnings
 ```
 
+`rop-finder --version` prints the tool version, the version of the capstone
+core the binary is linked against, and a one-line attribution to ROPgadget
+(see [NOTICE](NOTICE)). The capstone line matters when reporting a parity
+diff or a decode disagreement: PLAN.md names capstone version drift as the
+project's top residual risk, and the disassembler build that produced a
+given output is otherwise unrecoverable from the output itself.
+
 ## Usage
 
 ```sh
@@ -60,7 +91,7 @@ rop-finder --binary ./prog --only "pop|ret" --badbytes "0a|0d" --range 0x1000-0x
 rop-finder --binary ./prog --base 0x400000 --offset 0x1000
 rop-finder --binary tests/fixtures/raw-x86.raw --rawArch=x86 --rawMode=32
 rop-finder --binary tests/fixtures/elf-ARMv7-ls --thumb
-rop-finder --binary ./ntoskrnl.exe --section .text --base 0   # ring0: RVAs, .text only
+rop-finder --binary ./driver.sys --section .text --base 0   # RVAs, .text only
 rop-finder --binary ./prog --info                           # metadata JSON, no scan
 rop-finder --binary tests/fixtures/elf-Linux-x64 --ropchain # execve("/bin/sh") chain script
 rop-finder --binary ./prog.exe --ropchain --chain windows-virtualprotect --api-addr 0x7fff12340000
@@ -164,7 +195,9 @@ rop-finder --binary tests/fixtures/pe-x86-cmd-v6.1.7600 --ropchain \
 A Linux `execve("/bin/sh", 0, 0)` chain — x86 via `int 0x80`, x64 via
 `syscall` — ported faithfully from ROPgadget's `ropmakerx86.py` /
 `ropmakerx64.py` (same gadget search order, same write-what-where
-backtracking, same tab-indented padding rendering). ELF x86/x64 only
+backtracking). One deliberate divergence: padding words render at
+column 0, not with ROPgadget's leading tab, because the tab made the
+generated script raise `IndentationError` at import (ROB-05). ELF x86/x64 only
 (matching ROPgadget's `ropmaker.py` dispatch); anything else exits 1 with
 a "not supported yet for the rop chain generation" usage error.
 `--depth`, `--badbytes`, `--base`, `--offset` and `--section` all apply
@@ -173,6 +206,20 @@ to the underlying scan; `--badbytes` additionally rejects chain words
 byte.
 
 ### windows-virtualprotect (Phase 4b)
+
+> **Experimental — the generated chain is not known to execute.** No
+> generated Windows chain has ever been run against a CPU or an emulator
+> (PLAN's Phase-4b "verify layout in an emulator harness" criterion has no
+> artifact), and the audit records three concrete defects in the emitted
+> layout: the stack-alignment pad is an inert data word that the preceding
+> gadget's `ret` lands on (`CHWIN-01`), `lpflOldProtect` defaults to the
+> shellcode address so VirtualProtect overwrites the first four bytes of
+> the buffer it just made RWX (`CHWIN-02`), and the IAT path uses the
+> `IMAGE_IMPORT_BY_NAME` record rather than the `FirstThunk` slot
+> (`CHWIN-03`). The CLI prints a warning to stderr whenever
+> `--chain windows-virtualprotect` is used. Treat the output as a layout
+> sketch to review by hand, not as a working primitive. Fixes are scheduled
+> for v0.5; see `docs/AUDIT-FINDINGS.md`.
 
 A Windows `VirtualProtect(shellcode, size, PAGE_EXECUTE_READWRITE, &old)`
 chain for PE x86/x64, designed per PLAN sec. 6.2 after the mandatory
@@ -187,8 +234,7 @@ regenerate with `python tests/spike_inventory.py`):
   `pop rax` + `mov rX, rax`; when neither exists the build fails with a
   structured error naming the register and every strategy tried — the
   spike shows this is the common case (cmd.exe x64 has NO ret-terminated
-  gadget writing rdx/r8/r9; ntoskrnl.exe has the full pop set and builds
-  end-to-end).
+  gadget writing rdx/r8/r9).
 - **x86 (stdcall)**: everything on the stack —
   `[api][ret→shellcode][lpAddress][dwSize][0x40][&old]`; VirtualProtect's
   `ret 0x10` continues into the shellcode. Needs no gadgets at all;
@@ -207,7 +253,15 @@ regenerate with `python tests/spike_inventory.py`):
 - **`--cfg-aware`**: keeps only gadgets entering on `endbr64`/`endbr32`
   (CET/IBT-valid targets). goblin does not expose the load-config CET
   flag, so the filter applies whenever the flag is passed; the CLI warns
-  when a PE advertises GUARD_CF and the flag is absent.
+  when a PE advertises GUARD_CF and the flag is absent. **Two caveats.**
+  GUARD_CF is Microsoft's *software* Control Flow Guard, a different
+  mitigation from Intel CET/IBT — it is a proxy for "hardened", not a CET
+  marker. And the flag returns **zero gadgets on every fixture in this
+  repository** (verified: 0 hits on all 24), because none of them contains
+  an `endbr64`/`endbr32` byte sequence, so an empty result is
+  indistinguishable from "no CET-valid gadget exists". There is also no
+  CET-marked PE in the corpus to test it against. Both are `CRIT-01`,
+  scheduled for v0.2.
 
 The chain is first built as a target-independent IR (`rf-chain` crate):
 a `RopChain` is a word list where each word is tagged `gadget` /
@@ -259,11 +313,27 @@ operand metadata (x86/x64, high confidence) or mnemonic heuristics
   offset…). Directory: `ROP_FINDER_CACHE_DIR`, else
   `%LOCALAPPDATA%\rop-finder\cache` (Windows) or `~/.cache/rop-finder`.
   Hits and misses are reported on stderr.
-- **Evaluation gate**: `cargo test -p rf-classify` samples 5,744 gadgets
-  from three fixtures, labels them with an independent metadata mapping,
-  and requires held-out macro-averaged precision ≥ 0.90 — it currently
-  measures **1.0000** (2,872 held-out samples, per-class P/R all 1.0;
-  see `tests/fixtures-eval.json`, sample in `tests/fixtures-labeled.jsonl`).
+
+**`rf-classify` is a heuristic, and it has not been independently
+evaluated.** No accuracy figure for it is published here, because none has
+been measured. `crates/rf-classify/tests/eval.rs` looks like an evaluation
+gate — it samples gadgets, computes a "ground truth" with
+`independent_labels()`, and asserts held-out macro-averaged precision
+≥ 0.90 — but `independent_labels()` is a second hand-written transcription
+of the same TAXONOMY.md rules R1–R13, by the same author, reading the same
+iced-x86 `InstructionInfoFactory` metadata the classifier itself consumes.
+Sharing no code is not independence when the rules and the evidence are
+identical: that experiment can detect a transcription slip and nothing
+else, so the number it produces measures self-agreement, not accuracy. It
+is also x86-64-only — all three sampled fixtures (`elf-x64-bash-v4.1.5.1`,
+`pe-x64-cmd-v6.1.7601`, `elf-Linux-x64`) are x64 — so the
+x86, ARM/ARM64/MIPS/PPC/SPARC/RISC-V heuristics have no
+evaluation of any kind beyond the `low_confidence` flag on each record.
+Earlier revisions of this README quoted that test's output as a measured
+precision; that claim is retracted. A genuine held-out labeled set replaces
+the circular harness in v0.3 (`CLS-01`/`CLS-11`). Until then, treat
+`--classify`, `--rank` and the MCP `sort_by: "quality"` ordering as a
+documented heuristic to triage a large dump, not as a measured judgement.
 
 **Chain DSL: deferred.** The stretch goal from PLAN §5 (a declarative
 chain-description DSL compiled to the Chain IR) is intentionally not
@@ -278,9 +348,13 @@ transport only** — there is deliberately no network listener.
 
 ```sh
 cargo build --release
-target/release/rop-finder-mcp --allow-dir /path/to/binaries --allow-dir tests/fixtures
+target/release/rop-finder-mcp --allow-dir /path/to/binaries --allow-dir /path/to/rop-finder/tests/fixtures
 # optional: --cache-dir <dir> --timeout-secs 60 --max-results 1000
+#           --max-depth 64 --max-concurrent 2 --allow-cwd --verbose-path-errors
 ```
+
+`--allow-dir` takes **absolute** paths and is the only source of the
+allowlist; with none given the server exits 2. See the security model below.
 
 The scan orchestration (`ScanRequest` → `scan_bytes`/`info_bytes`) lives in
 the `rf-cli` library and is shared verbatim with the CLI — no stdout
@@ -288,7 +362,7 @@ scraping.
 
 ### Tools
 
-All seven tools return structured JSON (`structuredContent` + text content);
+All eight tools return structured JSON (`structuredContent` + text content);
 errors are `{error: {code, message}}` with the MCP `isError` flag.
 
 | Tool | Purpose |
@@ -297,6 +371,7 @@ errors are `{error: {code, message}}` with the MCP `isError` flag.
 | `find_jop_gadgets` | JOP gadgets only (jmp/call-terminated); also supports `sort_by` |
 | `find_syscall_gadgets` | SYS gadgets only (syscall/sysenter/int/iret); also supports `sort_by` |
 | `get_binary_info` | The `--info` payload (format/arch/sections/imports), no scan |
+| `get_server_config` | The effective allow roots and caps (`max_depth`, `max_file_bytes`, `max_results`, `max_concurrent`, `timeout_secs`, cache state), so an agent never has to probe for them |
 | `search_gadgets_by_pattern` | Regex over gadget text (invalid regex → literal substring), full scan |
 | `run_ropgadget_command` | Flag passthrough, restricted to the allowlist below |
 | `build_rop_chain` | ROP chains: `target: "linux-execve"` (ELF x86/x64) or `"windows-virtualprotect"` (PE x86/x64, with `api_addr`/`shellcode_addr`/`shellcode_size`/`cfg_aware`); returns chain IR + python script |
@@ -331,19 +406,66 @@ Example JSON-RPC exchange (newline-delimited over stdio):
 maps onto the engine. Side-channel flags (`--dump`, `--string`, `--memstr`,
 `--console`) and unknown flags are rejected with `invalid_flag`.
 
-### Security model (PLAN §6.1, hardened after review)
+### Security model (PLAN §6.1)
 
-The server would otherwise be a local arbitrary-file-read primitive, so:
+The server is, by construction, a way to hand a local file's bytes to an
+autonomous agent. Everything below describes what the code enforces as of
+v0.1.1. Read the "What this does NOT protect against" list too — it is the
+half that decides whether running this is safe for you.
 
-- **Path confinement**: `binary_path` must canonicalize (symlinks and `..`
-  resolved) into the allowlist — the server process working directory plus
-  every `--allow-dir`. Anything else → `path_not_allowed`.
+**What the code enforces**
+
+- **Path confinement by open-then-verify handle.** `binary_path` is
+  resolved by `crates/rf-mcp/src/confine.rs`, not by canonicalizing a
+  string. Phase 1 is lexical and performs zero syscalls: the path must be
+  absolute, must contain no `.`/`..` component and no interior NUL, and on
+  Windows must not use a `\\?\` / `\\.\` / UNC prefix or carry a `:` after
+  the drive letter; the allow root is selected by component-wise match on
+  path components, never by string prefix, so `/allowed` does not admit
+  `/allowed-evil/x`. Phase 2 opens the file *pinned to the root*: on Unix
+  each remaining component is opened with
+  `openat(O_RDONLY|O_NOFOLLOW|O_CLOEXEC)` from a directory descriptor held
+  since startup, so no name is resolved twice and the descriptor is
+  provably a descendant; on Windows the handle is validated after the fact
+  with `GetFinalPathNameByHandleW(FILE_NAME_NORMALIZED|VOLUME_NAME_GUID)`
+  against the root's own final path, plus `GetFileType == FILE_TYPE_DISK`
+  and a matching volume serial. Phase 3 fstats the *handle* and requires a
+  regular file (which also rejects FIFOs) within the size cap. The open
+  handle — not a path — is what crosses into the blocking worker, so there
+  is no window between check and read. This replaces the previous
+  canonicalize-then-reopen-by-name design, against which a rename race read
+  a file outside the allowlist in 323 of 400 attempts
+  (`docs/AUDIT-FINDINGS.md` `MCP-01`).
+- **The allowlist is `--allow-dir` and nothing else.** The server's own
+  working directory is no longer seeded into the allowlist; starting with
+  no `--allow-dir` exits 2 rather than silently allowing the cwd. Passing
+  `--allow-cwd` opts the cwd back in explicitly (for `cargo run` and CI),
+  and obviously-wide roots are refused without
+  `--i-accept-a-wide-allowlist`: a filesystem or drive root, and anything
+  at or above `/etc`, `/usr`, `/var`, `/System`, `/Library`, `/home`,
+  `/Users`, `/root`, `/private/etc`, `/private/var`, `C:\Users`,
+  `C:\Windows`, `C:\Program Files`, `C:\Program Files (x86)` or
+  `C:\ProgramData` (matched component-wise, so `/etc` covers `/etc/ssl`).
+  `--cache-dir` and `--audit-log` are refused if they fall inside an
+  allowed root.
+- **One denial code, no existence oracle.** Every rejection returns
+  `path_denied` with the same message and no OS error text, whether the
+  path is outside every root, absent, a directory, a symlink, or
+  unreadable. The old taxonomy (`not_a_file` / `path_not_allowed` /
+  `path_not_found`) distinguished exists-as-dir from exists-as-file from
+  absent for *any* absolute path on the machine — a whole-filesystem
+  existence oracle (`MCP-07`). `--verbose-path-errors` restores detail, and
+  only for paths that already selected an allowed root. Use
+  `get_server_config` to read back the effective roots and caps rather than
+  probing for them.
 - **Flag allowlist** for `run_ropgadget_command` (see above); no flag can
   expand file access beyond the directory allowlist.
 - **Resource caps**: `max_results` defaults to 1000, hard-capped at 50000;
-  per-request timeout defaults to 60 s (hard cap 300 s). Scans run on
-  blocking worker threads; a timed-out request returns a `timeout` error
-  while the orphaned worker finishes in the background.
+  per-request timeout defaults to 60 s (hard cap 300 s); `depth` above
+  `--max-depth` (default 64) is *rejected* with a `usage_error` naming the
+  limit and the value, not silently clamped; `--max-concurrent` (default 2)
+  bounds simultaneous scans; `--max-file-bytes` (default 256 MiB) is
+  enforced against the fstat of the open handle, before any read.
 - **Content-hash cache**: SHA-256 of the file plus the scan parameters
   (including `base` and `cfg_aware`) keys an in-memory cache (plus
   optional `--cache-dir` on-disk spill), so repeated queries on the same
@@ -354,7 +476,35 @@ The server would otherwise be a local arbitrary-file-read primitive, so:
   computed once at scan time and ride in the cache, so quality-sorted
   queries need no rescan; without `sort_by`, the first N in
   deterministic traversal order are returned.
-- **No panics**: malformed binaries return a `binary_error` tool error.
+- **Loader errors are structured**: a malformed or unsupported binary
+  returns a `binary_error` tool error rather than taking the server down.
+  This is not a proven no-panic guarantee — no fuzz corpus exists yet
+  (PLAN Phase 1's "zero panics on 10K mutated binaries" criterion is
+  untested), so read it as "the known error paths are handled".
+
+**What this does NOT protect against**
+
+- **Your own choice of root.** The confinement is exactly as narrow as the
+  directories you pass to `--allow-dir`. Point it at a home directory or a
+  source tree and everything in there is in scope, by design. The
+  wide-root refusal is a guardrail against the obvious mistakes, not a
+  policy engine.
+- **Anything readable inside a root.** There is no per-file policy, no
+  file-type gate beyond "regular file within the size cap", and no
+  redaction. If a private key, a credential file or an unrelated document
+  sits inside an allowed root, a request naming it will be served.
+- **The binary's bytes reaching the agent.** That is the product, not a
+  leak: gadget text, byte sequences, section layout, import names and
+  chain scripts derived from the target all flow to the model and to
+  whatever the host does with model context. Do not point this at a binary
+  you would not paste into a chat window.
+- **A timed-out request stopping work.** Until the v0.2 engine cancellation
+  token lands, a timeout returns a `timeout` error to the caller while the
+  worker keeps running to completion (`MCP-03`). The `--max-depth` and
+  `--max-concurrent` caps bound how much that can cost; they do not stop it.
+- **The agent itself.** Nothing here judges intent. An agent that has been
+  prompt-injected can issue any request the operator's own roots and flag
+  allowlist permit.
 
 ## Parity harness
 
@@ -368,9 +518,16 @@ Compares post-dedup `(vaddr, bytes)` gadget sets against
 `python ../ropgadget/ROPgadget.py --binary <f> --depth 10 --dump` for the
 full fixture corpus (ELF all arches, PE, Mach-O, Universal, raw — raw gets
 `--rawArch=x86 --rawMode=32` on both sides) and prints per-file overlap
-statistics, sample diffs, and per-file timings. Current status: 99.93% of
-ROPgadget's gadgets reproduced across ~764 K reference gadgets; 100% on
-MIPS/PPC/SPARC/RISC-V/Universal/raw/Mach-O-PPC/x64.
+statistics, sample diffs, and per-file timings. Current status
+([`docs/measured-2026-09.md`](docs/measured-2026-09.md)): **763,186 of
+763,718 reference gadgets reproduced — 99.93%** across **24** fixtures, 11
+of which are bit-exact in both directions. The corpus is 24 binaries, not
+25: ROPgadget's own test suite has a 25th, `core` (a 300 KB ET_CORE ELF
+core dump exercising a distinct loader path — no section headers, unusual
+program-header layout), which was never copied into `tests/fixtures/`.
+`tests/fixtures/PROVENANCE.md` records that drop along with the origin and
+licence of each fixture that is present. The ET_CORE loader path is
+therefore unmeasured; re-adding the fixture is v0.2 work.
 
 ## Semantic notes / intentional deviations
 
@@ -396,14 +553,36 @@ MIPS/PPC/SPARC/RISC-V/Universal/raw/Mach-O-PPC/x64.
   cosmetics; the x86 path normalizes the biggest capstone quirks
   (segment-override prefixes on non-memory instructions, rep/repne outside
   string ops and branch families, rep/repne kept on string ops, memory sizes
-  always shown, RIP-relative operands). Residual parity noise (~0.05–0.2% of
-  gadgets on x86/x64): capstone accepts some invalid LOCK-prefixed
-  instructions iced rejects (and vice versa, e.g. `ud0` operands), far
-  jumps (`ljmp`/`lcall`), and dedup-survivor swaps from any remaining text
-  difference. On ARM/ARM64 the capstone "next" core rejects a few encodings
-  python-capstone 5.0.7 accepts (`udf #0`, some `vmov`/`vmrs` VFP forms) —
-  11 gadgets on elf-ARM64-bash, 14 on elf-ARMv7-ls. Parity is judged on
-  post-dedup `(vaddr, bytes)` sets.
+  always shown, RIP-relative operands). On ARM/ARM64 the capstone "next"
+  core rejects a few encodings python-capstone 5.0.7 accepts (`udf #0`,
+  some `vmov`/`vmrs` VFP forms) — 11 gadgets on elf-ARM64-bash, 14 on
+  elf-ARMv7-ls.
+- **Two different divergence numbers, and they are not interchangeable.**
+  Parity is judged on post-dedup `(vaddr, bytes)` SETS: which byte
+  sequences at which addresses were found. On that measure the loss is
+  0.07% overall (99.93%, `docs/measured-2026-09.md`) and the residual
+  x86/x64 noise is on the order of a tenth of a percent per fixture
+  (`docs/AUDIT-FINDINGS.md` `SCAN-08` confirms the historical
+  0.05–0.2% range for this measure) — decoder
+  disagreements (capstone accepts some invalid LOCK-prefixed instructions
+  iced rejects and vice versa, e.g. `ud0` operands; iced rejects `mov cs,
+  r/m16` which capstone decodes), far jumps (`ljmp`/`lcall`), and
+  dedup-survivor swaps. **The divergence in gadget TEXT is 100-500x larger:
+  15-29% of x86/x64 gadget texts do not match ROPgadget's byte for byte**
+  (measured in `docs/AUDIT-FINDINGS.md` `SCAN-08`). The two numbers measure
+  different things and conflating them is a real user-facing bug: the same
+  gadget, found at the same address with the same bytes, is *rendered*
+  differently by iced-x86 than by capstone. Sources: immediates always in
+  hex (`add rsp, 0x8` vs `add rsp, 8`), no spaces around displacement signs
+  (`[rbp-0x38]` vs `[rbp - 0x38]`), and genuinely different mnemonics —
+  `popal`/`popad`, `pushal`/`pushad`, `xlatb` vs `xlat byte ptr [rbx]`,
+  `retf`/`retfq`, `fucompi`/`fucomip`, `call`/`callf`, `jmp`/`jmpf`, and
+  `xrelease mov` for f3-prefixed stores. Consequence: **do not reuse
+  ROPgadget-era greps, `--re` patterns or `--only` lists unchanged.**
+  `--only` matches the first whitespace token, so `--only "popal|ret"`,
+  `--only "xlatb"` and `--only "call"` (far calls are `callf` here) all
+  select differently from ROPgadget. Text-level parity is not a goal this
+  release claims to meet.
 - Non-x86 scan semantics replicate `gadgets.py:__gadgetsFinding`: aligned
   backward stepping in virtual-address space with byte-fallback
   (gadgets.py:73-89), the fixed-width clean-decode rule (104-107), the
@@ -418,14 +597,38 @@ MIPS/PPC/SPARC/RISC-V/Universal/raw/Mach-O-PPC/x64.
 - MPX anchors (`f2 c3` etc.) decode as `bnd ret`/`bnd jmp`, which are not in
   ROPgadget's accepted branch list — they are scanned but always rejected,
   exactly as in ROPgadget.
-- `--filter`: ROPgadget anchors the regex with `re.match("(…)$")`, i.e.
-  effectively full-mnemonic equality; Phase 0 uses suffix matching on `|`
-  parts (close enough for the flag's purpose; not used by the parity harness).
+- `--filter`: **known divergence, not yet fixed.** ROPgadget compiles the
+  value as a REGEX anchored at both ends (`re.match("({})$")`), i.e.
+  full-mnemonic regex equality. rop-finder splits on `|` and does a literal
+  `ends_with` on each part. This diverges in both directions: a regex like
+  `--filter "j.*"` filters nothing here (no mnemonic literally ends in the
+  four characters `j.*`) where ROPgadget removes every jump gadget, and a
+  short literal like `--filter "op"` removes every `pop` gadget here where
+  ROPgadget removes none (no mnemonic is exactly `op`). The parity harness
+  does not exercise `--filter`, which is why this survived. Tracked as
+  `CLI-02`/`SCAN-01`; scheduled for v0.2.
 - `--ropchain` (Phase 4a) intentional deviations from ropmaker:
-  - the write-what-where register regex in `ropmakerx64.py:29` /
-    `ropmakerx86.py:29` is a buggy Python char class (`[a-z]`-style ranges
-    that also match `;`, `0`…); we implement the *intended* register sets
-    (REGS64/REGS32) with explicit operand parsing and the same backtracking.
+  - the write-what-where register match in
+    `ropgadget/ropchain/arch/ropmakerx64.py:29` /
+    `ropmakerx86.py:29` is a Python character class that was clearly meant
+    to be an alternation: `[(rax)|(rbx)|…|(r15)]{3}`. Written with `[…]` it
+    is not an alternation and contains no ranges — it is the literal set of
+    characters `{ ( ) | r a x b c d s i 0 1 2 3 4 5 9 }`, and `;` is **not**
+    in it. The actual bug is that *any* 3-character permutation of that set
+    matches (`r9d`, `((r`, `rxx`), which in practice never changes the
+    outcome because the following `pop <reg>` lookup discards non-registers.
+    We do explicit operand parsing against fixed register lists
+    (`REGS64`/`REGS32` in `crates/rf-chain/src/linux.rs`) with the same
+    backtracking, and those lists **reproduce the oracle's effective set
+    rather than correcting it**: x64 is the oracle's enumeration minus `r9`
+    (the `{3}` quantifier cannot match a 2-character name, so ROPgadget
+    never selects it either), and `r8` is absent from the oracle's
+    enumeration altogether — the character `8` is not in the class, so no
+    `r8` form can match. `rbp` and `rsp` are considered by neither tool.
+    Net effect: a binary whose only clean-tail write-what-where primitive
+    goes through `r8`, `r9` or `rbp` reports "can't find a suitable gadget"
+    in both tools. Widening the register set is a deliberate parity
+    divergence and is not done here.
   - `ropmakerx64.py:79` hardcodes `.data`; we fall back to the first
     writable non-executable section when no section is named `.data`
     (mirrors how ROPgadget's `getDataSections` already treats every

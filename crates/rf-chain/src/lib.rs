@@ -201,9 +201,16 @@ impl RopChain {
 
     /// ROPgadget-compatible Python exploit script (ropmakerx64.py output
     /// structure: the `from struct import pack` header, `p = b''`, and
-    /// `p += pack('<Q', 0x...) # ...` lines; padding lines are
-    /// tab-indented; string immediates render as `p += b'...'`). The
-    /// header comment line comes from [`RopChain::script_comment`].
+    /// `p += pack('<Q', 0x...) # ...` lines; string immediates render as
+    /// `p += b'...'`). The header comment line comes from
+    /// [`RopChain::script_comment`].
+    ///
+    /// Every line is emitted at column 0 (ROB-05: ropmaker indents padding
+    /// lines with a literal tab, which makes the script an
+    /// `IndentationError` at module level — we deliberately diverge), and
+    /// every comment goes through [`py_comment`] first (ROB-01: comment
+    /// text is derived from the analysed binary, so a newline in it would
+    /// otherwise close the comment and inject top-level Python).
     pub fn to_python(&self) -> String {
         let (c, w) = self.pack_char();
         let mask = if self.word_size >= 8 {
@@ -211,9 +218,12 @@ impl RopChain {
         } else {
             (1u64 << (self.word_size * 8)) - 1
         };
+        let mut header = py_comment(&self.script_comment);
+        if !header.starts_with('#') {
+            header.insert_str(0, "# ");
+        }
         let mut out = format!(
-            "#!/usr/bin/env python3\n{}\n\nfrom struct import pack\n\n# Padding goes here\np = b''\n\n",
-            self.script_comment
+            "#!/usr/bin/env python3\n{header}\n\nfrom struct import pack\n\n# Padding goes here\np = b''\n\n"
         );
         for word in &self.words {
             let value = word.value & mask;
@@ -222,16 +232,14 @@ impl RopChain {
                     let bytes = &value.to_le_bytes()[..self.word_size];
                     out.push_str(&format!("p += b'{}'\n", py_bytes_escape(bytes)));
                 }
-                WordKind::Padding => {
-                    out.push_str(&format!(
-                        "\tp += pack('<{c}', 0x{:0w$x}) # {}\n",
-                        value, word.comment
-                    ));
-                }
-                WordKind::GadgetAddr | WordKind::DataAddr | WordKind::CodeAddr => {
+                WordKind::GadgetAddr
+                | WordKind::DataAddr
+                | WordKind::CodeAddr
+                | WordKind::Padding => {
                     out.push_str(&format!(
                         "p += pack('<{c}', 0x{:0w$x}) # {}\n",
-                        value, word.comment
+                        value,
+                        py_comment(&word.comment)
                     ));
                 }
             }
@@ -252,6 +260,27 @@ impl RopChain {
         }
         out
     }
+}
+
+/// Maximum length of a comment rendered into the generated Python script.
+pub const PY_COMMENT_MAX: usize = 64;
+
+/// Sanitise a string for use inside a `#` comment of the generated Python
+/// script (ROB-01).
+///
+/// Comment text is derived from the analysed binary — the PE import DLL
+/// name ([`rf_core::PeImport::dll`], copied verbatim out of the import
+/// descriptor) and the disassembled gadget text both end up here. A
+/// newline in such a string terminates the `#` comment and turns whatever
+/// follows into top-level Python that the user then executes, so every
+/// character outside printable ASCII (`0x20..=0x7e`) — newlines and
+/// carriage returns included — is dropped rather than escaped, and the
+/// result is truncated to [`PY_COMMENT_MAX`] characters.
+pub fn py_comment(s: &str) -> String {
+    s.chars()
+        .filter(|c| (' '..='~').contains(c))
+        .take(PY_COMMENT_MAX)
+        .collect()
 }
 
 /// Render bytes as a Python `b'...'` literal body (ROPgadget only ever
@@ -291,8 +320,96 @@ pub fn arch_name(arch: Arch) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Pure-Rust "is this a flat, un-injected script?" check, shared with
+    /// the windows builder tests. Every generated script is a flat
+    /// sequence of top-level statements, so every line must be blank, a
+    /// comment, one of the two fixed header statements, or a `p += …`
+    /// append — and no line may be indented (ROB-05) or introduce a
+    /// statement of its own (ROB-01). A script that passes this also
+    /// parses as Python.
+    pub(crate) fn assert_flat_python_script(py: &str) {
+        let mut lines = py.lines();
+        assert_eq!(lines.next(), Some("#!/usr/bin/env python3"));
+        let header = lines.next().unwrap_or("");
+        assert!(
+            header.starts_with('#'),
+            "header is not a comment: {header:?}"
+        );
+        for (i, line) in py.lines().enumerate() {
+            assert!(
+                !(line.starts_with(' ') || line.starts_with('\t')),
+                "line {i} is indented at module level: {line:?}"
+            );
+            let ok = line.is_empty()
+                || line.starts_with('#')
+                || line == "from struct import pack"
+                || line == "p = b''"
+                || line.starts_with("p += ");
+            assert!(ok, "line {i} is not a header or append statement: {line:?}");
+        }
+    }
+
+    /// Assert `needle` never occurs in statement position: on every line
+    /// that contains it, the line's first `#` comes first.
+    pub(crate) fn assert_only_in_comment(py: &str, needle: &str) {
+        for line in py.lines() {
+            let Some(at) = line.find(needle) else {
+                continue;
+            };
+            let hash = line
+                .find('#')
+                .unwrap_or_else(|| panic!("{needle:?} outside any comment: {line:?}"));
+            assert!(hash < at, "{needle:?} in statement position: {line:?}");
+        }
+    }
+
+    /// The interpreter to cross-check generated scripts with:
+    /// `$RF_CHAIN_PYTHON` when set, else `python`, else `python3`.
+    /// Candidates are probed with `-c "import ast"` so a non-working stub
+    /// (the Windows Store alias) counts as absent.
+    fn python_interpreter() -> Option<String> {
+        let candidates = match std::env::var("RF_CHAIN_PYTHON") {
+            Ok(p) => vec![p],
+            Err(_) => vec!["python".to_string(), "python3".to_string()],
+        };
+        candidates.into_iter().find(|exe| {
+            std::process::Command::new(exe)
+                .args(["-c", "import ast"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
+    }
+
+    /// Optional cross-check: `ast.parse` the generated script with a real
+    /// interpreter. A no-op when no interpreter can be spawned, so the
+    /// suite never depends on a Python installation — the pure-Rust
+    /// [`assert_flat_python_script`] is the load-bearing assertion.
+    pub(crate) fn assert_python_parses(py: &str) {
+        let Some(exe) = python_interpreter() else {
+            return;
+        };
+        // pid + a per-process counter: tests run in parallel threads.
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("rf-chain-script-{}-{n}.py", std::process::id()));
+        std::fs::write(&path, py).unwrap();
+        let out = std::process::Command::new(&exe)
+            .args(["-c", "import ast,sys;ast.parse(open(sys.argv[1]).read())"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            out.status.success(),
+            "{exe} rejected the generated script: {}\n--- script ---\n{py}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 
     fn chain_fixture() -> RopChain {
         RopChain {
@@ -396,8 +513,19 @@ mod tests {
         ));
         assert!(py.contains("p += pack('<Q', 0x0000000000401000) # pop rdi ; ret\n"));
         assert!(py.contains("p += pack('<Q', 0x00000000006bc080) # @ .data\n"));
-        // padding lines are tab-indented
-        assert!(py.contains("\tp += pack('<Q', 0x4141414141414141) # padding\n"));
+    }
+
+    /// ROB-05: ropmaker indents padding lines with a literal tab, which
+    /// makes every script with a padding word an `IndentationError`. We
+    /// deliberately diverge — every line is at column 0.
+    #[test]
+    fn padding_lines_are_not_indented() {
+        let c = chain_fixture();
+        let py = c.to_python();
+        assert!(py.contains("p += pack('<Q', 0x4141414141414141) # padding\n"));
+        assert!(!py.contains('\t'), "{py}");
+        assert_flat_python_script(&py);
+        assert_python_parses(&py);
     }
 
     #[test]
@@ -406,7 +534,8 @@ mod tests {
         c.word_size = 4;
         let py = c.to_python();
         assert!(py.contains("pack('<I', 0x00401000)"));
-        assert!(py.contains("\tp += pack('<I', 0x41414141) # padding\n"));
+        assert!(py.contains("p += pack('<I', 0x41414141) # padding\n"));
+        assert!(!py.contains('\t'), "{py}");
         // raw bytes are 4-byte LE words
         let raw = c.to_bytes();
         assert_eq!(raw.len(), 12);
@@ -426,6 +555,60 @@ mod tests {
         assert!(py.contains("p += b'/bin//sh'\n"));
         let raw = c.to_bytes();
         assert_eq!(&raw[24..32], b"/bin//sh");
+    }
+
+    /// ROB-01: the sanitiser itself.
+    #[test]
+    fn py_comment_strips_control_chars_and_truncates() {
+        assert_eq!(
+            py_comment("@ IAT VirtualProtect (KERNEL32.dll)"),
+            "@ IAT VirtualProtect (KERNEL32.dll)"
+        );
+        // newlines, carriage returns and tabs are removed, not escaped
+        assert_eq!(
+            py_comment("KERNEL32\nimport os\r\nx\t.dll"),
+            "KERNEL32import osx.dll"
+        );
+        // everything else outside 0x20..=0x7e goes too (NUL, DEL, non-ASCII)
+        assert_eq!(py_comment("a\u{0}b\u{7f}c\u{e9}d\u{1f600}"), "abcd");
+        assert_eq!(py_comment(&"A".repeat(4096)).len(), PY_COMMENT_MAX);
+    }
+
+    /// ROB-01: a comment carried in the IR cannot break out of the `#`,
+    /// whichever word kind or the script header carries it.
+    #[test]
+    fn tainted_comments_cannot_escape_the_python_comment() {
+        let mut c = chain_fixture();
+        c.script_comment = "# hdr\nimport os\nos.system('id')".to_string();
+        c.words[0].comment = "pop rdi ; ret\nimport os\nos.system('id')".to_string();
+        c.words[1].comment = "@ .data\nimport os\nos.system('id')".to_string();
+        c.words[2].comment = "padding\nimport os\nos.system('id')".to_string();
+        let py = c.to_python();
+        assert!(py.contains("os.system('id')"), "{py}");
+        for line in py.lines() {
+            assert!(
+                !line.starts_with("import os"),
+                "injected statement: {line:?}"
+            );
+        }
+        assert_only_in_comment(&py, "import os");
+        assert_only_in_comment(&py, "os.system('id')");
+        assert_flat_python_script(&py);
+        assert_python_parses(&py);
+    }
+
+    /// A `script_comment` that is not already a comment still renders as
+    /// one, so the second line of the script is never a statement.
+    #[test]
+    fn script_comment_is_forced_into_a_comment() {
+        let mut c = chain_fixture();
+        c.script_comment = "os.system('id')".to_string();
+        let py = c.to_python();
+        assert!(
+            py.starts_with("#!/usr/bin/env python3\n# os.system('id')\n"),
+            "{py}"
+        );
+        assert_flat_python_script(&py);
     }
 
     #[test]

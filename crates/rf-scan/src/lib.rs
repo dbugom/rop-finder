@@ -22,3 +22,34 @@ mod engine;
 pub mod x86;
 
 pub use engine::{post_process, scan_binary, scan_section, Gadget, ScanOptions};
+
+/// The capstone C library this build is linked against, as `"major.minor"`.
+///
+/// Reported by the library itself at runtime (`cs_version()`, wrapped by
+/// capstone-rs as `Capstone::lib_version`), not by the crate version — so
+/// it stays true if the pin in Cargo.toml ever moves or a distributor
+/// links a system capstone. capstone's C API returns only major and
+/// minor: `CS_VERSION_EXTRA` is a compile-time macro that `cs_version()`
+/// does not hand back, so there is no patch level to print and none is
+/// invented here (CLAIM-10; PLAN.md:262 wants this recorded because
+/// disassembly text drifts between capstone releases and that drift is
+/// the project's #1 parity risk).
+///
+/// Only the non-x86 architectures decode through capstone; x86/x64 go
+/// through iced-x86, which exposes no runtime version at all.
+pub fn capstone_version() -> String {
+    let (major, minor) = capstone::Capstone::lib_version();
+    format!("{major}.{minor}")
+}
+
+#[cfg(test)]
+mod tests {
+    /// The pinned `capstone = "=0.13.0"` bundles the capstone 5.0 C core;
+    /// if a future bump changes what the linked library reports, this
+    /// fails and `--version` has to be re-checked rather than silently
+    /// printing something new.
+    #[test]
+    fn capstone_version_is_the_linked_library_version() {
+        assert_eq!(super::capstone_version(), "5.0");
+    }
+}

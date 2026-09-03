@@ -36,7 +36,7 @@ use rf_core::{Arch, PeImport};
 use rf_scan::Gadget;
 
 use crate::linux::{find_exact, ChainBuilder, DataSection};
-use crate::{arch_name, ChainError, ChainWord, RopChain, WordKind};
+use crate::{arch_name, py_comment, ChainError, ChainWord, RopChain, WordKind};
 
 const PADDING64: u64 = 0x4141_4141_4141_4141;
 const PADDING32: u64 = 0x4141_4141;
@@ -277,9 +277,13 @@ fn emit_api_call64(
         .ok_or_else(|| ChainError::MissingGadget("jmp rax (IAT transfer)".to_string()))?;
 
     b.gadget(pop_rax);
+    // ROB-01: `imp.dll` is copied verbatim out of the PE import descriptor
+    // (rf-core pe.rs) — sanitise it here as well as at render time so the
+    // IR (and its JSON form) never carries attacker-controlled control
+    // characters either.
     b.data(
         imp.thunk_vaddr,
-        format!("@ IAT {} ({})", opts.api_name, imp.dll),
+        format!("@ IAT {} ({})", opts.api_name, py_comment(&imp.dll)),
     );
     b.padding(pop_rax, &[]);
     b.gadget(deref);
@@ -429,6 +433,18 @@ mod tests {
     fn vp_import() -> Vec<PeImport> {
         vec![PeImport {
             dll: "KERNEL32.dll".into(),
+            name: "VirtualProtect".into(),
+            thunk_rva: 0x2000,
+            thunk_vaddr: 0x502000,
+        }]
+    }
+
+    /// ROB-01: what `rf-core`'s PE loader hands us when the import
+    /// descriptor's Name RVA points at attacker-chosen bytes — the DLL
+    /// name is copied verbatim, newlines included.
+    fn poisoned_import() -> Vec<PeImport> {
+        vec![PeImport {
+            dll: "KERNEL32\nimport os\nos.system('id')\n.dll".into(),
             name: "VirtualProtect".into(),
             thunk_rva: 0x2000,
             thunk_vaddr: 0x502000,
@@ -677,6 +693,143 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ChainError::NoWritableSection));
+    }
+
+    /// ROB-01 end to end: a PE whose import DLL name carries Python must
+    /// not produce a script that runs it.
+    #[test]
+    fn iat_dll_name_cannot_inject_python() {
+        let g = win64_pop_set();
+        let chain = build_windows_virtualprotect(
+            &g,
+            &data(),
+            &poisoned_import(),
+            Arch::X64,
+            "pe",
+            &WinChainOpts::default(), // no api_addr → IAT path (windows.rs:282)
+            &[],
+        )
+        .unwrap();
+        // The IR itself is already clean: no control characters survive.
+        let iat = chain
+            .words
+            .iter()
+            .find(|w| w.comment.contains("@ IAT"))
+            .unwrap();
+        assert!(!iat.comment.contains('\n') && !iat.comment.contains('\r'));
+
+        let py = chain.to_python();
+        // The text still appears — it is not silently dropped — but only
+        // ever as comment text.
+        assert!(py.contains("os.system('id')"), "{py}");
+        for line in py.lines() {
+            assert!(
+                !line.starts_with("import os"),
+                "injected top-level statement: {line:?}"
+            );
+        }
+        crate::tests::assert_only_in_comment(&py, "import os");
+        crate::tests::assert_only_in_comment(&py, "os.system('id')");
+        crate::tests::assert_flat_python_script(&py);
+        crate::tests::assert_python_parses(&py);
+    }
+
+    /// ROB-05 + ROB-01: every windows-virtualprotect script this builder
+    /// can produce is valid, flat Python. The real shipped fixture
+    /// `tests/fixtures/pe-x64-cmd-v6.1.7601` cannot be used here — the
+    /// builder returns `can't find a suitable gadget: cannot populate rdx`
+    /// on it (the spike's "common case on real PEs") — so the synthetic
+    /// gadget sets above cover every code path instead.
+    #[test]
+    fn every_generated_chain_script_is_flat_python() {
+        let pop_set = win64_pop_set();
+        let mut autopad = win64_pop_set();
+        autopad[3] = gadget(0x1030, "pop r9 ; pop rbx ; ret");
+        let mut fallback = win64_fallback_set();
+        fallback.push(gadget(0x1090, "mov r9, rax ; ret"));
+
+        let cases: Vec<(&str, RopChain)> = vec![
+            (
+                "x64 --api-addr",
+                build_windows_virtualprotect(
+                    &pop_set,
+                    &data(),
+                    &[],
+                    Arch::X64,
+                    "pe",
+                    &opts_with_api(),
+                    &[],
+                )
+                .unwrap(),
+            ),
+            (
+                "x64 alignment autopad",
+                build_windows_virtualprotect(
+                    &autopad,
+                    &data(),
+                    &[],
+                    Arch::X64,
+                    "pe",
+                    &opts_with_api(),
+                    &[],
+                )
+                .unwrap(),
+            ),
+            (
+                "x64 IAT",
+                build_windows_virtualprotect(
+                    &pop_set,
+                    &data(),
+                    &vp_import(),
+                    Arch::X64,
+                    "pe",
+                    &WinChainOpts::default(),
+                    &[],
+                )
+                .unwrap(),
+            ),
+            (
+                "x64 rax fallback",
+                build_windows_virtualprotect(
+                    &fallback,
+                    &data(),
+                    &[],
+                    Arch::X64,
+                    "pe",
+                    &opts_with_api(),
+                    &[],
+                )
+                .unwrap(),
+            ),
+            (
+                "x86 stdcall",
+                build_windows_virtualprotect(
+                    &[],
+                    &data(),
+                    &[],
+                    Arch::X86,
+                    "pe",
+                    &opts_with_api(),
+                    &[],
+                )
+                .unwrap(),
+            ),
+        ];
+
+        for (label, chain) in &cases {
+            let py = chain.to_python();
+            assert!(!py.contains('\t'), "{label}: tab in script\n{py}");
+            crate::tests::assert_flat_python_script(&py);
+            crate::tests::assert_python_parses(&py);
+            if chain.word_size == 8 {
+                // every Win64 chain carries shadow-space padding words —
+                // the words ROB-05 used to indent.
+                assert!(
+                    chain.words.iter().any(|w| w.kind == WordKind::Padding),
+                    "{label}: expected padding words"
+                );
+            }
+        }
     }
 
     #[test]

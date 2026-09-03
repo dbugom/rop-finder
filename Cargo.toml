@@ -13,11 +13,23 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "BSD-2-Clause"
-rust-version = "1.80"
+# Real floor, not aspiration: the highest `rust-version` declared anywhere in
+# the resolved graph is 1.88.0 (darling 0.24.1, rmcp 3.2.0, globset 0.4.20;
+# goblin 0.10.7 and clap 4.6.6 want 1.85). Re-derive it with
+# `cargo metadata --format-version 1 --locked` and take the maximum
+# `rust_version` field. The pinned toolchain lives in rust-toolchain.toml.
+rust-version = "1.88"
 
 [workspace.dependencies]
 goblin = "0.10"
-iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "intel", "instr_info", "fast_fmt"] }
+# Exact pin, not a caret range. iced-x86's FastFormatter produces the
+# user-visible x86/x64 instruction text, and rf-scan/src/x86.rs hand-matches
+# capstone's exact output strings ("ds ret", "repz ret", "bnd jmp", rep-on-
+# string-ops). Any 1.x release that changes formatting silently breaks the
+# parity numbers in docs/measured-2026-09.md, so this is pinned the same way
+# rf-scan/Cargo.toml pins capstone = "=0.13.0". Do not relax without re-running
+# tests/parity.py.
+iced-x86 = { version = "=1.21.0", default-features = false, features = ["std", "decoder", "intel", "instr_info", "fast_fmt"] }
 memchr = "2.7"
 thiserror = "2"
 clap = { version = "4.5", features = ["derive"] }

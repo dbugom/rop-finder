@@ -63,3 +63,35 @@ not evidence for the headline claim.
 No criterion benchmark suite exists (`benches/` is empty), so these figures are
 wall-clock from the parity harness and shell timing, not statistically sampled.
 Phase 6 replaces this section with generated output.
+
+No comparison against `ropper`, `rp++`, `radare2` or any other peer tool was
+run. Earlier documentation carried a "~9-14x faster than ropper" figure; it has
+no source and has been removed rather than restated.
+
+## Documentation-retraction pass — 2026-09-03
+
+Facts checked while rewriting README/MANUAL/PLAN/TAXONOMY for Phase 1
+(`REMEDIATION.md`, "Retract every claim the code does not support"). Each
+row is either a command actually run against this tree — Windows 11,
+`cargo build -p rf-cli --release`, rustc 1.89.0 — or a source location that
+was read. These are the receipts for the claims those documents now make.
+
+| Claim now in the docs | How it was checked | Result |
+|---|---|---|
+| Fixture corpus is 24 binaries, not 25 | `ls tests/fixtures` | 24 binaries (plus `MANIFEST.sha256` and `PROVENANCE.md`, added in the same release). `PROVENANCE.md` records the dropped 25th, `core` (ET_CORE) |
+| Default output is sorted alphabetically by gadget text, not by address | `rop-finder --binary tests/fixtures/elf-Linux-x86 --depth 4` | First gadget `0x080604ab : aaa ; …`, last `0x0807d14c : xor esi, esi ; ret 0xf01`. Alphabetical, addresses unordered. Source: `post_process` in `crates/rf-scan/src/engine.rs` (`keyed.sort_by(\|a, b\| a.0.cmp(&b.0))`, a port of `rgutils.alphaSortgadgets`) |
+| `--cfg-aware` returns zero gadgets on every fixture | `for f in tests/fixtures/*; do rop-finder --binary "$f" --cfg-aware \| grep -c '^0x'; done` | 0 on all 24. Confirms `CRIT-01`; the MANUAL's `--cfg-aware` recommendation is withdrawn until v0.2 |
+| `--version` prints the capstone version and the ROPgadget attribution | `rop-finder --version` | Prints `rop-finder 0.1.0`, `capstone 5.0 (bundled; …)`, `iced-x86 (decodes x86/x64)`, and the ROPgadget/BSD-3-Clause attribution. Exit 0 |
+| `--help` and `--version` exit 0; `-v` is not bound | `rop-finder --help; rop-finder --version; rop-finder -v` | Exit 0, 0, 1. `-v` reports `unexpected argument` — recorded as a `partial` row in the MANUAL's flag-coverage table |
+| `--chain windows-virtualprotect` prints an experimental warning | `rop-finder --binary tests/fixtures/pe-x86-cmd-v6.1.7600 --ropchain --chain windows-virtualprotect --api-addr 0x76771234` | Three `[Warning]` lines on stderr naming `CHWIN-01`, `CHWIN-02`, `CHWIN-03` and v0.5 |
+| `--string`, `--opcode` are implemented | `rop-finder --binary tests/fixtures/elf-Linux-x86 --opcode c9c3` / `--string "bin"` | Both print ROPgadget-format hit lists |
+| `--align` constrains but does not deepen on x86/x64 | Read `crates/rf-scan/src/engine.rs` (x86 path) vs `crates/rf-scan/src/cs.rs` (capstone path) vs `ropgadget/gadgets.py:73-89` | The oracle and `cs.rs` both step candidate starts by `ref - i*align`, reaching `(depth-1)*align` bytes back. The x86 path steps by `ref - i` and discards unaligned starts, reaching `depth-1` bytes. Counts on `elf-Linux-x86 --depth 10`: 42,480 gadgets at `--align 0`, 12,099 at `--align 4`. The oracle side could not be run here — python-capstone is not installed on this machine — so no cross-tool ratio is quoted |
+| `--filter` is a literal suffix match, not an anchored regex | Read `pass_clean` in `crates/rf-scan/src/x86.rs` (`m.ends_with(s)`) vs `options.py`'s `re.match("({})$")` | Confirms `CLI-02`/`SCAN-01`; recorded as a known divergence |
+| The classifier's evaluation is circular | Read `crates/rf-classify/tests/eval.rs` | `independent_labels()` re-implements the TAXONOMY.md rules over the same iced-x86 `InstructionInfoFactory` metadata `rf-classify` consumes; the three sampled fixtures (`elf-x64-bash-v4.1.5.1`, `pe-x64-cmd-v6.1.7601`, `elf-Linux-x64`) are all x86-64. The reported precision is self-agreement; it is now retracted from README and MANUAL |
+| ROPgadget's write-what-where register class contains no ranges and not `;` | Read `ropgadget/ropchain/arch/ropmakerx64.py:29` and `ropmakerx86.py:29` | The class is `[(rax)\|(rbx)\|…\|(r15)]{3}` — the literal character set `{ ( ) \| r a x b c d s i 0 1 2 3 4 5 9 }`. `;` is absent, `8` is absent (so no `r8` form can match), and `{3}` cannot match the 2-character `r9`. `REGS64` in `crates/rf-chain/src/linux.rs` is that enumeration minus `r9` — the oracle's effective set, not a corrected one. README's description of this bug was wrong on both counts and has been rewritten |
+| ROPgadget 7.7 has 30 flags | Read `ropgadget/args.py:75-104` | 30 `add_argument` calls; all 30 appear in the MANUAL's flag-coverage table against `pub struct Cli` in `crates/rf-cli/src/lib.rs` |
+| The MCP server's post-fix shape | Read `crates/rf-mcp/src/confine.rs`, `lib.rs`, `main.rs` | `open_confined` handle API, `allow_dirs: Vec::new()` by default, `--allow-cwd` / `--i-accept-a-wide-allowlist` / `--max-depth` (64) / `--max-file-bytes` (256 MiB) / `--max-concurrent` (2) / `--verbose-path-errors`, single `path_denied` code, and a `get_server_config` tool — eight tools total, not seven. README and MANUAL now describe this shape |
+
+No new timing or parity measurement was taken in this pass: the speed and
+parity tables above are unchanged, and the retraction work only removed or
+sourced claims rather than producing new figures.

@@ -64,8 +64,12 @@ System binaries were scanned from local copies (not committed).
   tails. Push/rsp-relative fragments exist but are jmp-terminated.
 * **ntoskrnl.exe (this machine): feasible, pop-based.** `pop rcx` (3),
   `pop rdx` (4), `pop r8` (3), `pop r9` (2) -- the full Win64 arg set plus
-  `add rsp, imm` pivots (348). This is PLAN sec. 6.2's ring0 target; it is the
-  primary success-path demo for the x64 builder.
+  `add rsp, imm` pivots (348). This is PLAN sec. 6.2's ring0 target.
+  **Retracted (CHWIN-09, v0.1.1):** the gadget inventory above is accurate,
+  but this is NOT a success-path demo. The only chain the builder knows how
+  to construct calls VirtualProtect, a Win32 usermode API that does not
+  exist in kernel address space, so the chain it emits is not a ring0
+  primitive.
 * **cmd.exe x86 (6.1.7600): feasible via the stdcall layout, no arg pops
   needed.** Win32 VirtualProtect takes its four args on the stack; the
   chain is `[api][ret-to-shellcode][lpAddress][dwSize][0x40][&old]` and

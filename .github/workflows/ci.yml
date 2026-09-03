@@ -1,0 +1,193 @@
+# ENG-01 / ENG-11 — the first CI this repository has ever had.
+#
+# Before this file, `git ls-files` contained no CI descriptor of any kind, so
+# nothing enforced fmt, clippy, tests, the declared MSRV, or that the tree even
+# compiles on a platform other than the author's. The Windows-specific code
+# paths in particular (%LOCALAPPDATA% cache directory, \\?\ verbatim path
+# handling in rf-mcp, the whole windows-virtualprotect chain builder) had never
+# been executed by an automated build; windows-2022 below is therefore not
+# optional, and macos-13 (x86_64) is kept alongside macos-14 (arm64) because
+# the two differ in pointer-authentication behaviour and in which capstone
+# object files get built.
+#
+# Third-party actions: none. Only actions/checkout and actions/cache, both
+# first-party, referenced by major-version tag. Commit-SHA pinning is the
+# stronger supply-chain guarantee and is deliberately deferred rather than
+# faked here — see deny.toml for the dependency-graph half of ENG-11.
+
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          # rust-toolchain.toml pins the channel; `rustup show` materialises it.
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal --no-self-update
+          rustup component add rustfmt
+          cargo --version
+          cargo fmt --version
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  test:
+    name: build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - macos-14        # arm64
+          - macos-13        # x86_64
+          - windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal --no-self-update
+          rustup component add clippy
+          rustc --version
+          cargo --version
+          cargo clippy --version
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      # Exit criterion for this release: `--version`, `--help`, and both output
+      # modes piped into `head` must exit 0 on every platform. All four exited
+      # non-zero before v0.1.1 (1 from the clap error mapping, 101 from the
+      # unbuffered println! on EPIPE), which is why they are asserted here and
+      # not merely assumed to be covered by `cargo test`.
+      - name: Smoke-test the CLI (exit codes, both output modes, broken pipe)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --workspace
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            bin=target/debug/rop-finder.exe
+          else
+            bin=target/debug/rop-finder
+          fi
+          fixture=tests/fixtures/elf-Linux-x64
+          "$bin" --version
+          "$bin" --help > /dev/null
+          "$bin" --binary "$fixture" | head -5
+          "$bin" --binary "$fixture" --json | head -5
+
+  msrv:
+    name: MSRV check
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # ENG-07: the declared MSRV used to be a number in a manifest that
+      # nothing tested. It is read straight out of Cargo.toml here rather than
+      # duplicated into this file, so the two cannot drift apart: if someone
+      # edits `rust-version`, this job starts testing the new value on the same
+      # commit. As of 2026-09-03 it resolves to 1.88.0.
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          set -euo pipefail
+          msrv=$(sed -n 's/^rust-version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+          if [ -z "$msrv" ]; then
+            echo "::error file=Cargo.toml::no rust-version in [workspace.package]" >&2
+            exit 1
+          fi
+          # rustup toolchain names need major.minor.patch.
+          case "$msrv" in
+            *.*.*) ;;
+            *) msrv="$msrv.0" ;;
+          esac
+          echo "version=$msrv" >> "$GITHUB_OUTPUT"
+          echo "MSRV is $msrv"
+
+      - name: Install MSRV toolchain
+        run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal --no-self-update
+
+      # The `+toolchain` argument overrides rust-toolchain.toml, which pins the
+      # newer tested compiler. That override is the entire point of this job.
+      - name: cargo +MSRV check
+        run: cargo +${{ steps.msrv.outputs.version }} check --workspace --all-targets --locked
+
+  supply-chain:
+    name: cargo-deny and cargo-audit
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal --no-self-update
+          cargo --version
+
+      - name: Cache cargo-deny and cargo-audit binaries
+        id: audit-tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-audit-tools-v1
+
+      - name: Install cargo-deny and cargo-audit
+        if: steps.audit-tools.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          cargo install --locked cargo-deny
+          cargo install --locked cargo-audit
+
+      # ENG-11: 141 packages, 135 of them third party, 23 with build scripts
+      # that run arbitrary code at build time, and capstone-sys bringing 44 MB
+      # of vendored C into every non-x86 decode path. The allow-list in
+      # deny.toml is derived from the licenses actually present in the graph;
+      # see the comments in that file.
+      - name: cargo deny
+        run: cargo deny check advisories licenses bans sources
+
+      - name: cargo audit
+        run: cargo audit

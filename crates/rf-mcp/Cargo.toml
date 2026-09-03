@@ -23,5 +23,16 @@ schemars = "1"
 sha2 = "0.10"
 regex = "1"
 
+# Path confinement (MCP-01). Unix walks the allowlisted directory with
+# openat(O_NOFOLLOW) per component; Windows validates the opened HANDLE.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -1,0 +1,129 @@
+# cargo-deny configuration — ENG-11.
+#
+# Run locally exactly as CI runs it:
+#
+#     cargo install --locked cargo-deny
+#     cargo deny check advisories licenses bans sources
+#
+# Validated against cargo-deny 0.20.2.
+#
+# SCOPE. This file governs the Rust dependency graph only — 141 packages when
+# ENG-11 was filed, of which 135 are third party. It says nothing about
+# the 24 third-party binaries under tests/fixtures/: those are redistributed
+# test data, not linked code, they are carved out of this repository's blanket
+# BSD-2-Clause declaration one by one in tests/fixtures/PROVENANCE.md, and
+# cargo-deny never looks at them. A license question about a fixture is
+# answered by PROVENANCE.md, not by this file.
+
+[graph]
+# Every target we build for in .github/workflows/release.yml, plus the two
+# linux-gnu hosts CI itself runs on. Restricting the target set keeps
+# cfg-gated dependencies that we never build (wasi, r-efi, redox) out of the
+# license and advisory verdicts.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]
+all-features = true
+
+[advisories]
+# RUSTSEC database, fetched by cargo-deny itself. Nothing is ignored: an
+# advisory against any of the 135 third-party packages fails the build. When
+# an ignore does become necessary it goes here with a RUSTSEC id, a date and
+# a sentence saying why the code path is unreachable — never bare.
+ignore = []
+
+[licenses]
+# Derived, not guessed. Every distinct license expression in the resolved
+# graph, obtained with:
+#
+#   cargo tree --workspace --prefix none --format "{p} {l}" | sort -u
+#
+# was, on 2026-09-03 (count of packages carrying each expression):
+#
+#   94  MIT OR Apache-2.0                   the bulk of the graph
+#   24  MIT                                 tokio, capstone, capstone-sys,
+#                                           goblin, iced-x86, schemars, ...
+#    6  Apache-2.0 OR MIT                   same thing, other spelling
+#    6  BSD-2-Clause                        the six rf-* workspace crates
+#    3  Unlicense OR MIT                    aho-corasick, globset, memchr
+#    3  MIT/Apache-2.0                      ident_case, plain, version_check
+#                                           (legacy slash spelling, = OR)
+#    3  Apache-2.0 WITH LLVM-exception       rustix, linux-raw-sys, wasi;
+#         OR Apache-2.0 OR MIT              satisfied by the MIT branch, so
+#                                           the LLVM exception need not be
+#                                           allowed
+#    2  Apache-2.0                          rmcp, rmcp-macros
+#    1  MIT OR Apache-2.0                   r-efi; the LGPL branch is never
+#         OR LGPL-2.1-or-later              taken, and r-efi is not built for
+#                                           any target in [graph] anyway
+#    1  (MIT OR Apache-2.0) AND Unicode-3.0 unicode-ident  <- the AND is the
+#                                           only reason Unicode-3.0 has to be
+#                                           on the allow list
+#
+# So the allow list below is exactly the set of licenses required to satisfy
+# those expressions and nothing more. Adding a dependency under a license not
+# listed here is a deliberate decision that has to be made in this file.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.93
+# No per-crate exceptions today. A copyleft dependency would need one here,
+# and NOTICE would need to grow a section for it in the same commit.
+exceptions = []
+
+[bans]
+# Deny is the useful setting: it is what turns "we accidentally carry two
+# copies of a crate" into a build failure instead of a line of log nobody
+# reads. Known, deliberate duplicates are listed in `skip` with a reason.
+multiple-versions = "deny"
+# WARN, not DENY, and this is a deliberate, temporary compromise.
+#
+# The six rf-* crates depend on each other by `{ path = "../rf-core" }` with
+# no version requirement, which cargo-deny counts as a wildcard.
+# `allow-wildcard-paths` is the intended escape hatch, but cargo-deny 0.20.2
+# refuses to apply it to crates that are publishable, because crates.io
+# rejects bare path dependencies — and none of the six crates sets
+# `publish = false`. Verified: with `wildcards = "deny"` the run fails with
+# eleven `error[wildcard]` diagnostics for rf-scan/rf-classify/rf-cli/rf-mcp
+# and nothing else.
+#
+# To restore `wildcards = "deny"`, add `publish = false` to each of the six
+# crates/*/Cargo.toml (they are not published to crates.io) and leave
+# allow-wildcard-paths on; the check then passes with no exceptions. That
+# edit belongs to the workspace-manifest workstream, not to this file.
+wildcards = "warn"
+allow-wildcard-paths = true
+# Build scripts run arbitrary code at build time; 23 packages in this graph
+# have one. `highlight` makes them visible in `cargo deny check bans` output
+# rather than silently allowed.
+highlight = "all"
+
+skip = [
+    # The proc-macro ecosystem is mid-migration from syn 2 to syn 3:
+    # clap_derive/serde_derive/thiserror-impl pull one and schemars_derive
+    # pulls the other. Both are build-time only and neither ships in the
+    # released binary. Remove this entry once the graph converges on syn 3.
+    { crate = "syn@2", reason = "syn 2/3 split across proc-macro deps; build-time only" },
+]
+
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# crates.io and nothing else. There are no git dependencies in Cargo.lock and
+# there must not be: a git dependency is an unpinned, unaudited code source
+# for a tool that parses attacker-supplied binaries.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

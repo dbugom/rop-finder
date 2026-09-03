@@ -101,10 +101,8 @@ impl Console {
             universal_arch: None,
         };
         if let Some(path) = &cli.binary {
-            let bytes =
-                std::fs::read(path).map_err(|_| LOAD_FAIL_MSG.to_string())?;
-            let target = load_target(&bytes, raw)
-                .map_err(|e| format!("{LOAD_FAIL_MSG} ({e})"))?;
+            let bytes = std::fs::read(path).map_err(|_| LOAD_FAIL_MSG.to_string())?;
+            let target = load_target(&bytes, raw).map_err(|e| format!("{LOAD_FAIL_MSG} ({e})"))?;
             c.set_target(target);
         }
         Ok(c)
@@ -157,8 +155,7 @@ impl Console {
                 let view = prepared.view;
                 self.addr_size = view.addr_size();
                 self.universal_arch = view.universal.then_some(view.arch());
-                let mut gadgets =
-                    rf_scan::scan_binary(&view, &opts).map_err(|e| e.to_string())?;
+                let mut gadgets = rf_scan::scan_binary(&view, &opts).map_err(|e| e.to_string())?;
                 crate::apply_post_filters(
                     &mut gadgets,
                     &self.re,
@@ -283,13 +280,14 @@ impl Console {
 
 const LOAD_FAIL_MSG: &str = "Can't open the binary or binary not found";
 
-/// Entry point for `--console` (cli.binary optional).
-pub fn run_console(cli: &Cli) -> Result<i32, String> {
+/// Entry point for `--console` (cli.binary optional). `out` is the
+/// process-wide buffered stdout; `run_repl` flushes it before every read,
+/// so the prompt still appears before the user types (PERF-07).
+pub fn run_console(cli: &Cli, out: &mut dyn Write) -> Result<i32, String> {
     let mut console = Console::from_cli(cli)?;
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
-    let mut out = std::io::stdout();
-    Ok(run_repl(&mut console, &mut input, &mut out))
+    Ok(run_repl(&mut console, &mut input, out))
 }
 
 /// The REPL, factored for tests: prompt → read → dispatch; EOF or
@@ -408,12 +406,8 @@ fn dispatch(c: &mut Console, line: &str, out: &mut dyn Write) -> bool {
                     if with_k.iter().all(|k| text.contains(k))
                         && !without_k.iter().any(|k| text.contains(k))
                     {
-                        let _ = writeln!(
-                            out,
-                            "{} : {}",
-                            crate::fmt_addr(g.vaddr, c.addr_size),
-                            text
-                        );
+                        let _ =
+                            writeln!(out, "{} : {}", crate::fmt_addr(g.vaddr, c.addr_size), text);
                     }
                 }
             }
@@ -423,7 +417,10 @@ fn dispatch(c: &mut Console, line: &str, out: &mut dyn Write) -> bool {
         }
         "filter" => {
             if arg.is_empty() {
-                let _ = writeln!(out, "Syntax: filter <filter1|filter2|...> - Suppress specific mnemonics");
+                let _ = writeln!(
+                    out,
+                    "Syntax: filter <filter1|filter2|...> - Suppress specific mnemonics"
+                );
             } else {
                 c.filter = Some(arg.to_string());
                 let _ = writeln!(out, "[+] Filter setted. You have to reload gadgets");
@@ -431,7 +428,10 @@ fn dispatch(c: &mut Console, line: &str, out: &mut dyn Write) -> bool {
         }
         "only" => {
             if arg.is_empty() {
-                let _ = writeln!(out, "Syntax: only <only1|only2|...> - Only show specific instructions");
+                let _ = writeln!(
+                    out,
+                    "Syntax: only <only1|only2|...> - Only show specific instructions"
+                );
             } else {
                 c.only = if arg.eq_ignore_ascii_case("none") {
                     None
@@ -453,7 +453,10 @@ fn dispatch(c: &mut Console, line: &str, out: &mut dyn Write) -> bool {
                     );
                 }
                 Some((s, e)) if s > e => {
-                    let _ = writeln!(out, "[-] The start value must be greater than the end value");
+                    let _ = writeln!(
+                        out,
+                        "[-] The start value must be greater than the end value"
+                    );
                 }
                 Some(_) => {
                     c.range = Some(arg.to_string());
@@ -463,7 +466,10 @@ fn dispatch(c: &mut Console, line: &str, out: &mut dyn Write) -> bool {
         }
         "re" => {
             if arg.is_empty() {
-                let _ = writeln!(out, "Syntax: re <pattern1 | pattern2 |...> - Regular expression");
+                let _ = writeln!(
+                    out,
+                    "Syntax: re <pattern1 | pattern2 |...> - Regular expression"
+                );
             } else {
                 c.re = if arg.eq_ignore_ascii_case("none") {
                     None
@@ -508,7 +514,10 @@ fn dispatch(c: &mut Console, line: &str, out: &mut dyn Write) -> bool {
             "enable" | "disable" => {
                 c.all = arg == "enable";
                 let word = if c.all { "enabled" } else { "disabled" };
-                let _ = writeln!(out, "[+] Showing all gadgets {word}. You have to reload gadgets");
+                let _ = writeln!(
+                    out,
+                    "[+] Showing all gadgets {word}. You have to reload gadgets"
+                );
             }
             _ => {
                 let _ = writeln!(
@@ -527,7 +536,10 @@ fn dispatch(c: &mut Console, line: &str, out: &mut dyn Write) -> bool {
                 );
             }
             _ => {
-                let _ = writeln!(out, "Syntax: multibr <enable|disable> - Enable/Disable multiple branch gadgets");
+                let _ = writeln!(
+                    out,
+                    "Syntax: multibr <enable|disable> - Enable/Disable multiple branch gadgets"
+                );
             }
         },
         // Console EXTENSION (the oracle has no do_string/do_opcode/
@@ -618,24 +630,42 @@ mod tests {
                 fixture_path("elf-Linux-x86")
             ),
         );
-        assert!(out.starts_with("(ROPgadget)> All:         False\n"), "{out}");
+        assert!(
+            out.starts_with("(ROPgadget)> All:         False\n"),
+            "{out}"
+        );
         assert!(out.contains("Range:       0x0-0x0\n"), "{out}");
         assert!(out.contains("Mipsrop:     None\n"), "{out}");
         assert!(out.contains("(ROPgadget)> [+] Binary loaded\n"), "{out}");
-        assert!(out.contains("[+] Loading gadgets, please wait...\n[+] Gadgets loaded !\n"), "{out}");
+        assert!(
+            out.contains("[+] Loading gadgets, please wait...\n[+] Gadgets loaded !\n"),
+            "{out}"
+        );
         assert!(out.contains(" loaded gadgets.\n"), "{out}");
         // search prints "0x........ : text" lines containing pop, no count
         assert!(out.contains(" : pop"), "{out}");
-        assert!(out.contains("[+] Depth updated. You have to reload gadgets\n"), "{out}");
-        assert!(out.contains("[-] The start value must be greater than the end value\n"), "{out}");
+        assert!(
+            out.contains("[+] Depth updated. You have to reload gadgets\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("[-] The start value must be greater than the end value\n"),
+            "{out}"
+        );
     }
 
     #[test]
     fn repl_empty_line_repeats_and_unknown_syntax() {
         let mut c = Console::from_cli(&cli_for(None)).unwrap();
         let out = run_script(&mut c, "count\n\nboguscmd\n\nquit\n");
-        assert!(out.contains("[+] 0 loaded gadgets.\n(ROPgadget)> [+] 0 loaded gadgets.\n"), "{out}");
-        assert!(out.matches("*** Unknown syntax: boguscmd").count() == 2, "{out}");
+        assert!(
+            out.contains("[+] 0 loaded gadgets.\n(ROPgadget)> [+] 0 loaded gadgets.\n"),
+            "{out}"
+        );
+        assert!(
+            out.matches("*** Unknown syntax: boguscmd").count() == 2,
+            "{out}"
+        );
     }
 
     #[test]
@@ -650,7 +680,10 @@ mod tests {
     #[test]
     fn repl_preload_and_search_extension() {
         let mut c = Console::from_cli(&cli_for(Some(fixture_path("elf-Linux-x86")))).unwrap();
-        let out = run_script(&mut c, "load\nstring main\nopcode c3\nmemstr /bin\nsettings\nquit\n");
+        let out = run_script(
+            &mut c,
+            "load\nstring main\nopcode c3\nmemstr /bin\nsettings\nquit\n",
+        );
         assert!(out.contains("Strings information\n"), "{out}");
         assert!(out.contains("Opcodes information\n"), "{out}");
         assert!(out.contains("Memory bytes information\n"), "{out}");

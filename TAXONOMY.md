@@ -5,6 +5,22 @@ exclusion decision rules, N >= 1,000 gadgets labeled from iced-x86 operand
 metadata and spot-verified by hand, per-class precision/recall, gate =
 macro-averaged precision >= 0.90 on the held-out half.
 
+> **The gate below is not satisfied as written, and the precision number it
+> produces should not be quoted** (`CLAIM-05` in `docs/AUDIT-FINDINGS.md`).
+> The rules in this document are real and are what `rf-classify` implements;
+> what is missing is an independent measurement of whether those rules are
+> right. The "independent" labeler in `crates/rf-classify/tests/eval.rs` is a
+> second hand-written transcription of these same rules, by the same author,
+> reading the same iced-x86 `InstructionInfoFactory` metadata the classifier
+> consumes — so it can catch a transcription slip and nothing else, and its
+> output measures self-agreement rather than accuracy. All three sampled
+> fixtures are x86-64, so the x86 and the ARM/ARM64/MIPS/PowerPC/SPARC/RISC-V
+> mnemonic heuristics are unevaluated entirely. README and MANUAL no longer
+> quote a precision figure. A genuine held-out labeled set, produced by a
+> procedure that does not read these rules, replaces the harness in v0.3
+> (`CLS-01`, `CLS-11`). Treat `rf-classify` as a documented heuristic until
+> then.
+
 ## Classes
 
 | class | meaning |
@@ -105,17 +121,23 @@ R13. **Confidence.** x86/x64 classification decodes bytes with iced-x86
 1. Sample N >= 1,000 gadgets deterministically (every k-th in scan
    order) from `tests/fixtures` x86/x64 binaries, split 50/50 into
    dev (rule tuning) and held-out (reported) halves by index parity.
-2. Ground-truth labels come from an INDEPENDENT direct metadata mapping
-   (in the eval harness, not the classifier): per instruction, iced
-   register/memory effects mapped to label sets with rules R1-R8 and no
-   production normalizations beyond R1. Hand spot-verify >= 30 entries
-   (done: 35 entries, 5 per primary class, evenly spread across the
-   sample — all agreed with the assigned labels; verified 2026-06).
+2. Ground-truth labels come from a separate direct metadata mapping in the
+   eval harness: per instruction, iced register/memory effects mapped to
+   label sets with rules R1-R8 and no production normalizations beyond R1.
+   **This mapping is not independent of the classifier** — it encodes the
+   same rules from this document over the same metadata source, so
+   agreement between the two is not evidence that either is correct. The
+   protocol also calls for hand spot-verification of >= 30 entries; a
+   previous revision of this document recorded 35 as done, but no artifact
+   of that verification exists in the tree, so it cannot be relied on and
+   the claim is withdrawn. Both gaps are what v0.3 fixes.
 3. The committed file `tests/fixtures-labeled.jsonl` records
    {vaddr, text, labels, primary} for the full sample.
 4. Eval reports per-class precision and recall on the held-out half,
    plus the macro average over the 8 taxonomy classes. Gate:
-   macro-averaged precision >= 0.90.
+   macro-averaged precision >= 0.90. Because of the circularity in step 2,
+   what this actually measures is the agreement of two transcriptions of
+   the same rules; do not quote it as classifier accuracy.
 
 ## Dev-half tuning log
 

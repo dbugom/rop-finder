@@ -1,0 +1,119 @@
+NOTICE
+======
+
+This file records third-party copyright notices and attributions that this
+distribution is required to retain and reproduce. It accompanies LICENSE, which
+covers only the original Rust work in this repository.
+
+Three separate bodies of third-party material are covered here:
+
+  1. ROPgadget, the project this tool is a port of.
+  2. Compiled dependencies statically linked into the shipped binaries.
+  3. The 24 binaries under tests/fixtures/ — see tests/fixtures/PROVENANCE.md,
+     which is the authoritative, per-file record for those.
+
+
+--------------------------------------------------------------------------
+1. ROPgadget
+--------------------------------------------------------------------------
+
+rop-finder is a port of ROPgadget (https://github.com/JonathanSalwan/ROPgadget).
+It is a derivative work: the gadget anchor tables, the `passClean` filter, the
+gadget-assembly and depth-walk semantics, and the x86/x64 `ropmaker` ROP-chain
+construction logic were re-implemented in Rust from ROPgadget's Python sources,
+and are cited by name in comments throughout crates/. The 24 files under
+tests/fixtures/ are byte-identical copies of ROPgadget's test-suite-binaries/,
+used as the parity corpus. ROPgadget itself is not bundled, modified or
+redistributed by this repository.
+
+Upstream version this port tracks: ROPgadget v7.7, at commit
+b6e3fe31af46d7e045fef99a3ab19ccbcea5c2f6 of
+https://github.com/JonathanSalwan/ropgadget.git.
+
+Authors and contributors, as listed in ROPgadget's own AUTHORS file:
+
+  ROPgadget project (>= v5.0)
+    Authors:      Jonathan Salwan, Alexey Vishnyakov
+    Contributors: hugsy; Francisco Falcon; Kevin Hamacher; Florian Meier;
+                  Álvaro Felipe Melchor; Sascha Schirra; Stephen Edwards;
+                  Mikhail Davidov; penguin-wwy; Alexey Nurmukhametov;
+                  Mario Haustein; pkubaj; 0xMirasio
+
+  ROPgadget initial project (<= v4.0.3)
+    Authors:      Jonathan Salwan, Allan Wirth
+    Contributors: Hellman; Axel "0vercl0k" Souchet; k3rensk1; brianairb; cao;
+                  dark-rose; Dennis Semakin
+
+The following is ROPgadget's license, reproduced verbatim from the upstream file
+LICENSE_BSD.txt at the commit named above. Note that despite the file's name it
+states three conditions, the third being a non-endorsement clause; the upstream
+copyright line names no holder, and is reproduced here exactly as written.
+
+    This is the software license for the ROPgadget project.
+
+    Copyright (c) 2016-2023. All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are met:
+
+    * Redistributions of source code must retain the above copyright notice,
+      this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright notice,
+      this list of conditions and the following disclaimer in the documentation
+      and/or other materials provided with the distribution.
+    * Neither the name of the developers nor the names of its
+      contributors may be used to endorse or promote products derived from this
+      software without specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+    ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE
+    LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+    CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+    SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+    INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+    CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+    ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
+
+Neither the ROPgadget developers nor its contributors endorse this project.
+
+
+--------------------------------------------------------------------------
+2. Dependencies linked into the shipped binaries
+--------------------------------------------------------------------------
+
+`rop-finder` and `rop-finder-mcp` statically link their whole dependency graph.
+The complete, exact set is Cargo.lock, which is tracked in this repository for
+exactly this reason; `cargo deny check licenses` in CI is the enforcement point.
+The dependencies whose code is most visible in this tool's output are:
+
+  capstone 0.13.0 (crate: MIT) — builds and statically links the Capstone
+    disassembly engine's vendored C sources, whose own license reads
+    "Copyright (c) 2013, COSEINC. All rights reserved." (BSD 3-clause, plus
+    LICENSE_LLVM.TXT for the LLVM-derived portions). Capstone was designed and
+    implemented by Nguyen Anh Quynh. https://www.capstone-engine.org
+  iced-x86 1.21.0 (MIT) — the x86/x64 instruction formatter.
+  goblin 0.10.7 (MIT) — ELF/PE/Mach-O parsing.
+  rmcp 3.2.0 (Apache-2.0) — the Model Context Protocol server runtime.
+
+Full per-crate license texts are not vendored here; each ships in the
+corresponding crate's own source, which `cargo vendor` will lay out for you if
+you need to assemble a complete notice file for a downstream distribution.
+
+
+--------------------------------------------------------------------------
+3. Test fixtures
+--------------------------------------------------------------------------
+
+tests/fixtures/ contains 24 third-party binaries that are NOT licensed under
+this repository's LICENSE and are explicitly carved out of it. They include
+Microsoft, Apple and GPL-licensed material. Do not assume they may be
+redistributed on this repository's terms.
+
+tests/fixtures/PROVENANCE.md records, for each file, its origin, what it
+actually is, and the license that governs it. tests/fixtures/MANIFEST.sha256
+records the SHA-256 of each, and tests/fetch_fixtures.py can re-fetch them from
+ROPgadget's test-suite-binaries at the pinned commit for anyone who would rather
+not hold the copies.

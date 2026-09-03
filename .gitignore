@@ -1,3 +1,6 @@
 target/
-Cargo.lock
 tests/spike-binaries/
+
+# Cargo.lock is deliberately NOT ignored: this workspace ships binaries
+# (rop-finder, rop-finder-mcp), so the exact resolved dependency set is part
+# of the release artifact and of the parity numbers in docs/measured-2026-09.md.

@@ -26,7 +26,7 @@
           ]
         },
         "binary_path": {
-          "description": "Path to the binary; must be inside an allowed directory.",
+          "description": "Absolute path to the binary; must be inside one of the server's\nallow_roots (get_server_config lists them).",
           "type": "string"
         },
         "cfg_aware": {
@@ -89,7 +89,7 @@
     "name": "build_rop_chain"
   },
   {
-    "description": "Find ROP gadgets in a binary (ret-terminated). Returns up to max_results gadgets (default 1000) plus total_count and a truncated flag. Set sort_by=\"quality\" to rank gadgets by the Phase 5 quality score (cleanest first) before sampling. The binary path must be inside an allowed directory (server cwd by default).",
+    "description": "Find ROP gadgets in a binary (ret-terminated). Returns up to max_results gadgets (default 1000) plus total_count and a truncated flag. Set sort_by=\"quality\" to rank gadgets by the Phase 5 quality score (cleanest first) before sampling. binary_path must be an absolute path inside one of the server's allow_roots (call get_server_config to list them); anything else returns path_denied. depth above max_depth is rejected, not clamped.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -108,7 +108,7 @@
           ]
         },
         "binary_path": {
-          "description": "Path to the binary; must be inside an allowed directory.",
+          "description": "Absolute path to the binary; must be inside one of the server's\nallow_roots (get_server_config lists them).",
           "type": "string"
         },
         "depth": {
@@ -201,7 +201,7 @@
           ]
         },
         "binary_path": {
-          "description": "Path to the binary; must be inside an allowed directory.",
+          "description": "Absolute path to the binary; must be inside one of the server's\nallow_roots (get_server_config lists them).",
           "type": "string"
         },
         "depth": {
@@ -294,7 +294,7 @@
           ]
         },
         "binary_path": {
-          "description": "Path to the binary; must be inside an allowed directory.",
+          "description": "Absolute path to the binary; must be inside one of the server's\nallow_roots (get_server_config lists them).",
           "type": "string"
         },
         "depth": {
@@ -380,7 +380,7 @@
           ]
         },
         "binary_path": {
-          "description": "Path to the binary; must be inside an allowed directory.",
+          "description": "Absolute path to the binary; must be inside one of the server's\nallow_roots (get_server_config lists them).",
           "type": "string"
         }
       },
@@ -390,6 +390,14 @@
       "type": "object"
     },
     "name": "get_binary_info"
+  },
+  {
+    "description": "Report the server's effective configuration: allow_roots (the only directories binary_path may name), max_depth, max_file_bytes, max_results, max_concurrent, timeout_secs, whether an on-disk cache is enabled, and the server version. Call this first: paths outside allow_roots are refused with a single path_denied code that deliberately reveals nothing about the target.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "get_server_config"
   },
   {
     "description": "Run a ROPgadget-style scan with explicit flags. args is a list like [\"--depth\", \"6\", \"--only\", \"pop|ret\"]. Allowlist: --depth --norop --nojop --nosys --only --filter --re --range --section --base --offset --badbytes --align --multibr --json; anything else (--string, --dump, --console, ...) is rejected. Output is always structured JSON.",
@@ -404,7 +412,7 @@
           "type": "array"
         },
         "binary_path": {
-          "description": "Path to the binary; must be inside an allowed directory.",
+          "description": "Absolute path to the binary; must be inside one of the server's\nallow_roots (get_server_config lists them).",
           "type": "string"
         },
         "max_results": {
@@ -454,7 +462,7 @@
           ]
         },
         "binary_path": {
-          "description": "Path to the binary; must be inside an allowed directory.",
+          "description": "Absolute path to the binary; must be inside one of the server's\nallow_roots (get_server_config lists them).",
           "type": "string"
         },
         "depth": {
