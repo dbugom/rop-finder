@@ -331,6 +331,15 @@ pub(crate) fn classify_text(g: &Gadget, _arch: Arch) -> Classification {
         mid_branches,
         dispatcher: false,
         terminator,
+        // CLS-09: the text path has no decoder metadata, so it has no way to
+        // prove a stack-pointer effect, a value flow or a clobber. It says so
+        // rather than guessing — a `low_confidence` stack delta would be
+        // exactly the confident wrong number the field exists to avoid.
+        terminator_target: crate::TerminatorTarget::Implicit,
+        stack_delta: None,
+        transfers: Vec::new(),
+        sets: Vec::new(),
+        clobbers: Vec::new(),
         privileged,
         low_confidence: true,
     }

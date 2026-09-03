@@ -41,6 +41,9 @@ pub struct MachOBinary {
     sections: Vec<Section>,
     /// ROPgadget-compatible scan regions: sections with instruction attrs.
     exec_regions: Vec<Section>,
+    /// ECO-06 — MH_PIE, stack/heap execute flags, code signature and
+    /// hardened runtime (see `macho_info.rs`).
+    mitigations: crate::mitigations::Mitigations,
 }
 
 impl MachOBinary {
@@ -154,7 +157,17 @@ impl MachOBinary {
             image_base,
             sections,
             exec_regions,
+            mitigations: crate::macho_info::report(&crate::macho_info::facts(macho, bytes)),
         })
+    }
+
+    /// ECO-06 — the mitigation report for this slice.
+    ///
+    /// Keys, in report order: `pie`, `nx_stack`, `nx_heap`,
+    /// `code_signature`, `hardened_runtime`. A fat binary reports per slice
+    /// — the flags genuinely differ between them.
+    pub fn mitigations(&self) -> &crate::mitigations::Mitigations {
+        &self.mitigations
     }
 
     /// Mach-O `cputype`.

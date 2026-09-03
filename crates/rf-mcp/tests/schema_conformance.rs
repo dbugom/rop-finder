@@ -91,8 +91,29 @@ fn calls(binary: &Value, fixture: &str) -> Vec<(&'static str, Value)> {
             "build_rop_chain",
             merge(json!({"depth": 4, "target": "linux-execve"})),
         ),
+        // v0.4. `find_gadgets_by_effect` refuses an unconstrained call, so
+        // it is given the cheapest real constraint; the two searches and
+        // the mitigation report take a pattern that exists in some
+        // fixtures and not others, which is the point — both outcomes have
+        // to validate.
+        (
+            "find_gadgets_by_effect",
+            merge(json!({"depth": 4, "max_results": 5, "terminator": "ret"})),
+        ),
+        (
+            "find_string",
+            merge(json!({"string": "lib", "max_results": 5})),
+        ),
+        (
+            "find_bytes",
+            merge(json!({"opcode": "c3", "max_results": 5})),
+        ),
+        ("get_mitigations", merge(json!({}))),
     ]
 }
+
+/// How many tools `calls` exercises per fixture.
+const CALLS_PER_FIXTURE: usize = 12;
 
 /// Every fixture × every tool, validated against the declared schema.
 #[tokio::test]
@@ -100,7 +121,7 @@ async fn schema_conformance() {
     let mut mcp = McpChild::spawn().await;
     let list = mcp.rpc(1, "tools/list", json!({})).await;
     let tools = list["result"]["tools"].as_array().expect("tools");
-    assert_eq!(tools.len(), 10, "unexpected tool count");
+    assert_eq!(tools.len(), 14, "unexpected tool count");
 
     // The schemas as the SERVER declares them, not as this test imagines.
     let mut schemas = std::collections::HashMap::new();
@@ -167,13 +188,12 @@ async fn schema_conformance() {
         }
     }
     println!(
-        "schema_conformance: {} fixtures x {} tools = {} responses ({ok_bodies} ok, \
-         {err_bodies} error), all valid against the declared schemas",
+        "schema_conformance: {} fixtures x {CALLS_PER_FIXTURE} tools = {} responses \
+         ({ok_bodies} ok, {err_bodies} error), all valid against the declared schemas",
         fixtures.len(),
-        8,
         ok_bodies + err_bodies
     );
-    assert_eq!(ok_bodies + err_bodies, fixtures.len() * 8);
+    assert_eq!(ok_bodies + err_bodies, fixtures.len() * CALLS_PER_FIXTURE);
 
     // The two parameterless tools.
     for (tool, args) in [
@@ -244,7 +264,9 @@ async fn the_four_shapes_that_differed_are_now_one() {
     let (_, first) = &shapes[0];
     let want_top = keys(first);
     let want_rec = keys(&first["gadgets"][0]);
-    assert_eq!(want_rec.len(), 22, "{want_rec:?}");
+    // 22 in v0.3; v0.4 adds `explanation` (ECO-01).
+    assert_eq!(want_rec.len(), 23, "{want_rec:?}");
+    assert!(want_rec.contains("explanation"), "{want_rec:?}");
     for (label, body) in &shapes {
         assert_eq!(
             keys(body),

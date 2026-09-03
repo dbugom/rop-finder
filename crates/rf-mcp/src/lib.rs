@@ -65,9 +65,12 @@ pub mod confine;
 
 pub mod audit;
 pub mod cache;
+pub mod checksec;
 pub mod cursor;
+pub mod find;
 pub mod guard;
 pub mod logging;
+pub mod pattern;
 pub mod resources;
 pub mod scan;
 pub mod schema;
@@ -134,6 +137,23 @@ pub const PROBE_DELAY: Duration = Duration::from_millis(250);
 /// a hostile PE with a million import entries cannot produce a gigabyte of
 /// JSON (MCP-06).
 pub const DEFAULT_MAX_INFO_ITEMS: usize = 4096;
+
+/// Default cap on `get_binary_info`'s `symbols` array: symbols are OPT-IN.
+///
+/// `sections` and `imports` are bounded by the file's own structure — 30 and
+/// 46 on `elf-Linux-x64` — so `DEFAULT_MAX_INFO_ITEMS` never bites there. A
+/// symbol table is not: that same fixture has 2169, and reporting them by
+/// default took `get_binary_info`'s rendered response from 10,410 characters
+/// to 331,338 (2,602 -> 82,834 estimated tokens), which blew the 10,000-token
+/// whole-task budget `tests/mcp_workability.py` gates on by 8x on the FIRST
+/// call of the loop. The symbol table is a query target, not an overview, so
+/// an agent asks for it by name; `symbol_count` still reports the true total
+/// and a `symbols_truncated` warning names the parameter, so a default-shaped
+/// response can never be mistaken for "this ELF has no symbols".
+///
+/// `imports` — the SHN_UNDEF subset a ret2plt chain resolves against, with
+/// its GOT/PLT addresses — is unaffected and still reported by default.
+pub const DEFAULT_MAX_SYMBOLS: usize = 0;
 
 /// PLAN §6.1 flag allowlist for `run_ropgadget_command`.
 const ALLOWED_FLAGS: &[&str] = &[
@@ -412,13 +432,41 @@ pub struct GadgetQuery {
     /// from the chain payload. With no `writes_reg`, requires at least one
     /// stack-loaded register.
     pub from_stack: Option<bool>,
-    /// Keep only gadgets with this terminator kind: "ret" (every returning
-    /// form), "jmp", "call", "syscall", "none", or "any".
+    /// Keep only gadgets with this terminator. Comma-separated any-of,
+    /// case-insensitive: the coarse kind "ret"
+    /// (every returning form), "jmp", "call", "syscall", "none", "any"
+    /// (no constraint), or a CLS-09 class -- "bare-ret" (the plain near
+    /// return, which coarse "ret" is a superset of), "ret-imm",
+    /// "jmp-reg", "jmp-mem", "call-reg", "call-mem", "far", "other".
     pub terminator: Option<String>,
     /// Keep only gadgets with at most this many side effects.
     pub max_side_effects: Option<u32>,
     /// Keep only gadgets with at most this many instructions.
     pub max_insns: Option<u32>,
+    /// ECO-01: keep only gadgets that SET all of these registers — write
+    /// them with a value the chain PAYLOAD decides. Strictly stronger than
+    /// `writes_reg`: `xor rdi, rdi ; ret` writes rdi and sets nothing.
+    pub set_reg: Option<String>,
+    /// ECO-01: none of these registers may be CLOBBERED — written with a
+    /// value the payload does not decide. Matched against the classifier's
+    /// `clobbers`, NOT `regs_written`: `pop rdi ; ret` survives
+    /// `no_clobber: ["rdi"]` and `mov rdi, rax ; ret` does not. Elements
+    /// may also be comma-separated.
+    pub no_clobber: Option<Vec<String>>,
+    /// ECO-01: keep only gadgets whose net stack movement is KNOWN and at
+    /// most this many bytes (the terminator's own pop included, so
+    /// `pop rdi ; ret` is 16 on x86-64). A gadget whose delta is unknown is
+    /// REJECTED, never assumed to be 0.
+    pub max_stack_delta: Option<i64>,
+    /// ECO-12: the stack-pivot preset — keep only gadgets carrying the
+    /// `stack-pivot` label.
+    pub pivot: Option<bool>,
+    /// ECO-01: ropper-style wildcard matcher over the instruction
+    /// SEQUENCE, e.g. "pop rdi; ret". `?` is one character, `%` is any run
+    /// inside one instruction (so a bare `%` is any single instruction).
+    /// The instructions must appear as a contiguous run, so
+    /// "pop rdi; ret" also matches "xor eax, eax ; pop rdi ; ret".
+    pub search: Option<String>,
     /// Architecture slice for a fat (Universal) Mach-O, e.g. "x86_64",
     /// "arm64", "i386". REQUIRED for a multi-slice container: without it
     /// the scan is refused rather than concatenating slices whose virtual
@@ -487,14 +535,138 @@ pub struct SearchQuery {
     pub preserves_regs: Option<String>,
     /// Require the `writes_reg` registers to come off the stack.
     pub from_stack: Option<bool>,
-    /// Terminator kind: "ret", "jmp", "call", "syscall", "none", "any".
+    /// Terminator kind: "ret", "jmp", "call", "syscall", "none", "any",
+    /// or a CLS-09 class ("bare-ret", "ret-imm", "jmp-reg", "jmp-mem",
+    /// "call-reg", "call-mem", "far", "other").
     pub terminator: Option<String>,
     pub max_side_effects: Option<u32>,
     pub max_insns: Option<u32>,
+    /// ECO-01: keep only gadgets that SET all of these registers — write
+    /// them with a value the chain PAYLOAD decides. Strictly stronger than
+    /// `writes_reg`: `xor rdi, rdi ; ret` writes rdi and sets nothing.
+    pub set_reg: Option<String>,
+    /// ECO-01: none of these registers may be CLOBBERED — written with a
+    /// value the payload does not decide. Matched against the classifier's
+    /// `clobbers`, NOT `regs_written`: `pop rdi ; ret` survives
+    /// `no_clobber: ["rdi"]` and `mov rdi, rax ; ret` does not. Elements
+    /// may also be comma-separated.
+    pub no_clobber: Option<Vec<String>>,
+    /// ECO-01: keep only gadgets whose net stack movement is KNOWN and at
+    /// most this many bytes (the terminator's own pop included, so
+    /// `pop rdi ; ret` is 16 on x86-64). A gadget whose delta is unknown is
+    /// REJECTED, never assumed to be 0.
+    pub max_stack_delta: Option<i64>,
+    /// ECO-12: the stack-pivot preset — keep only gadgets carrying the
+    /// `stack-pivot` label.
+    pub pivot: Option<bool>,
+    /// ECO-01: ropper-style wildcard matcher over the instruction
+    /// SEQUENCE, e.g. "pop rdi; ret". `?` is one character, `%` is any run
+    /// inside one instruction (so a bare `%` is any single instruction).
+    /// The instructions must appear as a contiguous run, so
+    /// "pop rdi; ret" also matches "xor eax, eax ; pop rdi ; ret".
+    pub search: Option<String>,
     /// Architecture slice for a fat (Universal) Mach-O, e.g. "x86_64",
     /// "arm64", "i386". REQUIRED for a multi-slice container: without it
     /// the scan is refused rather than concatenating slices whose virtual
     /// address ranges overlap (CORE-03).
+    pub arch: Option<String>,
+    /// Per-request timeout in seconds (default 60, max 300).
+    pub timeout_secs: Option<u64>,
+}
+
+/// ECO-01 — the constraint search, as one call.
+///
+/// This is MCP-DESIGN's usefulness bar item 15: "set rdi from the stack,
+/// preserve rsi and rdx, at most one side effect, clean ret" expressed
+/// once and answered with a small correct set, instead of a thousand
+/// alphabetically-ordered records beginning with `adc al, 0x89 ; retf
+/// 0xc281`.
+///
+/// Every filter here is also available on `find_gadgets`; this tool exists
+/// because a *named* tool whose whole parameter list is the question is
+/// what an agent finds, and because it scans ROP+JOP+SYS together so
+/// `terminator` decides the family instead of the tool name doing it.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct EffectQuery {
+    /// Absolute path to the binary; must be inside one of the server's
+    /// allow_roots (get_server_config lists them).
+    pub binary_path: String,
+    /// Search depth (default 10).
+    pub depth: Option<usize>,
+
+    // ---- the constraint vocabulary (shared with the CLI's long flags) ----
+    /// The gadget must SET this register — write it with a value the chain
+    /// PAYLOAD decides. Several may be given, comma-separated, and all are
+    /// required. Strictly stronger than `writes_reg`: `xor rdi, rdi ; ret`
+    /// writes rdi and sets nothing.
+    pub set_reg: Option<String>,
+    /// The `set_reg` write must ORIGINATE on the stack — a pop, or a load
+    /// through the stack pointer — rather than in an arbitrary
+    /// computation. With no `set_reg` it falls back to `writes_reg`, and
+    /// with neither it means "at least one register comes off the stack".
+    pub from_stack: Option<bool>,
+    /// None of these registers may be CLOBBERED. Matched against the
+    /// classifier's `clobbers`, NOT `regs_written`, which is the
+    /// difference between "this gadget destroys rdi" and "this gadget
+    /// loads rdi from your payload". Elements may be comma-separated.
+    pub no_clobber: Option<Vec<String>>,
+    /// The gadget must read ALL of these registers.
+    pub reads_reg: Option<String>,
+    /// Net stack movement must be KNOWN and at most this many bytes, the
+    /// terminator's own pop included (`pop rdi ; ret` is 16 on x86-64). An
+    /// unknown delta is REJECTED, never read as 0 — `xchg rsp, rax ; ret`
+    /// must not slip into a layout budget.
+    pub max_stack_delta: Option<i64>,
+    /// At most this many side effects (instructions that earn a label).
+    pub max_side_effects: Option<u32>,
+    /// At most this many instructions.
+    pub max_insns: Option<u32>,
+    /// Terminator: the coarse kind "ret" (every returning form), "jmp",
+    /// "call", "syscall", "none", "any"; or the CLS-09 class "ret-imm",
+    /// "jmp-reg", "jmp-mem", "call-reg", "call-mem", "far", "other".
+    pub terminator: Option<String>,
+    /// Ropper-style wildcard matcher over the instruction SEQUENCE, e.g.
+    /// "pop rdi; ret". `?` is one character, `%` is any run inside one
+    /// instruction (a bare `%` is any single instruction). The pattern must
+    /// appear as a CONTIGUOUS run, so it also matches
+    /// "xor eax, eax ; pop rdi ; ret".
+    pub search: Option<String>,
+    /// ECO-12: the stack-pivot preset — only gadgets carrying the
+    /// `stack-pivot` label. Combine with `max_stack_delta` to rank pivots
+    /// by reach.
+    pub pivot: Option<bool>,
+    /// Primary class: reg-write, stack-pivot, mem-read, mem-write,
+    /// arithmetic, syscall, dispatcher, other (comma-separated).
+    pub class: Option<String>,
+    /// At least one of these labels (same vocabulary as `class`).
+    pub label: Option<String>,
+    /// The gadget must WRITE all of these registers — the v0.3 spelling,
+    /// satisfied by any write. `set_reg` is the one you usually want.
+    pub writes_reg: Option<String>,
+    /// The gadget must write NONE of these registers, matched against
+    /// `regs_written`. Coarser than `no_clobber` and kept because every
+    /// other gadget tool has it.
+    pub preserves_regs: Option<String>,
+
+    // ---- scan shaping, identical to find_gadgets ----
+    /// Executable section name(s); comma-separated, `*` globbing.
+    pub section: Option<String>,
+    /// Rebase the image base at load time (hex string).
+    pub base: Option<String>,
+    /// Offset added to gadget addresses after any rebase (hex string).
+    pub offset: Option<String>,
+    /// Address range to scan, "0xSTART-0xEND".
+    pub range: Option<String>,
+    /// Reject gadgets whose final address contains these bytes.
+    pub badbytes: Option<String>,
+    /// Maximum gadgets returned per page (default 1000, hard max 50000).
+    pub max_results: Option<usize>,
+    /// Result ordering; see find_gadgets. Default "rank".
+    pub order: Option<String>,
+    /// `next_cursor` from a previous page of THIS query.
+    pub cursor: Option<String>,
+    /// Architecture slice for a fat (Universal) Mach-O. REQUIRED for a
+    /// multi-slice container.
     pub arch: Option<String>,
     /// Per-request timeout in seconds (default 60, max 300).
     pub timeout_secs: Option<u64>,
@@ -528,10 +700,35 @@ pub struct RawCommandQuery {
     pub preserves_regs: Option<String>,
     /// Require the `writes_reg` registers to come off the stack.
     pub from_stack: Option<bool>,
-    /// Terminator kind: "ret", "jmp", "call", "syscall", "none", "any".
+    /// Terminator kind: "ret", "jmp", "call", "syscall", "none", "any",
+    /// or a CLS-09 class ("bare-ret", "ret-imm", "jmp-reg", ...).
     pub terminator: Option<String>,
     pub max_side_effects: Option<u32>,
     pub max_insns: Option<u32>,
+    /// ECO-01: keep only gadgets that SET all of these registers — write
+    /// them with a value the chain PAYLOAD decides. Strictly stronger than
+    /// `writes_reg`: `xor rdi, rdi ; ret` writes rdi and sets nothing.
+    pub set_reg: Option<String>,
+    /// ECO-01: none of these registers may be CLOBBERED — written with a
+    /// value the payload does not decide. Matched against the classifier's
+    /// `clobbers`, NOT `regs_written`: `pop rdi ; ret` survives
+    /// `no_clobber: ["rdi"]` and `mov rdi, rax ; ret` does not. Elements
+    /// may also be comma-separated.
+    pub no_clobber: Option<Vec<String>>,
+    /// ECO-01: keep only gadgets whose net stack movement is KNOWN and at
+    /// most this many bytes (the terminator's own pop included, so
+    /// `pop rdi ; ret` is 16 on x86-64). A gadget whose delta is unknown is
+    /// REJECTED, never assumed to be 0.
+    pub max_stack_delta: Option<i64>,
+    /// ECO-12: the stack-pivot preset — keep only gadgets carrying the
+    /// `stack-pivot` label.
+    pub pivot: Option<bool>,
+    /// ECO-01: ropper-style wildcard matcher over the instruction
+    /// SEQUENCE, e.g. "pop rdi; ret". `?` is one character, `%` is any run
+    /// inside one instruction (so a bare `%` is any single instruction).
+    /// The instructions must appear as a contiguous run, so
+    /// "pop rdi; ret" also matches "xor eax, eax ; pop rdi ; ret".
+    pub search: Option<String>,
     /// Per-request timeout in seconds (default 60, max 300).
     pub timeout_secs: Option<u64>,
 }
@@ -567,6 +764,77 @@ pub struct IdsQuery {
     pub timeout_secs: Option<u64>,
 }
 
+/// CLI-05 / ECO-02 — `find_string`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct StringQuery {
+    /// Absolute path to the binary; must be inside one of the server's
+    /// allow_roots (get_server_config lists them).
+    pub binary_path: String,
+    /// The pattern, as a BYTE regex (ROPgadget's `--string` semantics), so
+    /// "/bin/sh" is a literal and "m..n" is four bytes. Matched only
+    /// against MAPPED sections.
+    pub string: String,
+    /// ROPgadget's `--memstr` instead of `--string`: locate each CHARACTER
+    /// of `string` separately and report only the FIRST place each one
+    /// occurs, searching executable sections before data ones. This is how
+    /// you assemble a string you cannot find contiguously. Default false.
+    pub memstr: Option<bool>,
+    /// Rebase the image base before reporting addresses (hex string, e.g.
+    /// "0x400000"; "0" for RVAs).
+    pub base: Option<String>,
+    /// Offset added to reported addresses after any rebase (hex string).
+    pub offset: Option<String>,
+    /// Restrict the search to this address range, "0xSTART-0xEND". It can
+    /// only ever NARROW the mapped windows, never widen them.
+    pub range: Option<String>,
+    /// Maximum hits returned per page (default 1000, hard max 50000).
+    pub max_results: Option<usize>,
+    /// `next_cursor` from a previous page of THIS query.
+    pub cursor: Option<String>,
+    /// Architecture slice for a fat (Universal) Mach-O. REQUIRED for a
+    /// multi-slice container, whose slices' addresses overlap.
+    pub arch: Option<String>,
+    /// Per-request timeout in seconds (default 60, max 300).
+    pub timeout_secs: Option<u64>,
+}
+
+/// CLI-05 / ECO-02 — `find_bytes`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct BytesQuery {
+    /// Absolute path to the binary; must be inside one of the server's
+    /// allow_roots (get_server_config lists them).
+    pub binary_path: String,
+    /// The byte sequence as hex, e.g. "c9c3" or "c9 c3". `??` matches any
+    /// one byte, so "ff??e0" finds `jmp rax` through `jmp r15`. A nibble
+    /// wildcard is refused rather than silently widened.
+    pub opcode: String,
+    /// Rebase the image base before reporting addresses (hex string).
+    pub base: Option<String>,
+    /// Offset added to reported addresses after any rebase (hex string).
+    pub offset: Option<String>,
+    /// Restrict the search to this address range, "0xSTART-0xEND".
+    pub range: Option<String>,
+    /// Maximum hits returned per page (default 1000, hard max 50000).
+    pub max_results: Option<usize>,
+    /// `next_cursor` from a previous page of THIS query.
+    pub cursor: Option<String>,
+    /// Architecture slice for a fat (Universal) Mach-O. REQUIRED for a
+    /// multi-slice container.
+    pub arch: Option<String>,
+    /// Per-request timeout in seconds (default 60, max 300).
+    pub timeout_secs: Option<u64>,
+}
+
+/// ECO-06 — `get_mitigations`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct MitigationsQuery {
+    /// Absolute path to the binary; must be inside one of the server's
+    /// allow_roots (get_server_config lists them).
+    pub binary_path: String,
+    /// Per-request timeout in seconds (default 60, max 300).
+    pub timeout_secs: Option<u64>,
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct InfoQuery {
     /// Absolute path to the binary; must be inside one of the server's
@@ -580,6 +848,15 @@ pub struct InfoQuery {
     /// Maximum imports reported (default 4096). A larger array is
     /// truncated and `warnings` carries `imports_truncated`.
     pub max_imports: Option<usize>,
+    /// Maximum ELF symbols reported. Symbols are OPT-IN: the default is 0
+    /// because a symbol table is unbounded by the file's structure (2169 on
+    /// elf-Linux-x64) where `sections` and `imports` are not, and returning
+    /// it by default cost 80k tokens on the first call of a task. Pass a
+    /// number to get them, up to max_info_items (4096). `symbol_count`
+    /// always reports the true total and `warnings` carries
+    /// `symbols_truncated`, so a short list is never indistinguishable from
+    /// a binary with few symbols. `imports` is NOT affected by this.
+    pub max_symbols: Option<usize>,
     /// Per-request timeout in seconds (default 60, max 300).
     pub timeout_secs: Option<u64>,
 }
@@ -748,11 +1025,15 @@ pub fn parse_ropgadget_args(args: &[String]) -> Result<ParsedArgs, ToolError> {
     Ok(ParsedArgs { request: req, re })
 }
 
-/// Collect the nine CLS-08 filter parameters out of a query.
+/// Collect the semantic filter parameters out of a query.
 ///
-/// `GadgetQuery`, `SearchQuery` and `RawCommandQuery` carry the same nine
-/// fields under the same names; a macro is how one spelling covers all
-/// three without a trait whose only job is to re-export nine getters.
+/// `GadgetQuery`, `SearchQuery`, `RawCommandQuery` and `EffectQuery` carry
+/// the same fields under the same names — the nine CLS-08 ones plus v0.4's
+/// `set_reg` / `no_clobber` / `max_stack_delta` / `pivot` / `search`
+/// (ECO-01, ECO-12) — so one spelling covers all four without a trait whose
+/// only job is to re-export fourteen getters. Keeping them uniform is what
+/// makes `find_gadgets_by_effect` a preset over the same predicate rather
+/// than a second, divergent filter.
 macro_rules! raw_filter {
     ($q:expr) => {
         semantics::RawFilter {
@@ -765,6 +1046,11 @@ macro_rules! raw_filter {
             terminator: $q.terminator.as_deref(),
             max_side_effects: $q.max_side_effects,
             max_insns: $q.max_insns,
+            set_reg: $q.set_reg.as_deref(),
+            no_clobber: $q.no_clobber.as_deref().unwrap_or(&[]),
+            max_stack_delta: $q.max_stack_delta,
+            pivot: $q.pivot,
+            search: $q.search.as_deref(),
         }
     };
 }
@@ -813,6 +1099,40 @@ fn query_to_request(q: &GadgetQuery, rop: bool, jop: bool, sys: bool) -> rf_cli:
 // ---------------------------------------------------------------------------
 // The server
 // ---------------------------------------------------------------------------
+
+/// Everything [`RopFinderMcp::run_find`] needs, so the two search tools
+/// differ by a `mode` and a pattern rather than by twelve arguments.
+struct FindRequest {
+    binary_path: String,
+    mode: find::Mode,
+    /// The pattern as the caller wrote it, echoed back in `query`.
+    query: String,
+    base: Option<String>,
+    offset: Option<String>,
+    range: Option<String>,
+    arch: Option<String>,
+    max_results: Option<usize>,
+    cursor: Option<String>,
+    params_hash: String,
+    timeout_secs: Option<u64>,
+}
+
+/// Address padding width for a search hit, in bytes.
+///
+/// ROPgadget's search modes pad to 8 hex digits on `CS_MODE_32` and 16
+/// otherwise (core.py:113), which is the pointer size everywhere except a
+/// RAW arm/thumb blob, whose capstone mode is `CS_MODE_ARM`/`CS_MODE_THUMB`
+/// rather than `CS_MODE_32` — so those print 16 digits despite 4-byte
+/// pointers (raw.py:54-67). Reproduced so a hit's address column matches
+/// the CLI's and the oracle's.
+fn search_addr_size(target: &rf_cli::Target, arch: rf_core::Arch) -> usize {
+    if matches!(target, rf_cli::Target::Raw(_))
+        && matches!(arch, rf_core::Arch::Arm | rf_core::Arch::ArmThumb)
+    {
+        return 8;
+    }
+    arch.addr_size()
+}
 
 /// Post-scan options applied over the cached gadget set.
 struct PostOpts {
@@ -1471,6 +1791,292 @@ impl RopFinderMcp {
         }
     }
 
+    /// CLI-05 / ECO-02 — the body of `find_string` and `find_bytes`.
+    ///
+    /// Everything a gadget scan gets, a search gets: the same confined
+    /// handle, the same guard (so it is cancellable, timed out and
+    /// semaphore-bounded), the same cursor contract and the same NDJSON
+    /// resource (ECO-09). What it does NOT get is the file: every byte it
+    /// examines comes out of a [`rf_core::Section`] the loader
+    /// materialised, which is the property that makes exposing this
+    /// through the MCP safe at all (see [`crate::find`]).
+    async fn run_find(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        rec: &mut AuditRecord,
+        opts: FindRequest,
+    ) -> Result<find::SearchHitsResponse, ToolError> {
+        let FindRequest {
+            binary_path,
+            mode,
+            query,
+            base,
+            offset,
+            range,
+            arch,
+            max_results,
+            cursor: cursor_in,
+            params_hash,
+            timeout_secs,
+        } = opts;
+
+        // A bad pattern is the caller's mistake, so it is diagnosed BEFORE
+        // a file is opened, a permit is taken or a byte is read.
+        let byte_pattern = match mode {
+            find::Mode::Opcode => Some(find::BytePattern::parse(&query)?),
+            _ => None,
+        };
+
+        rec.binary = Some(binary_path.clone());
+        let confined = self.open_confined(&binary_path)?;
+        rec.binary = Some(confined.label.clone());
+        let binary_label = confined.label.clone();
+        let base_value = base
+            .as_deref()
+            .map(|b| rf_cli::parse_hex(b, "base"))
+            .transpose()
+            .map_err(|e| ToolError::new(ErrorCode::UsageError, e))?;
+        let offset_value = offset
+            .as_deref()
+            .map(|o| rf_cli::parse_hex(o, "offset"))
+            .transpose()
+            .map_err(|e| ToolError::new(ErrorCode::UsageError, e))?
+            .unwrap_or(0);
+        let range_value = range
+            .as_deref()
+            .map(rf_cli::parse_range)
+            .transpose()
+            .map_err(|e| ToolError::new(ErrorCode::UsageError, e))?
+            .flatten();
+        let page = clamp_max_results(max_results, self.config.max_results);
+        let timeout = clamp_timeout(timeout_secs, self.config.timeout);
+        let max_file_bytes = self.config.max_file_bytes;
+        let workspace = self.config.workspace_dir.clone();
+        let cache = self.cache.clone();
+
+        let work = move |_cancel: rf_scan::CancelToken| -> Result<
+            (find::SearchHitsResponse, ScanFacts),
+            ToolError,
+        > {
+            let bytes = confined.read_all(max_file_bytes)?;
+            let file_hash = sha256_hex(&bytes);
+            let target = rf_cli::load_target(&bytes, None).map_err(scan_err_to_tool)?;
+            // CORE-03: a fat container is refused rather than searched as a
+            // concatenation, exactly as a scan of one is.
+            let selected = rf_cli::resolve_arch(&target, arch.as_deref(), false)
+                .map_err(scan_err_to_tool)?;
+            let slice = match (&target, selected) {
+                (rf_cli::Target::Universal(u), Some(a)) => {
+                    Some(u.select(a).map_err(|e| {
+                        ToolError::new(ErrorCode::UsageError, e.to_string())
+                    })?)
+                }
+                _ => None,
+            };
+            let view = rf_cli::build_view_selected(&target, selected);
+            let image_base = view.base;
+            let delta = base_value.map_or(0, |b| b.wrapping_sub(image_base));
+            let opts = find::SearchOpts {
+                delta,
+                offset: offset_value,
+                range: range_value,
+                addr_size: search_addr_size(&target, rf_core::Image::arch(&view)),
+                // Collect up to the hard cap so `total_count` and the
+                // cursor walk agree; the PAGE is `max_results`.
+                max_hits: HARD_MAX_RESULTS,
+            };
+            let windows = match mode {
+                find::Mode::String => find::data_windows(&target, slice, delta),
+                find::Mode::Opcode => find::exec_windows(&target, slice, delta),
+                // core.py:202-227 — exec sections first, then data.
+                find::Mode::MemStr => {
+                    let mut w = find::exec_windows(&target, slice, delta);
+                    w.extend(find::data_windows(&target, slice, delta));
+                    w
+                }
+            };
+            let sections_searched = find::window_names(&windows);
+            let mut warnings: Vec<Warning> = Vec::new();
+            if windows.is_empty() {
+                warnings.push(Warning::new(
+                    "no_mapped_sections",
+                    "this container exposes no mapped section of the kind this search reads, \
+                     so the answer is empty by construction rather than by absence",
+                ));
+            }
+
+            let (all_hits, total) = match (mode, &byte_pattern) {
+                (find::Mode::String, _) => find::find_string(&windows, &query, &opts)?,
+                (find::Mode::MemStr, _) => find::find_memstr(&windows, &query, &opts),
+                (find::Mode::Opcode, Some(p)) => find::find_opcode(&windows, p, &opts),
+                // `byte_pattern` is built above for exactly this mode.
+                (find::Mode::Opcode, None) => {
+                    return Err(ToolError::new(
+                        ErrorCode::Internal,
+                        "the opcode pattern was not compiled",
+                    ))
+                }
+            };
+            if total > all_hits.len() as u64 {
+                warnings.push(Warning::truncation(
+                    "hits_capped",
+                    "hits",
+                    all_hits.len(),
+                    usize::try_from(total).unwrap_or(usize::MAX),
+                ));
+            }
+
+            // The cursor key names this exact result set: the file, the
+            // mode and every parameter that decides which bytes were read.
+            let key = format!(
+                "s{}",
+                rf_cache::sha256_hex(
+                    format!(
+                        "{file_hash}|{}|{query}|base={base_value:?}|offset={offset_value}|\
+                         range={range_value:?}|arch={}",
+                        mode.as_str(),
+                        arch.as_deref().unwrap_or("")
+                    )
+                    .as_bytes()
+                )
+            );
+            let walkable = all_hits.len() as u64;
+            let start = match &cursor_in {
+                Some(raw) => Cursor::decode(raw, &key, "address", &params_hash)?.offset,
+                None => 0,
+            };
+            let hits: Vec<find::Hit> = all_hits
+                .iter()
+                .skip(usize::try_from(start).unwrap_or(usize::MAX))
+                .take(page)
+                .cloned()
+                .collect();
+            let returned = hits.len() as u64;
+            let truncated = start.saturating_add(returned) < total;
+            if truncated {
+                warnings.push(Warning::truncation(
+                    "truncated",
+                    "hits",
+                    usize::try_from(returned).unwrap_or(usize::MAX),
+                    usize::try_from(total).unwrap_or(usize::MAX),
+                ));
+            }
+
+            // ECO-09: a paged answer also names the WHOLE set as NDJSON,
+            // pinned in the same bounded store a paged scan uses.
+            let paged = walkable > returned;
+            let (resource_uri, workspace_file) = if paged {
+                let ndjson = find::render_ndjson(&all_hits);
+                cache.pin_text(&key, &ndjson);
+                let file = workspace
+                    .as_deref()
+                    .and_then(|dir| resources::ensure_file(dir, &key, || ndjson.clone()))
+                    .map(|p| p.display().to_string());
+                (Some(resources::search_uri(&key)), file)
+            } else {
+                (None, None)
+            };
+
+            let facts = ScanFacts {
+                sha256: file_hash.clone(),
+                bytes_read: bytes.len() as u64,
+                cache: "none",
+                total_count: total,
+                returned,
+            };
+            Ok((
+                find::SearchHitsResponse {
+                    hits,
+                    mode: mode.as_str().to_string(),
+                    query: query.clone(),
+                    total_count: total,
+                    returned,
+                    offset: start,
+                    truncated,
+                    next_cursor: Cursor::next(
+                        &key,
+                        "address",
+                        &params_hash,
+                        start,
+                        returned,
+                        walkable,
+                    ),
+                    sections_searched,
+                    binary_sha256: file_hash,
+                    binary_label,
+                    warnings,
+                    resource_uri,
+                    workspace_file,
+                },
+                facts,
+            ))
+        };
+
+        match self
+            .guard
+            .run(Some(Self::cancel_signal(ctx)), timeout, work)
+            .await
+        {
+            Ok((v, facts)) => {
+                facts.apply(rec);
+                self.stats.add_bytes_read(facts.bytes_read);
+                Ok(v)
+            }
+            Err(e) => {
+                rec.bytes_read = 0;
+                Err(e)
+            }
+        }
+    }
+
+    /// ECO-06 — the body of `get_mitigations`.
+    async fn run_mitigations(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        rec: &mut AuditRecord,
+        q: &MitigationsQuery,
+    ) -> Result<checksec::MitigationsResponse, ToolError> {
+        rec.binary = Some(q.binary_path.clone());
+        let confined = self.open_confined(&q.binary_path)?;
+        rec.binary = Some(confined.label.clone());
+        let label = confined.label.clone();
+        let timeout = clamp_timeout(q.timeout_secs, self.config.timeout);
+        let max_file_bytes = self.config.max_file_bytes;
+
+        let work = move |_cancel: rf_scan::CancelToken| -> Result<
+            (checksec::MitigationsResponse, ScanFacts),
+            ToolError,
+        > {
+            let bytes = confined.read_all(max_file_bytes)?;
+            let file_hash = sha256_hex(&bytes);
+            let target = rf_cli::load_target(&bytes, None).map_err(scan_err_to_tool)?;
+            let out = checksec::report(&target, file_hash.clone(), label);
+            let facts = ScanFacts {
+                sha256: file_hash,
+                bytes_read: bytes.len() as u64,
+                cache: "none",
+                total_count: 0,
+                returned: 0,
+            };
+            Ok((out, facts))
+        };
+
+        match self
+            .guard
+            .run(Some(Self::cancel_signal(ctx)), timeout, work)
+            .await
+        {
+            Ok((v, facts)) => {
+                rec.binary_sha256 = Some(facts.sha256.clone());
+                rec.bytes_read = facts.bytes_read;
+                rec.cache = Some("none");
+                self.stats.add_bytes_read(facts.bytes_read);
+                Ok(v)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// `get_binary_info` (MCP-06): the one tool that used to have neither a
     /// timeout nor a cap, and that did its whole-file read plus goblin
     /// parse INLINE on the async runtime, occupying a tokio worker.
@@ -1494,13 +2100,14 @@ impl RopFinderMcp {
         let cap = self.config.max_info_items;
         let max_sections = q.max_sections.unwrap_or(cap).clamp(1, cap);
         let max_imports = q.max_imports.unwrap_or(cap).clamp(1, cap);
+        let max_symbols = q.max_symbols.unwrap_or(DEFAULT_MAX_SYMBOLS).min(cap);
 
         let work =
             move |_cancel: rf_scan::CancelToken| -> Result<(InfoResponse, ScanFacts), ToolError> {
                 let bytes = confined.read_all(max_file_bytes)?;
                 let file_hash = sha256_hex(&bytes);
                 let mut v = rf_cli::info_bytes(&bytes, None, base).map_err(scan_err_to_tool)?;
-                let warnings = truncate_info(&mut v, max_sections, max_imports);
+                let warnings = truncate_info(&mut v, max_sections, max_imports, max_symbols);
                 let out = InfoResponse::from_value(v, file_hash.clone(), warnings);
                 let facts = ScanFacts {
                     sha256: file_hash,
@@ -1659,7 +2266,12 @@ impl ScanFacts {
 /// is announced rather than silent: an agent that sees
 /// `imports_truncated` knows the list is partial, where a silently short
 /// list would be indistinguishable from a binary with few imports.
-fn truncate_info(v: &mut Value, max_sections: usize, max_imports: usize) -> Vec<Warning> {
+fn truncate_info(
+    v: &mut Value,
+    max_sections: usize,
+    max_imports: usize,
+    max_symbols: usize,
+) -> Vec<Warning> {
     let mut warnings = Vec::new();
     let Some(obj) = v.as_object_mut() else {
         return warnings;
@@ -1667,6 +2279,9 @@ fn truncate_info(v: &mut Value, max_sections: usize, max_imports: usize) -> Vec<
     for (field, cap, code) in [
         ("sections", max_sections, "sections_truncated"),
         ("imports", max_imports, "imports_truncated"),
+        // ECO-06: `symbol_count` is deliberately NOT truncated with the
+        // array, so the response always states how many there really were.
+        ("symbols", max_symbols, "symbols_truncated"),
     ] {
         let Some(Value::Array(a)) = obj.get_mut(field) else {
             continue;
@@ -1674,7 +2289,18 @@ fn truncate_info(v: &mut Value, max_sections: usize, max_imports: usize) -> Vec<
         let total = a.len();
         if total > cap {
             a.truncate(cap);
-            warnings.push(Warning::truncation(code, field, cap, total));
+            let mut w = Warning::truncation(code, field, cap, total);
+            if field == "symbols" {
+                // The symbols default is 0 (see DEFAULT_MAX_SYMBOLS), so this
+                // warning is the ONLY thing telling an agent the table exists
+                // and how to ask for it. Say so rather than leaving `returned:
+                // 0` to be read as "there are none".
+                w.detail = Some(
+                    "symbols are opt-in: pass max_symbols (up to 4096) to include them.                      `imports` (the SHN_UNDEF subset, with GOT/PLT) is reported regardless."
+                        .to_string(),
+                );
+            }
+            warnings.push(w);
         }
     }
     warnings
@@ -1874,6 +2500,215 @@ impl RopFinderMcp {
         self.finish(rec, t0, out).await
     }
 
+    /// ECO-01 / ECO-12 — the constraint search, as one call.
+    #[tool(
+        description = "Find gadgets by their EFFECT, not their text: \"set rdi from the stack, \
+        preserve rsi and rdx, at most one side effect, a clean ret\" is one call. Constraints: \
+        set_reg (the register is written with a value YOUR PAYLOAD decides — stronger than \
+        writes_reg, which `xor rdi, rdi` also satisfies), from_stack (that write must come off \
+        the stack), no_clobber (matched against the classifier's `clobbers`, so `pop rdi` \
+        survives no_clobber:[\"rdi\"] and `mov rdi, rax` does not), reads_reg, \
+        max_stack_delta (net rsp movement, terminator included; a gadget whose delta is UNKNOWN \
+        is rejected, never assumed 0), max_side_effects, max_insns, terminator \
+        (ret|jmp|call|syscall|none|any, or the finer bare-ret|ret-imm|jmp-reg|jmp-mem|call-reg|call-mem|\
+        far|other), search (ropper-style wildcards over the instruction sequence, e.g. \
+        \"pop rdi; ret\"; `?` is one character, `%` any run), pivot (the stack-pivot preset), \
+        plus class/label/writes_reg/preserves_regs. Scans ROP+JOP+SYS together, so `terminator` \
+        chooses the family. EVERY result carries an `explanation` object — sets, reads, \
+        clobbers, stack_delta, terminator and a one-line `why` — so a choice can be justified \
+        without re-deriving semantics from gadget text. Ranked, paged with next_cursor, and a \
+        paged result names an NDJSON resource with the whole set.",
+        output_schema = crate::schema::scan_output_schema()
+    )]
+    async fn find_gadgets_by_effect(
+        &self,
+        Parameters(q): Parameters<EffectQuery>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let (mut rec, t0) = self.begin(&ctx, "find_gadgets_by_effect", params_hash(&q));
+        let out = async {
+            let depth = self.check_depth(q.depth)?;
+            let req = rf_cli::ScanRequest {
+                depth,
+                // All three families: the question is about the effect, and
+                // `terminator` is how a caller narrows it. A `jmp-reg`
+                // constraint on a ROP-only scan would silently return
+                // nothing.
+                rop: true,
+                jop: true,
+                sys: true,
+                multibr: false,
+                only: None,
+                filter: None,
+                range: q.range.clone(),
+                badbytes: q.badbytes.clone(),
+                offset: q.offset.clone(),
+                base: q.base.clone(),
+                section: split_sections(q.section.as_deref()),
+                thumb: false,
+                cfg_aware: false,
+                align: None,
+                call_preceded: false,
+                all: false,
+                noinstr: false,
+                arch: q.arch.clone(),
+                max_gadgets: None,
+                max_memory: None,
+                compat: false,
+            };
+            let filter = GadgetFilter::parse(&raw_filter!(q))?;
+            if filter.is_empty() {
+                return Err(ToolError::with_details(
+                    ErrorCode::UsageError,
+                    "find_gadgets_by_effect was given no constraint; it would return the whole \
+                     scan. Pass at least one of set_reg, from_stack, no_clobber, reads_reg, \
+                     writes_reg, preserves_regs, max_stack_delta, max_side_effects, max_insns, \
+                     terminator, search, pivot, class or label — or call find_gadgets if an \
+                     unfiltered ranked list is what you want",
+                    json!({"parameter": "set_reg"}),
+                ));
+            }
+            self.run_scan(
+                &ctx,
+                &mut rec,
+                req,
+                &q.binary_path,
+                PostOpts {
+                    order: Order::parse(q.order.as_deref().unwrap_or("rank"))?,
+                    filter,
+                    cursor: q.cursor.clone(),
+                    params_hash: cursor::params_fingerprint(&q),
+                    max_results: q.max_results,
+                    timeout_secs: q.timeout_secs,
+                    ..Default::default()
+                },
+            )
+            .await
+        }
+        .await;
+        self.finish(rec, t0, out).await
+    }
+
+    /// CLI-05 / ECO-02 — strings inside the mapped image.
+    #[tool(
+        description = "Find a string in the binary's MAPPED DATA sections — where \"/bin/sh\" \
+        lives, and at what address. `string` is a BYTE regex (ROPgadget's --string semantics), \
+        so \"/bin/sh\" is a literal and \"m..n\" matches four bytes. Set memstr:true for \
+        ROPgadget's --memstr instead: each CHARACTER is located separately and only its first \
+        occurrence is reported, searching executable sections before data ones, which is how \
+        you assemble a string the binary does not contain contiguously. Each hit gives vaddr, \
+        section, length, an escaped preview, the raw hex, and whether the section is writable \
+        and executable — `writable` is what tells you an address is usable as scratch space. \
+        SCOPE, and it is enforced rather than promised: only bytes inside sections the loader \
+        MAPS are ever examined. There is no file-offset mode; headers, symbol and string \
+        tables and debug data are unreachable because they are in no mapped section, and \
+        `range` can only narrow the windows. `sections_searched` in the response names exactly \
+        what was read. Paged with next_cursor; a paged result also names an NDJSON resource.",
+        output_schema = crate::schema::search_output_schema()
+    )]
+    async fn find_string(
+        &self,
+        Parameters(q): Parameters<StringQuery>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let (mut rec, t0) = self.begin(&ctx, "find_string", params_hash(&q));
+        let params_fp = cursor::params_fingerprint(&q);
+        let mode = if q.memstr.unwrap_or(false) {
+            find::Mode::MemStr
+        } else {
+            find::Mode::String
+        };
+        let out = self
+            .run_find(
+                &ctx,
+                &mut rec,
+                FindRequest {
+                    binary_path: q.binary_path.clone(),
+                    mode,
+                    query: q.string.clone(),
+                    base: q.base.clone(),
+                    offset: q.offset.clone(),
+                    range: q.range.clone(),
+                    arch: q.arch.clone(),
+                    max_results: q.max_results,
+                    cursor: q.cursor.clone(),
+                    params_hash: params_fp,
+                    timeout_secs: q.timeout_secs,
+                },
+            )
+            .await;
+        self.finish(rec, t0, out).await
+    }
+
+    /// CLI-05 / ECO-02 — a byte sequence inside the mapped executable image.
+    #[tool(
+        description = "Find a byte sequence in the binary's MAPPED EXECUTABLE regions — the \
+        same regions find_gadgets walks. `opcode` is hex (\"c9c3\", or \"c9 c3\"), and `??` \
+        matches any one byte, so \"ff??e0\" finds `jmp rax` through `jmp r15`. A one-nibble \
+        wildcard is refused rather than silently widened. Each hit gives vaddr, section, \
+        length, an escaped preview, the raw hex and the section's writable/executable flags. \
+        SCOPE: only bytes inside mapped executable sections are examined — there is no \
+        file-offset mode and nothing outside a section is reachable; `sections_searched` names \
+        exactly what was read, and `range` can only narrow it. Paged with next_cursor; a paged \
+        result also names an NDJSON resource with the whole match set.",
+        output_schema = crate::schema::search_output_schema()
+    )]
+    async fn find_bytes(
+        &self,
+        Parameters(q): Parameters<BytesQuery>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let (mut rec, t0) = self.begin(&ctx, "find_bytes", params_hash(&q));
+        let params_fp = cursor::params_fingerprint(&q);
+        let out = self
+            .run_find(
+                &ctx,
+                &mut rec,
+                FindRequest {
+                    binary_path: q.binary_path.clone(),
+                    mode: find::Mode::Opcode,
+                    query: q.opcode.clone(),
+                    base: q.base.clone(),
+                    offset: q.offset.clone(),
+                    range: q.range.clone(),
+                    arch: q.arch.clone(),
+                    max_results: q.max_results,
+                    cursor: q.cursor.clone(),
+                    params_hash: params_fp,
+                    timeout_secs: q.timeout_secs,
+                },
+            )
+            .await;
+        self.finish(rec, t0, out).await
+    }
+
+    /// ECO-06 — checksec, for an agent.
+    #[tool(
+        description = "Report the binary's exploit mitigations, so an agent can decide whether \
+        ROP is even the right technique before it scans. ELF: nx (PT_GNU_STACK), pie \
+        (ET_DYN + DF_1_PIE/PT_INTERP/DT_DEBUG, distinguishing a PIE executable from a shared \
+        object), relro, canary, fortify, rpath, runpath. PE: aslr, dep, high_entropy_va, \
+        guard_cf and cet_compat as SEPARATE answers read from separate directories (CFG \
+        validates indirect CALL targets and does NOT check a ret; only cet_compat means a \
+        shadow stack), safe_seh, force_integrity. Mach-O: pie, nx_stack, nx_heap, \
+        code_signature, hardened_runtime — per SLICE for a fat container, in `slices`, because \
+        the slices genuinely disagree. Every entry is {name, enabled, evidence, detail} where \
+        `enabled` is true, false, or the string \"unknown\" — never false standing in for \
+        \"could not tell\" — and `evidence` names the header field that decided it, or the \
+        one whose absence made it unknown. The order is the loader's and is meaningful; `name` \
+        is the stable key. No scan is performed.",
+        output_schema = crate::schema::mitigations_output_schema()
+    )]
+    async fn get_mitigations(
+        &self,
+        Parameters(q): Parameters<MitigationsQuery>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let (mut rec, t0) = self.begin(&ctx, "get_mitigations", params_hash(&q));
+        let out = self.run_mitigations(&ctx, &mut rec, &q).await;
+        self.finish(rec, t0, out).await
+    }
+
     /// Resolve stable gadget ids back to full records.
     #[tool(
         description = "Resolve stable gadget ids (the `id` field of any gadget record, e.g. \
@@ -1947,10 +2782,11 @@ impl RopFinderMcp {
         description = "Get binary metadata as JSON: format, arch, endianness, addr_size, \
         image_base, entry, sections (name/vaddr/size/executable/writable), PE imports \
         (iat_vaddr is the IAT slot the loader patches; hint_name_vaddr is the \
-        IMAGE_IMPORT_BY_NAME record), fat Mach-O slices, binary_sha256 and warnings. The \
-        shape is fixed: an ELF reports slices: [] and a fat Mach-O reports sections: []. No \
-        scan is performed. Bounded like every other tool: timeout_secs (default 60), \
-        --max-file-bytes, and max_sections/max_imports (default 4096 each) — a truncated \
+        IMAGE_IMPORT_BY_NAME record; an ELF import instead carries addr/got/plt/type/binding, which         is what a ret2plt chain resolves against), the ELF symbol table (`symbols`, OPT-IN: pass max_symbols to get it; symbol_count is always the true total, and null means this format's symbols are not read at all), fat Mach-O slices,         binary_sha256 and warnings. The \
+        shape is fixed: an ELF reports slices: [] and a fat Mach-O reports sections: []. Exploit \
+        mitigations are NOT here: call get_mitigations, which types them and keeps the loader's \
+        order. No scan is performed. Bounded like every other tool: timeout_secs (default 60), \
+        --max-file-bytes, and max_sections/max_imports (default 4096 each) and max_symbols (default 0, max 4096) — a truncated \
         array is announced in warnings, never silently short.",
         output_schema = crate::schema::info_output_schema()
     )]
@@ -2246,12 +3082,24 @@ impl ServerHandler for RopFinderMcp {
             .cache
             .pinned_keys()
             .into_iter()
-            .map(|(key, gadgets)| {
-                rmcp::model::Resource::new(resources::scan_uri(&key), format!("scan {key}"))
-                    .with_mime_type(resources::NDJSON_MIME)
-                    .with_description(format!(
-                        "{gadgets} gadget records, one JSON object per line, in rank order"
-                    ))
+            .map(|(key, count)| {
+                // A search key is minted as `s<hex>` by run_find; a scan key
+                // is `rf_cache::make_key`'s `v<n>-<hex>--<hex>`. The two
+                // namespaces are disjoint by construction, and each URI form
+                // is parsed only by its own reader.
+                if key.starts_with('s') && !key.contains("--") {
+                    rmcp::model::Resource::new(resources::search_uri(&key), format!("search {key}"))
+                        .with_mime_type(resources::NDJSON_MIME)
+                        .with_description(format!(
+                            "{count} search hits, one JSON object per line, in address order"
+                        ))
+                } else {
+                    rmcp::model::Resource::new(resources::scan_uri(&key), format!("scan {key}"))
+                        .with_mime_type(resources::NDJSON_MIME)
+                        .with_description(format!(
+                            "{count} gadget records, one JSON object per line, in rank order"
+                        ))
+                }
             })
             .collect();
         Ok(rmcp::model::ListResourcesResult::with_all_items(resources))
@@ -2271,20 +3119,33 @@ impl ServerHandler for RopFinderMcp {
         _ctx: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::ReadResourceResponse, McpError> {
         let uri = request.uri.clone();
-        let Some(key) = resources::cache_key_of(&uri) else {
-            return Err(McpError::resource_not_found(
-                "not a rop-finder scan resource; the form is \
-                 ropfinder://scan/<cache_key>/gadgets.ndjson",
-                Some(json!({"uri": uri})),
-            ));
+        // ECO-09: two namespaces, each parsed by its own reader, so a scan
+        // key can never be served as a search body or the reverse.
+        let text = if let Some(key) = resources::search_key_of(&uri) {
+            let Some(body) = self.cache.pinned_text(key) else {
+                return Err(McpError::resource_not_found(
+                    "that search is no longer held; re-run it to get a fresh resource_uri",
+                    Some(json!({"uri": uri, "cursor_ttl_secs": self.config.cursor_ttl.as_secs()})),
+                ));
+            };
+            body.to_string()
+        } else {
+            let Some(key) = resources::cache_key_of(&uri) else {
+                return Err(McpError::resource_not_found(
+                    "not a rop-finder resource; the forms are \
+                     ropfinder://scan/<cache_key>/gadgets.ndjson and \
+                     ropfinder://search/<key>/hits.ndjson",
+                    Some(json!({"uri": uri})),
+                ));
+            };
+            let Some(p) = self.cache.pinned(key) else {
+                return Err(McpError::resource_not_found(
+                    "that scan is no longer held; re-run the scan to get a fresh resource_uri",
+                    Some(json!({"uri": uri, "cursor_ttl_secs": self.config.cursor_ttl.as_secs()})),
+                ));
+            };
+            resources::render_ndjson(&p.scan, &p.sems)
         };
-        let Some(p) = self.cache.pinned(key) else {
-            return Err(McpError::resource_not_found(
-                "that scan is no longer held; re-run the scan to get a fresh resource_uri",
-                Some(json!({"uri": uri, "cursor_ttl_secs": self.config.cursor_ttl.as_secs()})),
-            ));
-        };
-        let text = resources::render_ndjson(&p.scan, &p.sems);
         Ok(rmcp::model::ReadResourceResult::new(vec![
             rmcp::model::ResourceContents::TextResourceContents {
                 uri,
@@ -2320,8 +3181,14 @@ impl RopFinderMcp {
              Gadget results are RANKED by default (order=\"rank\"), carry a stable `id` you can \
              pass back to get_gadgets, and are paged with `next_cursor`. Prefer the server-side \
              filters — class, label, writes_reg, reads_reg, preserves_regs, from_stack, \
-             terminator, max_side_effects, max_insns — over reading gadgets to filter them \
-             yourself. A paged scan also names an NDJSON resource holding the whole set.\n\
+             terminator, max_side_effects, max_insns, and v0.4's set_reg, no_clobber, \
+             max_stack_delta, pivot and search — over reading gadgets to filter them \
+             yourself. find_gadgets_by_effect takes all of them at once and returns an \
+             `explanation` with every gadget. find_string and find_bytes locate strings and \
+             byte sequences, and read ONLY bytes inside MAPPED sections — never a file offset. \
+             get_mitigations is checksec: nx/pie/relro/canary or aslr/dep/guard_cf/cet_compat, \
+             each with its evidence, and \"unknown\" where the file does not say. A paged scan \
+             or search also names an NDJSON resource holding the whole set.\n\
              Every tool declares an outputSchema; every response has a FIXED field set, with \
              null rather than a missing key. Errors are {{error: {{code, message, retryable, \
              details, suggestion}}}} and `code` is one of: {}.",

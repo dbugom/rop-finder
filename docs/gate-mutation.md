@@ -387,6 +387,107 @@ keeps those two findings from silently regressing.
 
 ---
 
+## Part 3 - the capability matrix (RUN 2026-09-03, Phase 4 integration wave)
+
+`tests/capability_matrix.py` is the ECO-02 gate: the CLI and the MCP server
+must expose the same tool. It has three independent failure modes, and all
+three were observed rather than assumed.
+
+### M7 - a capability that exists on one surface only
+
+**Not a mutation.** This is what the gate found on its FIRST run, before any
+reconciliation, on the merged Phase 4 tree.
+
+```
+python tests/capability_matrix.py
+```
+
+**Result - exit 1.**
+
+```
+  terminator   both accept 14, both reject 1  DIVERGENT cli=['', 'RET', 'ret '] mcp=[]
+  reads-reg                    DIVERGENT cli=2888 mcp=2147
+
+FAIL: VOCABULARY: --terminator / terminator accept different values. CLI-only:
+      ['', 'RET', 'ret ']. MCP-only: []. Same name, different vocabulary is
+      the quiet half of ECO-02.
+FAIL: BEHAVIOUR reads-reg: the two surfaces answer the same question
+      differently. CLI 2888 gadgets, MCP 2147; 741 CLI-only, 0 MCP-only.
+      e.g. [('0x0000000000400fd7', 'jmp rax'), ('0x0000000000401041', 'call rax')]
+
+CAPABILITY MATRIX: FAIL
+```
+
+Both were real. `--terminator bare-ret` answered on the CLI and was a
+`usage_error` on MCP; `terminator: "any"` answered on MCP and was a usage
+error on the CLI; and `reads_reg` on MCP did not count the terminator's own
+target register, so `jmp rax` did not answer "which gadgets read rax". The
+`reads_reg` predicate now lives once, on `rf_classify::Classification`, and
+both front ends call it.
+
+### M8 - a capability removed from the table (the UNDECLARED path)
+
+**Mutation.** Delete the `--reads-reg` <-> `reads_reg` row from `PAIRS`,
+simulating a capability that arrives on one surface and is never mirrored.
+
+```
+python - <<'EOF'
+import io; p="tests/capability_matrix.py"; s=io.open(p,encoding="utf-8").read()
+io.open(p,"w",encoding="utf-8",newline="").write(
+    s.replace('    {"cli": "reads-reg", "mcp": "reads_reg"},
+',''))
+EOF
+python tests/capability_matrix.py --skip-behaviour
+```
+
+**Result - exit 1.**
+
+```
+FAIL: CLI-ONLY, UNDECLARED: --reads-reg exists on the CLI and has no MCP twin
+      and no declared reason. Add it to PAIRS (implement it on MCP) or to
+      CLI_ONLY with a reason.
+FAIL: MCP-ONLY, UNDECLARED: the parameter 'reads_reg' exists on the MCP
+      surface and has no CLI twin and no declared reason. Add it to PAIRS
+      (implement it on the CLI) or to MCP_ONLY with a reason.
+
+CAPABILITY MATRIX: FAIL (2 divergences)
+```
+
+### M9 - a declared asymmetry that has stopped being true (the STALE path)
+
+This is the mutation that matters most, because it is the way a table of
+declared exceptions rots into a permission slip: someone implements the
+missing half and nobody deletes the excuse.
+
+**Mutation.** Move `--pivot` out of `PAIRS` and declare it CLI-only, while
+`pivot` is in fact an MCP parameter.
+
+```
+python tests/capability_matrix.py --skip-behaviour
+```
+
+**Result - exit 1.**
+
+```
+FAIL: MCP-ONLY, UNDECLARED: the parameter 'pivot' exists on the MCP surface
+      and has no CLI twin and no declared reason. ...
+FAIL: STALE CLI_ONLY: --pivot is declared CLI-only but 'pivot' is now an MCP
+      parameter. Move it to PAIRS.
+
+CAPABILITY MATRIX: FAIL (2 divergences)
+```
+
+Both mutations were reverted immediately; the committed file is unmodified and
+the gate is green:
+
+```
+37 paired capabilities, 45 declared asymmetries, 2 vocabularies and 31 answers
+compared.
+CAPABILITY MATRIX: PASS
+```
+
+---
+
 ## How to re-run everything here
 
 ```
@@ -396,6 +497,8 @@ python tests/doc_claims.py --no-timing       # exit 0 expected
 cargo bench -p rf-bench
 python crates/rf-bench/check_regression.py   # exit 0 expected
 python tests/chain_parity.py                 # exit 0 expected
+python tests/flag_conformance.py             # exit 0 expected
+python tests/capability_matrix.py            # exit 0 expected (needs no oracle)
 ```
 
 Regenerating the parity baseline (only after deliberately accepting a new

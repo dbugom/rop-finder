@@ -296,6 +296,296 @@
     }
   },
   {
+    "description": "Find a byte sequence in the binary's MAPPED EXECUTABLE regions — the same regions find_gadgets walks. `opcode` is hex (\"c9c3\", or \"c9 c3\"), and `??` matches any one byte, so \"ff??e0\" finds `jmp rax` through `jmp r15`. A one-nibble wildcard is refused rather than silently widened. Each hit gives vaddr, section, length, an escaped preview, the raw hex and the section's writable/executable flags. SCOPE: only bytes inside mapped executable sections are examined — there is no file-offset mode and nothing outside a section is reachable; `sections_searched` names exactly what was read, and `range` can only narrow it. Paged with next_cursor; a paged result also names an NDJSON resource with the whole match set.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "arch": {
+          "description": "Architecture slice for a fat (Universal) Mach-O. REQUIRED for a\nmulti-slice container.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base": {
+          "description": "Rebase the image base before reporting addresses (hex string).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "binary_path": {
+          "description": "Absolute path to the binary; must be inside one of the server's\nallow_roots (get_server_config lists them).",
+          "type": "string"
+        },
+        "cursor": {
+          "description": "`next_cursor` from a previous page of THIS query.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_results": {
+          "description": "Maximum hits returned per page (default 1000, hard max 50000).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Offset added to reported addresses after any rebase (hex string).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "opcode": {
+          "description": "The byte sequence as hex, e.g. \"c9c3\" or \"c9 c3\". `??` matches any\none byte, so \"ff??e0\" finds `jmp rax` through `jmp r15`. A nibble\nwildcard is refused rather than silently widened.",
+          "type": "string"
+        },
+        "range": {
+          "description": "Restrict the search to this address range, \"0xSTART-0xEND\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_secs": {
+          "description": "Per-request timeout in seconds (default 60, max 300).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "binary_path",
+        "opcode"
+      ],
+      "type": "object"
+    },
+    "name": "find_bytes",
+    "outputSchema": {
+      "$defs": {
+        "Hit": {
+          "additionalProperties": false,
+          "description": "One match, in the shape ECO-02 asks for.",
+          "properties": {
+            "bytes": {
+              "description": "The matched bytes, lowercase hex. Same cap as `preview`.",
+              "type": "string"
+            },
+            "executable": {
+              "description": "Is the containing section executable at runtime?",
+              "type": "boolean"
+            },
+            "length": {
+              "description": "Length of the match in bytes.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "matched_char": {
+              "description": "`memstr` only: the character this hit locates. `null` in every other\nmode — the field is always present, so one parser reads every\nresponse.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "preview": {
+              "description": "The matched bytes, printable-escaped: printable ASCII verbatim,\neverything else as `\\xNN` (and `\\\\` for a literal backslash), so the\nvalue is safe to print and unambiguous to parse. Capped at\n[`MAX_PREVIEW_BYTES`] source bytes.",
+              "type": "string"
+            },
+            "section": {
+              "description": "Name of the mapped section the match lies in. `null` only for a\ncontainer whose sections are unnamed (a raw blob), never because\nthe match was outside one — a match outside a section cannot exist.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "vaddr": {
+              "description": "Zero-padded hex address, padded to the target's pointer width.",
+              "type": "string"
+            },
+            "vaddr_u64": {
+              "description": "The same address as a number; do arithmetic on this, never on\n`vaddr`.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "writable": {
+              "description": "Is the containing section writable at runtime? This is the field\nthat decides whether an address is usable as a scratch buffer.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "vaddr",
+            "vaddr_u64",
+            "length",
+            "preview",
+            "bytes",
+            "writable",
+            "executable"
+          ],
+          "type": "object"
+        },
+        "Warning": {
+          "additionalProperties": false,
+          "description": "A non-fatal fact the agent has to know to read the result correctly\n(CRIT-03 item 4).\n\n`fallback_section_names` used to be a bare boolean with no explanation,\nand truncation was announced nowhere at all. Every entry has a stable\n`code` to branch on and a `message` to show a human.",
+          "properties": {
+            "code": {
+              "description": "Stable machine-readable tag: `low_confidence_classification`,\n`fallback_section_names`, `universal_slice_selected`, `truncated`,\n`sections_truncated`, `imports_truncated`, `ids_not_found`,\n`unmapped_info_fields`.",
+              "type": "string"
+            },
+            "detail": {
+              "description": "Free-form detail (the slice name, the architecture, …).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "field": {
+              "description": "The response field the warning is about, when it is about one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "Human-readable explanation.",
+              "type": "string"
+            },
+            "returned": {
+              "description": "Entries returned in that field.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "total": {
+              "description": "Entries that exist.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "binary_label": {
+          "description": "The binary's path relative to its allow root.",
+          "type": "string"
+        },
+        "binary_sha256": {
+          "description": "SHA-256 of the analysed file.",
+          "type": "string"
+        },
+        "hits": {
+          "description": "This page of matches.",
+          "items": {
+            "$ref": "#/$defs/Hit"
+          },
+          "type": "array"
+        },
+        "mode": {
+          "description": "`string`, `memstr` or `opcode` — which search ran.",
+          "type": "string"
+        },
+        "next_cursor": {
+          "description": "Opaque token for the next page; `null` on the last one. Send it back\nas `cursor` with the SAME query parameters.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Index of this page's first match within the ordered result.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "query": {
+          "description": "The pattern, echoed as given.",
+          "type": "string"
+        },
+        "resource_uri": {
+          "description": "`ropfinder://search/<key>/hits.ndjson` — the whole match set, one\n`Hit` per line, readable with `resources/read`. Present only when\nthe result was paged.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "returned": {
+          "description": "Matches in this page.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sections_searched": {
+          "description": "The MAPPED sections this search actually read, in order — the\nconfinement claim in the tool description, made checkable in the\nresponse. Nothing outside these windows was examined.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "total_count": {
+          "description": "Matches before paging.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncated": {
+          "description": "`total_count > offset + returned`.",
+          "type": "boolean"
+        },
+        "warnings": {
+          "description": "Non-fatal facts. Always present; `[]` when there are none.",
+          "items": {
+            "$ref": "#/$defs/Warning"
+          },
+          "type": "array"
+        },
+        "workspace_file": {
+          "description": "The same NDJSON as a real file, when the server was started with\n`--workspace-dir`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "hits",
+        "mode",
+        "query",
+        "total_count",
+        "returned",
+        "offset",
+        "truncated",
+        "sections_searched",
+        "binary_sha256",
+        "binary_label",
+        "warnings"
+      ],
+      "type": "object"
+    }
+  },
+  {
     "description": "Find ROP gadgets in a binary (ret-terminated). Results are RANKED by default (order=\"rank\": usability tier, then quality, then fewest instructions, then fewest side effects, then address), so the first page is the useful gadgets rather than the alphabetical head; order=\"address\"|\"quality\"|\"text\" are also accepted. Every record carries a stable id, the classification (class, labels, regs_written, regs_read, regs_from_stack, side_effects, terminator, usability) and delay_slot. Filter server-side with class/label/writes_reg/reads_reg/preserves_regs/from_stack/terminator/max_side_effects/max_insns instead of pulling gadgets into context. Page with next_cursor. binary_path must be an absolute path inside one of the server's allow_roots (call get_server_config to list them); anything else returns path_denied. depth above max_depth is rejected, not clamped. A request that exceeds timeout_secs is STOPPED, not orphaned, and notifications/cancelled stops it too.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -389,6 +679,24 @@
             "null"
           ]
         },
+        "max_stack_delta": {
+          "description": "ECO-01: keep only gadgets whose net stack movement is KNOWN and at\nmost this many bytes (the terminator's own pop included, so\n`pop rdi ; ret` is 16 on x86-64). A gadget whose delta is unknown is\nREJECTED, never assumed to be 0.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "no_clobber": {
+          "description": "ECO-01: none of these registers may be CLOBBERED — written with a\nvalue the payload does not decide. Matched against the classifier's\n`clobbers`, NOT `regs_written`: `pop rdi ; ret` survives\n`no_clobber: [\"rdi\"]` and `mov rdi, rax ; ret` does not. Elements\nmay also be comma-separated.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "offset": {
           "description": "Offset added to gadget addresses after any rebase (hex string).",
           "type": [
@@ -407,6 +715,13 @@
           "description": "Result ordering, applied BEFORE paging. \"rank\" (the default) is\nusability tier, then quality, then fewest instructions, then fewest\nside effects, then address — it is what puts `pop rdi ; ret` at the\ntop instead of `adc al, 0x89 ; retf 0xc281`. Also \"address\",\n\"quality\" and \"text\" (the pre-0.3 default). Anything else is\nrejected with the valid set in the error.",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "pivot": {
+          "description": "ECO-12: the stack-pivot preset — keep only gadgets carrying the\n`stack-pivot` label.",
+          "type": [
+            "boolean",
             "null"
           ]
         },
@@ -431,8 +746,22 @@
             "null"
           ]
         },
+        "search": {
+          "description": "ECO-01: ropper-style wildcard matcher over the instruction\nSEQUENCE, e.g. \"pop rdi; ret\". `?` is one character, `%` is any run\ninside one instruction (so a bare `%` is any single instruction).\nThe instructions must appear as a contiguous run, so\n\"pop rdi; ret\" also matches \"xor eax, eax ; pop rdi ; ret\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "section": {
           "description": "Executable section name(s) to scan; comma-separated, `*` globbing\n(e.g. \".text\" or \".init*,.plt\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "set_reg": {
+          "description": "ECO-01: keep only gadgets that SET all of these registers — write\nthem with a value the chain PAYLOAD decides. Strictly stronger than\n`writes_reg`: `xor rdi, rdi ; ret` writes rdi and sets nothing.",
           "type": [
             "string",
             "null"
@@ -446,7 +775,7 @@
           ]
         },
         "terminator": {
-          "description": "Keep only gadgets with this terminator kind: \"ret\" (every returning\nform), \"jmp\", \"call\", \"syscall\", \"none\", or \"any\".",
+          "description": "Keep only gadgets with this terminator. Comma-separated any-of,\ncase-insensitive: the coarse kind \"ret\"\n(every returning form), \"jmp\", \"call\", \"syscall\", \"none\", \"any\"\n(no constraint), or a CLS-09 class -- \"bare-ret\" (the plain near\nreturn, which coarse \"ret\" is a superset of), \"ret-imm\",\n\"jmp-reg\", \"jmp-mem\", \"call-reg\", \"call-mem\", \"far\", \"other\".",
           "type": [
             "string",
             "null"
@@ -477,6 +806,57 @@
     "name": "find_gadgets",
     "outputSchema": {
       "$defs": {
+        "Explanation": {
+          "additionalProperties": false,
+          "description": "ECO-01: why this gadget is in the answer, in the vocabulary the query\nwas written in.\n\nThe point is that an agent can justify a choice — to itself, to a user,\nor in a chain plan — WITHOUT re-deriving semantics from gadget text.\nRe-derivation from text is what the whole classifier exists to prevent,\nand it is where an agent silently gets `mov rdi, rax ; ret` wrong.\n\nIt repeats `reads`, `stack_delta` and `terminator`, which also appear at\nthe top level of the record, deliberately: the object is meant to be\nquotable on its own.",
+          "properties": {
+            "clobbers": {
+              "description": "CLS-09 `clobbers`: registers written with a value the payload does\nNOT decide. A clobber is not \"unusable\" — `mov rdi, rax ; ret`\nclobbers rdi and tells you to control rax instead — but it is what\n`no_clobber` rejects.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "reads": {
+              "description": "Registers read (`regs_read`): the inputs that must already hold what\nyou want.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "sets": {
+              "description": "CLS-09 `sets`: registers this gadget writes with a value the chain\nPAYLOAD decides. This is what `set_reg` matches, and it is a strict\nsubset of `regs_written` — `xor rdi, rdi ; ret` writes rdi and sets\nnothing.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "stack_delta": {
+              "description": "Net stack-pointer movement in bytes, terminator included. `null`\nmeans UNKNOWN (a non-constant effect, an unmodelled form, or the\ntext classification path) and must never be read as zero.",
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "terminator": {
+              "description": "CLS-09 terminator class: `ret`, `ret-imm`, `jmp-reg`, `jmp-mem`,\n`call-reg`, `call-mem`, `syscall`, `far`, `other`. Finer than the\nrecord's `terminator`, and the spelling the `terminator` filter\naccepts.",
+              "type": "string"
+            },
+            "why": {
+              "description": "One sentence naming the payload offset each set register comes from,\nwhat is clobbered, the stack movement and the terminator.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sets",
+            "reads",
+            "clobbers",
+            "terminator",
+            "why"
+          ],
+          "type": "object"
+        },
         "GadgetRecord": {
           "additionalProperties": false,
           "description": "One gadget, in the shape every gadget-returning tool emits.\n\nInvariant: the field set does not depend on the request. A gadget from a\nscan with no `section` parameter carries `\"section\": null`, not a missing\nkey; an x86-64 ELF carries `\"arch\": null` and `\"delay_slot\": false`, not\nnothing at all. `tests/schema_conformance.rs` asserts the four shapes\nthat used to differ — plain, `section=.text`, MIPS, and the fat Mach-O —\nhave identical key sets.",
@@ -506,6 +886,10 @@
             "dispatcher": {
               "description": "JOP/COP dispatcher heuristic.",
               "type": "boolean"
+            },
+            "explanation": {
+              "$ref": "#/$defs/Explanation",
+              "description": "ECO-01: why this gadget is here, in the query's own vocabulary."
             },
             "id": {
               "description": "Stable identity: `g_` + base32 of the first 10 bytes of\n`blake3(binary_sha256 || vaddr_le || bytes)`. Independent of every\nscan parameter, so the same gadget has the same id across calls,\nprocesses and cache evictions. Pass a list of these to\n`get_gadgets`.",
@@ -573,7 +957,7 @@
               "type": "integer"
             },
             "stack_delta": {
-              "description": "Net change to the stack pointer. **Always `null` in v0.3**: the\ncomputation is ECO-07/CLS-09 and lands in v0.4. The field is here\nnow so the record shape does not change when it does.",
+              "description": "Net change to the stack pointer, in bytes, with the terminator's\nown pop included — `pop rdi ; ret` is 16 on x86-64. CLS-09 landed\nthe computation in v0.4; the field existed (always `null`) in v0.3\nso the record shape would not change when it did.\n\n`null` is UNKNOWN, not zero: a non-constant effect (`xchg rsp,\nrax`), an architecture or instruction form the model does not prove,\nor a gadget classified from text. `max_stack_delta` rejects it\nrather than assuming.",
               "format": "int64",
               "type": [
                 "integer",
@@ -624,7 +1008,575 @@
             "terminator",
             "dispatcher",
             "privileged",
-            "low_confidence"
+            "low_confidence",
+            "explanation"
+          ],
+          "type": "object"
+        },
+        "Warning": {
+          "additionalProperties": false,
+          "description": "A non-fatal fact the agent has to know to read the result correctly\n(CRIT-03 item 4).\n\n`fallback_section_names` used to be a bare boolean with no explanation,\nand truncation was announced nowhere at all. Every entry has a stable\n`code` to branch on and a `message` to show a human.",
+          "properties": {
+            "code": {
+              "description": "Stable machine-readable tag: `low_confidence_classification`,\n`fallback_section_names`, `universal_slice_selected`, `truncated`,\n`sections_truncated`, `imports_truncated`, `ids_not_found`,\n`unmapped_info_fields`.",
+              "type": "string"
+            },
+            "detail": {
+              "description": "Free-form detail (the slice name, the architecture, …).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "field": {
+              "description": "The response field the warning is about, when it is about one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "Human-readable explanation.",
+              "type": "string"
+            },
+            "returned": {
+              "description": "Entries returned in that field.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "total": {
+              "description": "Entries that exist.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "binary_label": {
+          "description": "The binary's path relative to its allow root — what the audit log\nrecords, and never the caller's spelling of the path.",
+          "type": "string"
+        },
+        "binary_sha256": {
+          "description": "SHA-256 of the analysed file.",
+          "type": "string"
+        },
+        "cache": {
+          "description": "`hit` when the gadget set came from a cache (in memory, pinned for\na cursor, or authenticated from disk), `miss` when it was scanned.",
+          "type": "string"
+        },
+        "cache_key": {
+          "description": "Key of the cached scan; the second path component of `resource_uri`.",
+          "type": "string"
+        },
+        "fallback_section_names": {
+          "description": "The binary has no section names and synthetic `PT_LOAD#n` names were\nmatched instead. Also reported in `warnings`.",
+          "type": "boolean"
+        },
+        "gadgets": {
+          "items": {
+            "$ref": "#/$defs/GadgetRecord"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "description": "Opaque token for the next page; `null` on the last one. Send it back\nas `cursor` with the SAME query parameters.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Index of this page's first gadget within the ordered result.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "order": {
+          "description": "The order actually applied: `rank`, `address`, `quality`, `text` or\n`ids`. Echoed because the default changed to `rank` and an agent\nmust not have to assume.",
+          "type": "string"
+        },
+        "resource_uri": {
+          "description": "`ropfinder://scan/<cache_key>/gadgets.ndjson` — the WHOLE ordered\nresult, one `GadgetRecord` per line, readable with `resources/read`.\nPresent only when the result was paged.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "returned": {
+          "description": "Gadgets in this page.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_count": {
+          "description": "Gadgets matching the query, before paging.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncated": {
+          "description": "`total_count > offset + returned`.",
+          "type": "boolean"
+        },
+        "warnings": {
+          "description": "Non-fatal facts. Always present; `[]` when there are none.",
+          "items": {
+            "$ref": "#/$defs/Warning"
+          },
+          "type": "array"
+        },
+        "workspace_file": {
+          "description": "The same NDJSON as a real file, when the server was started with\n`--workspace-dir`. An agent with filesystem tools should grep this\ninstead of paging.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "gadgets",
+        "total_count",
+        "returned",
+        "offset",
+        "truncated",
+        "order",
+        "binary_sha256",
+        "binary_label",
+        "cache",
+        "cache_key",
+        "fallback_section_names",
+        "warnings"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Find gadgets by their EFFECT, not their text: \"set rdi from the stack, preserve rsi and rdx, at most one side effect, a clean ret\" is one call. Constraints: set_reg (the register is written with a value YOUR PAYLOAD decides — stronger than writes_reg, which `xor rdi, rdi` also satisfies), from_stack (that write must come off the stack), no_clobber (matched against the classifier's `clobbers`, so `pop rdi` survives no_clobber:[\"rdi\"] and `mov rdi, rax` does not), reads_reg, max_stack_delta (net rsp movement, terminator included; a gadget whose delta is UNKNOWN is rejected, never assumed 0), max_side_effects, max_insns, terminator (ret|jmp|call|syscall|none|any, or the finer bare-ret|ret-imm|jmp-reg|jmp-mem|call-reg|call-mem|far|other), search (ropper-style wildcards over the instruction sequence, e.g. \"pop rdi; ret\"; `?` is one character, `%` any run), pivot (the stack-pivot preset), plus class/label/writes_reg/preserves_regs. Scans ROP+JOP+SYS together, so `terminator` chooses the family. EVERY result carries an `explanation` object — sets, reads, clobbers, stack_delta, terminator and a one-line `why` — so a choice can be justified without re-deriving semantics from gadget text. Ranked, paged with next_cursor, and a paged result names an NDJSON resource with the whole set.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "arch": {
+          "description": "Architecture slice for a fat (Universal) Mach-O. REQUIRED for a\nmulti-slice container.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "badbytes": {
+          "description": "Reject gadgets whose final address contains these bytes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base": {
+          "description": "Rebase the image base at load time (hex string).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "binary_path": {
+          "description": "Absolute path to the binary; must be inside one of the server's\nallow_roots (get_server_config lists them).",
+          "type": "string"
+        },
+        "class": {
+          "description": "Primary class: reg-write, stack-pivot, mem-read, mem-write,\narithmetic, syscall, dispatcher, other (comma-separated).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor": {
+          "description": "`next_cursor` from a previous page of THIS query.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "depth": {
+          "description": "Search depth (default 10).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "from_stack": {
+          "description": "The `set_reg` write must ORIGINATE on the stack — a pop, or a load\nthrough the stack pointer — rather than in an arbitrary\ncomputation. With no `set_reg` it falls back to `writes_reg`, and\nwith neither it means \"at least one register comes off the stack\".",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "label": {
+          "description": "At least one of these labels (same vocabulary as `class`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_insns": {
+          "description": "At most this many instructions.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_results": {
+          "description": "Maximum gadgets returned per page (default 1000, hard max 50000).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_side_effects": {
+          "description": "At most this many side effects (instructions that earn a label).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_stack_delta": {
+          "description": "Net stack movement must be KNOWN and at most this many bytes, the\nterminator's own pop included (`pop rdi ; ret` is 16 on x86-64). An\nunknown delta is REJECTED, never read as 0 — `xchg rsp, rax ; ret`\nmust not slip into a layout budget.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "no_clobber": {
+          "description": "None of these registers may be CLOBBERED. Matched against the\nclassifier's `clobbers`, NOT `regs_written`, which is the\ndifference between \"this gadget destroys rdi\" and \"this gadget\nloads rdi from your payload\". Elements may be comma-separated.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Offset added to gadget addresses after any rebase (hex string).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "order": {
+          "description": "Result ordering; see find_gadgets. Default \"rank\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pivot": {
+          "description": "ECO-12: the stack-pivot preset — only gadgets carrying the\n`stack-pivot` label. Combine with `max_stack_delta` to rank pivots\nby reach.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "preserves_regs": {
+          "description": "The gadget must write NONE of these registers, matched against\n`regs_written`. Coarser than `no_clobber` and kept because every\nother gadget tool has it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "range": {
+          "description": "Address range to scan, \"0xSTART-0xEND\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reads_reg": {
+          "description": "The gadget must read ALL of these registers.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "search": {
+          "description": "Ropper-style wildcard matcher over the instruction SEQUENCE, e.g.\n\"pop rdi; ret\". `?` is one character, `%` is any run inside one\ninstruction (a bare `%` is any single instruction). The pattern must\nappear as a CONTIGUOUS run, so it also matches\n\"xor eax, eax ; pop rdi ; ret\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "section": {
+          "description": "Executable section name(s); comma-separated, `*` globbing.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "set_reg": {
+          "description": "The gadget must SET this register — write it with a value the chain\nPAYLOAD decides. Several may be given, comma-separated, and all are\nrequired. Strictly stronger than `writes_reg`: `xor rdi, rdi ; ret`\nwrites rdi and sets nothing.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "terminator": {
+          "description": "Terminator: the coarse kind \"ret\" (every returning form), \"jmp\",\n\"call\", \"syscall\", \"none\", \"any\"; or the CLS-09 class \"ret-imm\",\n\"jmp-reg\", \"jmp-mem\", \"call-reg\", \"call-mem\", \"far\", \"other\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_secs": {
+          "description": "Per-request timeout in seconds (default 60, max 300).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "writes_reg": {
+          "description": "The gadget must WRITE all of these registers — the v0.3 spelling,\nsatisfied by any write. `set_reg` is the one you usually want.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "binary_path"
+      ],
+      "type": "object"
+    },
+    "name": "find_gadgets_by_effect",
+    "outputSchema": {
+      "$defs": {
+        "Explanation": {
+          "additionalProperties": false,
+          "description": "ECO-01: why this gadget is in the answer, in the vocabulary the query\nwas written in.\n\nThe point is that an agent can justify a choice — to itself, to a user,\nor in a chain plan — WITHOUT re-deriving semantics from gadget text.\nRe-derivation from text is what the whole classifier exists to prevent,\nand it is where an agent silently gets `mov rdi, rax ; ret` wrong.\n\nIt repeats `reads`, `stack_delta` and `terminator`, which also appear at\nthe top level of the record, deliberately: the object is meant to be\nquotable on its own.",
+          "properties": {
+            "clobbers": {
+              "description": "CLS-09 `clobbers`: registers written with a value the payload does\nNOT decide. A clobber is not \"unusable\" — `mov rdi, rax ; ret`\nclobbers rdi and tells you to control rax instead — but it is what\n`no_clobber` rejects.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "reads": {
+              "description": "Registers read (`regs_read`): the inputs that must already hold what\nyou want.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "sets": {
+              "description": "CLS-09 `sets`: registers this gadget writes with a value the chain\nPAYLOAD decides. This is what `set_reg` matches, and it is a strict\nsubset of `regs_written` — `xor rdi, rdi ; ret` writes rdi and sets\nnothing.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "stack_delta": {
+              "description": "Net stack-pointer movement in bytes, terminator included. `null`\nmeans UNKNOWN (a non-constant effect, an unmodelled form, or the\ntext classification path) and must never be read as zero.",
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "terminator": {
+              "description": "CLS-09 terminator class: `ret`, `ret-imm`, `jmp-reg`, `jmp-mem`,\n`call-reg`, `call-mem`, `syscall`, `far`, `other`. Finer than the\nrecord's `terminator`, and the spelling the `terminator` filter\naccepts.",
+              "type": "string"
+            },
+            "why": {
+              "description": "One sentence naming the payload offset each set register comes from,\nwhat is clobbered, the stack movement and the terminator.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sets",
+            "reads",
+            "clobbers",
+            "terminator",
+            "why"
+          ],
+          "type": "object"
+        },
+        "GadgetRecord": {
+          "additionalProperties": false,
+          "description": "One gadget, in the shape every gadget-returning tool emits.\n\nInvariant: the field set does not depend on the request. A gadget from a\nscan with no `section` parameter carries `\"section\": null`, not a missing\nkey; an x86-64 ELF carries `\"arch\": null` and `\"delay_slot\": false`, not\nnothing at all. `tests/schema_conformance.rs` asserts the four shapes\nthat used to differ — plain, `section=.text`, MIPS, and the fat Mach-O —\nhave identical key sets.",
+          "properties": {
+            "arch": {
+              "description": "Fat Mach-O slice this gadget came from; `null` for every other\ncontainer.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "bytes": {
+              "description": "Gadget bytes, lowercase hex.",
+              "type": "string"
+            },
+            "class": {
+              "description": "Primary class (`reg-write`, `stack-pivot`, `mem-read`, `mem-write`,\n`arithmetic`, `syscall`, `dispatcher`, `other`); `null` when the\narchitecture has no classifier.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "delay_slot": {
+              "description": "MIPS/SPARC: the LAST instruction is the branch's delay slot, so it\nexecutes **before** control transfers. `rf_scan` has always computed\nthis and every output boundary dropped it.",
+              "type": "boolean"
+            },
+            "dispatcher": {
+              "description": "JOP/COP dispatcher heuristic.",
+              "type": "boolean"
+            },
+            "explanation": {
+              "$ref": "#/$defs/Explanation",
+              "description": "ECO-01: why this gadget is here, in the query's own vocabulary."
+            },
+            "id": {
+              "description": "Stable identity: `g_` + base32 of the first 10 bytes of\n`blake3(binary_sha256 || vaddr_le || bytes)`. Independent of every\nscan parameter, so the same gadget has the same id across calls,\nprocesses and cache evictions. Pass a list of these to\n`get_gadgets`.",
+              "type": "string"
+            },
+            "insns": {
+              "description": "The instructions, already split.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "labels": {
+              "description": "Every class the gadget earns, not just the primary one.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "low_confidence": {
+              "description": "The classification came from disassembly text rather than decoder\nmetadata, so treat the semantic fields as advisory.",
+              "type": "boolean"
+            },
+            "privileged": {
+              "description": "Contains a privileged or undefined instruction, so it faults in user\nmode and cannot appear in a chain.",
+              "type": "boolean"
+            },
+            "quality": {
+              "description": "TAXONOMY.md R12 quality score, higher is cleaner.",
+              "format": "int32",
+              "type": "integer"
+            },
+            "regs_from_stack": {
+              "description": "The subset of `regs_written` loaded off the stack — the registers a\nchain payload can actually control.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "regs_read": {
+              "description": "Registers the gadget reads.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "regs_written": {
+              "description": "Registers the gadget writes, lowercase and sigil-free.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "section": {
+              "description": "Section containing the gadget; `null` when no `section` filter was\napplied (the scan then has no section table to consult).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "side_effects": {
+              "description": "Instructions that earn at least one label.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stack_delta": {
+              "description": "Net change to the stack pointer, in bytes, with the terminator's\nown pop included — `pop rdi ; ret` is 16 on x86-64. CLS-09 landed\nthe computation in v0.4; the field existed (always `null`) in v0.3\nso the record shape would not change when it did.\n\n`null` is UNKNOWN, not zero: a non-constant effect (`xchg rsp,\nrax`), an architecture or instruction form the model does not prove,\nor a gadget classified from text. `max_stack_delta` rejects it\nrather than assuming.",
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "terminator": {
+              "description": "How the gadget hands control on: `ret`, `ret-imm`, `retf`, `iret`,\n`far`, `jmp`, `call`, `syscall`, `none`.",
+              "type": "string"
+            },
+            "text": {
+              "description": "`insns.join(\" ; \")`.",
+              "type": "string"
+            },
+            "usability": {
+              "description": "Usability tier 0..=3 — the primary key of the default `rank` order.\n3 = bare return plus a stack-loaded register; 2 = bare return;\n1 = needs a dispatcher or a stack fix-up, or nothing was identified;\n0 = privileged, or pure control flow.",
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "vaddr": {
+              "description": "Zero-padded hex address, for humans. The padding width is 8 on a\n32-bit target and 16 on a 64-bit one, which is why `vaddr_u64`\nexists.",
+              "type": "string"
+            },
+            "vaddr_u64": {
+              "description": "The same address as a number. Agents doing arithmetic should use\nthis and never parse `vaddr`.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id",
+            "vaddr",
+            "vaddr_u64",
+            "bytes",
+            "text",
+            "insns",
+            "delay_slot",
+            "labels",
+            "regs_written",
+            "regs_read",
+            "regs_from_stack",
+            "side_effects",
+            "quality",
+            "usability",
+            "terminator",
+            "dispatcher",
+            "privileged",
+            "low_confidence",
+            "explanation"
           ],
           "type": "object"
         },
@@ -875,6 +1827,24 @@
             "null"
           ]
         },
+        "max_stack_delta": {
+          "description": "ECO-01: keep only gadgets whose net stack movement is KNOWN and at\nmost this many bytes (the terminator's own pop included, so\n`pop rdi ; ret` is 16 on x86-64). A gadget whose delta is unknown is\nREJECTED, never assumed to be 0.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "no_clobber": {
+          "description": "ECO-01: none of these registers may be CLOBBERED — written with a\nvalue the payload does not decide. Matched against the classifier's\n`clobbers`, NOT `regs_written`: `pop rdi ; ret` survives\n`no_clobber: [\"rdi\"]` and `mov rdi, rax ; ret` does not. Elements\nmay also be comma-separated.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "offset": {
           "description": "Offset added to gadget addresses after any rebase (hex string).",
           "type": [
@@ -893,6 +1863,13 @@
           "description": "Result ordering, applied BEFORE paging. \"rank\" (the default) is\nusability tier, then quality, then fewest instructions, then fewest\nside effects, then address — it is what puts `pop rdi ; ret` at the\ntop instead of `adc al, 0x89 ; retf 0xc281`. Also \"address\",\n\"quality\" and \"text\" (the pre-0.3 default). Anything else is\nrejected with the valid set in the error.",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "pivot": {
+          "description": "ECO-12: the stack-pivot preset — keep only gadgets carrying the\n`stack-pivot` label.",
+          "type": [
+            "boolean",
             "null"
           ]
         },
@@ -917,8 +1894,22 @@
             "null"
           ]
         },
+        "search": {
+          "description": "ECO-01: ropper-style wildcard matcher over the instruction\nSEQUENCE, e.g. \"pop rdi; ret\". `?` is one character, `%` is any run\ninside one instruction (so a bare `%` is any single instruction).\nThe instructions must appear as a contiguous run, so\n\"pop rdi; ret\" also matches \"xor eax, eax ; pop rdi ; ret\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "section": {
           "description": "Executable section name(s) to scan; comma-separated, `*` globbing\n(e.g. \".text\" or \".init*,.plt\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "set_reg": {
+          "description": "ECO-01: keep only gadgets that SET all of these registers — write\nthem with a value the chain PAYLOAD decides. Strictly stronger than\n`writes_reg`: `xor rdi, rdi ; ret` writes rdi and sets nothing.",
           "type": [
             "string",
             "null"
@@ -932,7 +1923,7 @@
           ]
         },
         "terminator": {
-          "description": "Keep only gadgets with this terminator kind: \"ret\" (every returning\nform), \"jmp\", \"call\", \"syscall\", \"none\", or \"any\".",
+          "description": "Keep only gadgets with this terminator. Comma-separated any-of,\ncase-insensitive: the coarse kind \"ret\"\n(every returning form), \"jmp\", \"call\", \"syscall\", \"none\", \"any\"\n(no constraint), or a CLS-09 class -- \"bare-ret\" (the plain near\nreturn, which coarse \"ret\" is a superset of), \"ret-imm\",\n\"jmp-reg\", \"jmp-mem\", \"call-reg\", \"call-mem\", \"far\", \"other\".",
           "type": [
             "string",
             "null"
@@ -963,6 +1954,57 @@
     "name": "find_jop_gadgets",
     "outputSchema": {
       "$defs": {
+        "Explanation": {
+          "additionalProperties": false,
+          "description": "ECO-01: why this gadget is in the answer, in the vocabulary the query\nwas written in.\n\nThe point is that an agent can justify a choice — to itself, to a user,\nor in a chain plan — WITHOUT re-deriving semantics from gadget text.\nRe-derivation from text is what the whole classifier exists to prevent,\nand it is where an agent silently gets `mov rdi, rax ; ret` wrong.\n\nIt repeats `reads`, `stack_delta` and `terminator`, which also appear at\nthe top level of the record, deliberately: the object is meant to be\nquotable on its own.",
+          "properties": {
+            "clobbers": {
+              "description": "CLS-09 `clobbers`: registers written with a value the payload does\nNOT decide. A clobber is not \"unusable\" — `mov rdi, rax ; ret`\nclobbers rdi and tells you to control rax instead — but it is what\n`no_clobber` rejects.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "reads": {
+              "description": "Registers read (`regs_read`): the inputs that must already hold what\nyou want.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "sets": {
+              "description": "CLS-09 `sets`: registers this gadget writes with a value the chain\nPAYLOAD decides. This is what `set_reg` matches, and it is a strict\nsubset of `regs_written` — `xor rdi, rdi ; ret` writes rdi and sets\nnothing.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "stack_delta": {
+              "description": "Net stack-pointer movement in bytes, terminator included. `null`\nmeans UNKNOWN (a non-constant effect, an unmodelled form, or the\ntext classification path) and must never be read as zero.",
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "terminator": {
+              "description": "CLS-09 terminator class: `ret`, `ret-imm`, `jmp-reg`, `jmp-mem`,\n`call-reg`, `call-mem`, `syscall`, `far`, `other`. Finer than the\nrecord's `terminator`, and the spelling the `terminator` filter\naccepts.",
+              "type": "string"
+            },
+            "why": {
+              "description": "One sentence naming the payload offset each set register comes from,\nwhat is clobbered, the stack movement and the terminator.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sets",
+            "reads",
+            "clobbers",
+            "terminator",
+            "why"
+          ],
+          "type": "object"
+        },
         "GadgetRecord": {
           "additionalProperties": false,
           "description": "One gadget, in the shape every gadget-returning tool emits.\n\nInvariant: the field set does not depend on the request. A gadget from a\nscan with no `section` parameter carries `\"section\": null`, not a missing\nkey; an x86-64 ELF carries `\"arch\": null` and `\"delay_slot\": false`, not\nnothing at all. `tests/schema_conformance.rs` asserts the four shapes\nthat used to differ — plain, `section=.text`, MIPS, and the fat Mach-O —\nhave identical key sets.",
@@ -992,6 +2034,10 @@
             "dispatcher": {
               "description": "JOP/COP dispatcher heuristic.",
               "type": "boolean"
+            },
+            "explanation": {
+              "$ref": "#/$defs/Explanation",
+              "description": "ECO-01: why this gadget is here, in the query's own vocabulary."
             },
             "id": {
               "description": "Stable identity: `g_` + base32 of the first 10 bytes of\n`blake3(binary_sha256 || vaddr_le || bytes)`. Independent of every\nscan parameter, so the same gadget has the same id across calls,\nprocesses and cache evictions. Pass a list of these to\n`get_gadgets`.",
@@ -1059,7 +2105,7 @@
               "type": "integer"
             },
             "stack_delta": {
-              "description": "Net change to the stack pointer. **Always `null` in v0.3**: the\ncomputation is ECO-07/CLS-09 and lands in v0.4. The field is here\nnow so the record shape does not change when it does.",
+              "description": "Net change to the stack pointer, in bytes, with the terminator's\nown pop included — `pop rdi ; ret` is 16 on x86-64. CLS-09 landed\nthe computation in v0.4; the field existed (always `null`) in v0.3\nso the record shape would not change when it did.\n\n`null` is UNKNOWN, not zero: a non-constant effect (`xchg rsp,\nrax`), an architecture or instruction form the model does not prove,\nor a gadget classified from text. `max_stack_delta` rejects it\nrather than assuming.",
               "format": "int64",
               "type": [
                 "integer",
@@ -1110,7 +2156,8 @@
             "terminator",
             "dispatcher",
             "privileged",
-            "low_confidence"
+            "low_confidence",
+            "explanation"
           ],
           "type": "object"
         },
@@ -1262,6 +2309,303 @@
         "cache",
         "cache_key",
         "fallback_section_names",
+        "warnings"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Find a string in the binary's MAPPED DATA sections — where \"/bin/sh\" lives, and at what address. `string` is a BYTE regex (ROPgadget's --string semantics), so \"/bin/sh\" is a literal and \"m..n\" matches four bytes. Set memstr:true for ROPgadget's --memstr instead: each CHARACTER is located separately and only its first occurrence is reported, searching executable sections before data ones, which is how you assemble a string the binary does not contain contiguously. Each hit gives vaddr, section, length, an escaped preview, the raw hex, and whether the section is writable and executable — `writable` is what tells you an address is usable as scratch space. SCOPE, and it is enforced rather than promised: only bytes inside sections the loader MAPS are ever examined. There is no file-offset mode; headers, symbol and string tables and debug data are unreachable because they are in no mapped section, and `range` can only narrow the windows. `sections_searched` in the response names exactly what was read. Paged with next_cursor; a paged result also names an NDJSON resource.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "arch": {
+          "description": "Architecture slice for a fat (Universal) Mach-O. REQUIRED for a\nmulti-slice container, whose slices' addresses overlap.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base": {
+          "description": "Rebase the image base before reporting addresses (hex string, e.g.\n\"0x400000\"; \"0\" for RVAs).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "binary_path": {
+          "description": "Absolute path to the binary; must be inside one of the server's\nallow_roots (get_server_config lists them).",
+          "type": "string"
+        },
+        "cursor": {
+          "description": "`next_cursor` from a previous page of THIS query.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_results": {
+          "description": "Maximum hits returned per page (default 1000, hard max 50000).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "memstr": {
+          "description": "ROPgadget's `--memstr` instead of `--string`: locate each CHARACTER\nof `string` separately and report only the FIRST place each one\noccurs, searching executable sections before data ones. This is how\nyou assemble a string you cannot find contiguously. Default false.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Offset added to reported addresses after any rebase (hex string).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "range": {
+          "description": "Restrict the search to this address range, \"0xSTART-0xEND\". It can\nonly ever NARROW the mapped windows, never widen them.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "string": {
+          "description": "The pattern, as a BYTE regex (ROPgadget's `--string` semantics), so\n\"/bin/sh\" is a literal and \"m..n\" is four bytes. Matched only\nagainst MAPPED sections.",
+          "type": "string"
+        },
+        "timeout_secs": {
+          "description": "Per-request timeout in seconds (default 60, max 300).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "binary_path",
+        "string"
+      ],
+      "type": "object"
+    },
+    "name": "find_string",
+    "outputSchema": {
+      "$defs": {
+        "Hit": {
+          "additionalProperties": false,
+          "description": "One match, in the shape ECO-02 asks for.",
+          "properties": {
+            "bytes": {
+              "description": "The matched bytes, lowercase hex. Same cap as `preview`.",
+              "type": "string"
+            },
+            "executable": {
+              "description": "Is the containing section executable at runtime?",
+              "type": "boolean"
+            },
+            "length": {
+              "description": "Length of the match in bytes.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "matched_char": {
+              "description": "`memstr` only: the character this hit locates. `null` in every other\nmode — the field is always present, so one parser reads every\nresponse.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "preview": {
+              "description": "The matched bytes, printable-escaped: printable ASCII verbatim,\neverything else as `\\xNN` (and `\\\\` for a literal backslash), so the\nvalue is safe to print and unambiguous to parse. Capped at\n[`MAX_PREVIEW_BYTES`] source bytes.",
+              "type": "string"
+            },
+            "section": {
+              "description": "Name of the mapped section the match lies in. `null` only for a\ncontainer whose sections are unnamed (a raw blob), never because\nthe match was outside one — a match outside a section cannot exist.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "vaddr": {
+              "description": "Zero-padded hex address, padded to the target's pointer width.",
+              "type": "string"
+            },
+            "vaddr_u64": {
+              "description": "The same address as a number; do arithmetic on this, never on\n`vaddr`.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "writable": {
+              "description": "Is the containing section writable at runtime? This is the field\nthat decides whether an address is usable as a scratch buffer.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "vaddr",
+            "vaddr_u64",
+            "length",
+            "preview",
+            "bytes",
+            "writable",
+            "executable"
+          ],
+          "type": "object"
+        },
+        "Warning": {
+          "additionalProperties": false,
+          "description": "A non-fatal fact the agent has to know to read the result correctly\n(CRIT-03 item 4).\n\n`fallback_section_names` used to be a bare boolean with no explanation,\nand truncation was announced nowhere at all. Every entry has a stable\n`code` to branch on and a `message` to show a human.",
+          "properties": {
+            "code": {
+              "description": "Stable machine-readable tag: `low_confidence_classification`,\n`fallback_section_names`, `universal_slice_selected`, `truncated`,\n`sections_truncated`, `imports_truncated`, `ids_not_found`,\n`unmapped_info_fields`.",
+              "type": "string"
+            },
+            "detail": {
+              "description": "Free-form detail (the slice name, the architecture, …).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "field": {
+              "description": "The response field the warning is about, when it is about one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "Human-readable explanation.",
+              "type": "string"
+            },
+            "returned": {
+              "description": "Entries returned in that field.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "total": {
+              "description": "Entries that exist.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "binary_label": {
+          "description": "The binary's path relative to its allow root.",
+          "type": "string"
+        },
+        "binary_sha256": {
+          "description": "SHA-256 of the analysed file.",
+          "type": "string"
+        },
+        "hits": {
+          "description": "This page of matches.",
+          "items": {
+            "$ref": "#/$defs/Hit"
+          },
+          "type": "array"
+        },
+        "mode": {
+          "description": "`string`, `memstr` or `opcode` — which search ran.",
+          "type": "string"
+        },
+        "next_cursor": {
+          "description": "Opaque token for the next page; `null` on the last one. Send it back\nas `cursor` with the SAME query parameters.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Index of this page's first match within the ordered result.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "query": {
+          "description": "The pattern, echoed as given.",
+          "type": "string"
+        },
+        "resource_uri": {
+          "description": "`ropfinder://search/<key>/hits.ndjson` — the whole match set, one\n`Hit` per line, readable with `resources/read`. Present only when\nthe result was paged.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "returned": {
+          "description": "Matches in this page.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sections_searched": {
+          "description": "The MAPPED sections this search actually read, in order — the\nconfinement claim in the tool description, made checkable in the\nresponse. Nothing outside these windows was examined.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "total_count": {
+          "description": "Matches before paging.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncated": {
+          "description": "`total_count > offset + returned`.",
+          "type": "boolean"
+        },
+        "warnings": {
+          "description": "Non-fatal facts. Always present; `[]` when there are none.",
+          "items": {
+            "$ref": "#/$defs/Warning"
+          },
+          "type": "array"
+        },
+        "workspace_file": {
+          "description": "The same NDJSON as a real file, when the server was started with\n`--workspace-dir`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "hits",
+        "mode",
+        "query",
+        "total_count",
+        "returned",
+        "offset",
+        "truncated",
+        "sections_searched",
+        "binary_sha256",
+        "binary_label",
         "warnings"
       ],
       "type": "object"
@@ -1361,6 +2705,24 @@
             "null"
           ]
         },
+        "max_stack_delta": {
+          "description": "ECO-01: keep only gadgets whose net stack movement is KNOWN and at\nmost this many bytes (the terminator's own pop included, so\n`pop rdi ; ret` is 16 on x86-64). A gadget whose delta is unknown is\nREJECTED, never assumed to be 0.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "no_clobber": {
+          "description": "ECO-01: none of these registers may be CLOBBERED — written with a\nvalue the payload does not decide. Matched against the classifier's\n`clobbers`, NOT `regs_written`: `pop rdi ; ret` survives\n`no_clobber: [\"rdi\"]` and `mov rdi, rax ; ret` does not. Elements\nmay also be comma-separated.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "offset": {
           "description": "Offset added to gadget addresses after any rebase (hex string).",
           "type": [
@@ -1379,6 +2741,13 @@
           "description": "Result ordering, applied BEFORE paging. \"rank\" (the default) is\nusability tier, then quality, then fewest instructions, then fewest\nside effects, then address — it is what puts `pop rdi ; ret` at the\ntop instead of `adc al, 0x89 ; retf 0xc281`. Also \"address\",\n\"quality\" and \"text\" (the pre-0.3 default). Anything else is\nrejected with the valid set in the error.",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "pivot": {
+          "description": "ECO-12: the stack-pivot preset — keep only gadgets carrying the\n`stack-pivot` label.",
+          "type": [
+            "boolean",
             "null"
           ]
         },
@@ -1403,8 +2772,22 @@
             "null"
           ]
         },
+        "search": {
+          "description": "ECO-01: ropper-style wildcard matcher over the instruction\nSEQUENCE, e.g. \"pop rdi; ret\". `?` is one character, `%` is any run\ninside one instruction (so a bare `%` is any single instruction).\nThe instructions must appear as a contiguous run, so\n\"pop rdi; ret\" also matches \"xor eax, eax ; pop rdi ; ret\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "section": {
           "description": "Executable section name(s) to scan; comma-separated, `*` globbing\n(e.g. \".text\" or \".init*,.plt\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "set_reg": {
+          "description": "ECO-01: keep only gadgets that SET all of these registers — write\nthem with a value the chain PAYLOAD decides. Strictly stronger than\n`writes_reg`: `xor rdi, rdi ; ret` writes rdi and sets nothing.",
           "type": [
             "string",
             "null"
@@ -1418,7 +2801,7 @@
           ]
         },
         "terminator": {
-          "description": "Keep only gadgets with this terminator kind: \"ret\" (every returning\nform), \"jmp\", \"call\", \"syscall\", \"none\", or \"any\".",
+          "description": "Keep only gadgets with this terminator. Comma-separated any-of,\ncase-insensitive: the coarse kind \"ret\"\n(every returning form), \"jmp\", \"call\", \"syscall\", \"none\", \"any\"\n(no constraint), or a CLS-09 class -- \"bare-ret\" (the plain near\nreturn, which coarse \"ret\" is a superset of), \"ret-imm\",\n\"jmp-reg\", \"jmp-mem\", \"call-reg\", \"call-mem\", \"far\", \"other\".",
           "type": [
             "string",
             "null"
@@ -1449,6 +2832,57 @@
     "name": "find_syscall_gadgets",
     "outputSchema": {
       "$defs": {
+        "Explanation": {
+          "additionalProperties": false,
+          "description": "ECO-01: why this gadget is in the answer, in the vocabulary the query\nwas written in.\n\nThe point is that an agent can justify a choice — to itself, to a user,\nor in a chain plan — WITHOUT re-deriving semantics from gadget text.\nRe-derivation from text is what the whole classifier exists to prevent,\nand it is where an agent silently gets `mov rdi, rax ; ret` wrong.\n\nIt repeats `reads`, `stack_delta` and `terminator`, which also appear at\nthe top level of the record, deliberately: the object is meant to be\nquotable on its own.",
+          "properties": {
+            "clobbers": {
+              "description": "CLS-09 `clobbers`: registers written with a value the payload does\nNOT decide. A clobber is not \"unusable\" — `mov rdi, rax ; ret`\nclobbers rdi and tells you to control rax instead — but it is what\n`no_clobber` rejects.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "reads": {
+              "description": "Registers read (`regs_read`): the inputs that must already hold what\nyou want.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "sets": {
+              "description": "CLS-09 `sets`: registers this gadget writes with a value the chain\nPAYLOAD decides. This is what `set_reg` matches, and it is a strict\nsubset of `regs_written` — `xor rdi, rdi ; ret` writes rdi and sets\nnothing.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "stack_delta": {
+              "description": "Net stack-pointer movement in bytes, terminator included. `null`\nmeans UNKNOWN (a non-constant effect, an unmodelled form, or the\ntext classification path) and must never be read as zero.",
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "terminator": {
+              "description": "CLS-09 terminator class: `ret`, `ret-imm`, `jmp-reg`, `jmp-mem`,\n`call-reg`, `call-mem`, `syscall`, `far`, `other`. Finer than the\nrecord's `terminator`, and the spelling the `terminator` filter\naccepts.",
+              "type": "string"
+            },
+            "why": {
+              "description": "One sentence naming the payload offset each set register comes from,\nwhat is clobbered, the stack movement and the terminator.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sets",
+            "reads",
+            "clobbers",
+            "terminator",
+            "why"
+          ],
+          "type": "object"
+        },
         "GadgetRecord": {
           "additionalProperties": false,
           "description": "One gadget, in the shape every gadget-returning tool emits.\n\nInvariant: the field set does not depend on the request. A gadget from a\nscan with no `section` parameter carries `\"section\": null`, not a missing\nkey; an x86-64 ELF carries `\"arch\": null` and `\"delay_slot\": false`, not\nnothing at all. `tests/schema_conformance.rs` asserts the four shapes\nthat used to differ — plain, `section=.text`, MIPS, and the fat Mach-O —\nhave identical key sets.",
@@ -1478,6 +2912,10 @@
             "dispatcher": {
               "description": "JOP/COP dispatcher heuristic.",
               "type": "boolean"
+            },
+            "explanation": {
+              "$ref": "#/$defs/Explanation",
+              "description": "ECO-01: why this gadget is here, in the query's own vocabulary."
             },
             "id": {
               "description": "Stable identity: `g_` + base32 of the first 10 bytes of\n`blake3(binary_sha256 || vaddr_le || bytes)`. Independent of every\nscan parameter, so the same gadget has the same id across calls,\nprocesses and cache evictions. Pass a list of these to\n`get_gadgets`.",
@@ -1545,7 +2983,7 @@
               "type": "integer"
             },
             "stack_delta": {
-              "description": "Net change to the stack pointer. **Always `null` in v0.3**: the\ncomputation is ECO-07/CLS-09 and lands in v0.4. The field is here\nnow so the record shape does not change when it does.",
+              "description": "Net change to the stack pointer, in bytes, with the terminator's\nown pop included — `pop rdi ; ret` is 16 on x86-64. CLS-09 landed\nthe computation in v0.4; the field existed (always `null`) in v0.3\nso the record shape would not change when it did.\n\n`null` is UNKNOWN, not zero: a non-constant effect (`xchg rsp,\nrax`), an architecture or instruction form the model does not prove,\nor a gadget classified from text. `max_stack_delta` rejects it\nrather than assuming.",
               "format": "int64",
               "type": [
                 "integer",
@@ -1596,7 +3034,8 @@
             "terminator",
             "dispatcher",
             "privileged",
-            "low_confidence"
+            "low_confidence",
+            "explanation"
           ],
           "type": "object"
         },
@@ -1754,7 +3193,7 @@
     }
   },
   {
-    "description": "Get binary metadata as JSON: format, arch, endianness, addr_size, image_base, entry, sections (name/vaddr/size/executable/writable), PE imports (iat_vaddr is the IAT slot the loader patches; hint_name_vaddr is the IMAGE_IMPORT_BY_NAME record), fat Mach-O slices, binary_sha256 and warnings. The shape is fixed: an ELF reports slices: [] and a fat Mach-O reports sections: []. No scan is performed. Bounded like every other tool: timeout_secs (default 60), --max-file-bytes, and max_sections/max_imports (default 4096 each) — a truncated array is announced in warnings, never silently short.",
+    "description": "Get binary metadata as JSON: format, arch, endianness, addr_size, image_base, entry, sections (name/vaddr/size/executable/writable), PE imports (iat_vaddr is the IAT slot the loader patches; hint_name_vaddr is the IMAGE_IMPORT_BY_NAME record; an ELF import instead carries addr/got/plt/type/binding, which         is what a ret2plt chain resolves against), the ELF symbol table (`symbols`, OPT-IN: pass max_symbols to get it; symbol_count is always the true total, and null means this format's symbols are not read at all), fat Mach-O slices,         binary_sha256 and warnings. The shape is fixed: an ELF reports slices: [] and a fat Mach-O reports sections: []. Exploit mitigations are NOT here: call get_mitigations, which types them and keeps the loader's order. No scan is performed. Bounded like every other tool: timeout_secs (default 60), --max-file-bytes, and max_sections/max_imports (default 4096 each) and max_symbols (default 0, max 4096) — a truncated array is announced in warnings, never silently short.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -1787,6 +3226,15 @@
             "null"
           ]
         },
+        "max_symbols": {
+          "description": "Maximum ELF symbols reported. Symbols are OPT-IN: the default is 0\nbecause a symbol table is unbounded by the file's structure (2169 on\nelf-Linux-x64) where `sections` and `imports` are not, and returning\nit by default cost 80k tokens on the first call of a task. Pass a\nnumber to get them, up to max_info_items (4096). `symbol_count`\nalways reports the true total and `warnings` carries\n`symbols_truncated`, so a short list is never indistinguishable from\na binary with few symbols. `imports` is NOT affected by this.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "timeout_secs": {
           "description": "Per-request timeout in seconds (default 60, max 300).",
           "format": "uint64",
@@ -1808,26 +3256,69 @@
         "ImportRecord": {
           "additionalProperties": false,
           "properties": {
+            "addr": {
+              "description": "ELF only: the symbol's own `st_value`, rebased. `null` when it is 0,\nwhich is \"no address\" rather than \"address 0\" — the psABI puts a PLT\nstub here on ARM/AArch64/SPARC/RISC-V and nothing on x86/x64/PPC.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "binding": {
+              "description": "ELF only: `STB_*` as a name — `global`, `weak`, `local`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "dll": {
-              "type": "string"
+              "description": "PE only: the DLL the symbol comes from. `null` on an ELF, which has\nno per-symbol library name — the loader resolves by name across the\nwhole `DT_NEEDED` set.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "got": {
+              "description": "ELF only: the `DT_JMPREL` relocation slot — the GOT cell this symbol\nis written into. An exact relocation field, not a guess.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "hint_name_vaddr": {
-              "description": "The `IMAGE_IMPORT_BY_NAME` record holding the name string.",
-              "type": "string"
+              "description": "PE only: the `IMAGE_IMPORT_BY_NAME` record holding the name string.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "iat_vaddr": {
-              "description": "CHWIN-03: the IAT slot the loader patches. Dereference this.",
-              "type": "string"
+              "description": "PE only: the IAT slot the loader patches — dereference this. `null`\non an ELF (`got` is the equivalent).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "plt": {
+              "description": "ELF only: the PLT stub, reported ONLY when it is provable from a\nbyte-exact `.plt`/`.plt.sec` layout or an `st_value` that lands\ninside `.plt`. `null` everywhere else, because a wrong PLT address\nsilently produces a chain that jumps into the middle of a stub.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sym_type": {
+              "description": "ELF only: `STT_*` as a name — `func`, `object`, `notype`, `ifunc`.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "symbol": {
+              "description": "The symbol name. Present for every format.",
               "type": "string"
             }
           },
           "required": [
-            "dll",
-            "symbol",
-            "iat_vaddr",
-            "hint_name_vaddr"
+            "symbol"
           ],
           "type": "object"
         },
@@ -1932,12 +3423,90 @@
                 "integer",
                 "null"
               ]
+            },
+            "symbol_count": {
+              "description": "Same meaning as [`InfoResponse::symbol_count`], per slice.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "symbols": {
+              "description": "Same meaning as [`InfoResponse::symbols`], per slice.",
+              "items": {
+                "$ref": "#/$defs/SymbolRecord"
+              },
+              "type": "array"
             }
           },
           "required": [
             "format",
             "sections",
-            "imports"
+            "imports",
+            "symbols"
+          ],
+          "type": "object"
+        },
+        "SymbolRecord": {
+          "additionalProperties": false,
+          "description": "One symbol from an ELF's `.dynsym` or `.symtab` (ECO-06).\n\nThis is the ret2plt/ret2libc working set: without it, resolving\n`system` in a target meant leaving rop-finder for a second tool.",
+          "properties": {
+            "addr": {
+              "description": "`st_value`, rebased. `null` when it is 0 — \"no address\", not\n\"address 0\".",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "binding": {
+              "description": "`STB_*` as a name: `local`, `global`, `weak`.",
+              "type": "string"
+            },
+            "got": {
+              "description": "The `DT_JMPREL` GOT slot, when this symbol has one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "is_import": {
+              "description": "`st_shndx == SHN_UNDEF` — an import, i.e. something the loader will\nresolve elsewhere.",
+              "type": "boolean"
+            },
+            "name": {
+              "description": "Symbol name; never empty (unnamed entries are dropped by the\nloader).",
+              "type": "string"
+            },
+            "plt": {
+              "description": "The PLT stub, when it is provable.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "size": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "sym_type": {
+              "description": "`STT_*` as a name: `notype`, `object`, `func`, `section`, `file`,\n`common`, `tls`, `ifunc`.",
+              "type": "string"
+            },
+            "table": {
+              "description": "Which table it came from: `dynsym` or `symtab`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "size",
+            "sym_type",
+            "binding",
+            "table",
+            "is_import"
           ],
           "type": "object"
         },
@@ -2067,6 +3636,22 @@
           },
           "type": "array"
         },
+        "symbol_count": {
+          "description": "How many symbols the parser found BEFORE `max_symbols` truncation,\nor `null` when this format's symbols are not read at all. `0` and\n`null` are different answers and this field is the difference.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "symbols": {
+          "description": "ECO-06: the ELF symbol table (`.dynsym` first, then `.symtab`), which\nis what a ret2plt/ret2libc chain resolves against. `[]` for a format\nwhose symbols are not read — `symbol_count` is how you tell that\napart from \"this file has none\".",
+          "items": {
+            "$ref": "#/$defs/SymbolRecord"
+          },
+          "type": "array"
+        },
         "warnings": {
           "items": {
             "$ref": "#/$defs/Warning"
@@ -2079,6 +3664,7 @@
         "sections",
         "imports",
         "slices",
+        "symbols",
         "binary_sha256",
         "warnings"
       ],
@@ -2157,6 +3743,57 @@
     "name": "get_gadgets",
     "outputSchema": {
       "$defs": {
+        "Explanation": {
+          "additionalProperties": false,
+          "description": "ECO-01: why this gadget is in the answer, in the vocabulary the query\nwas written in.\n\nThe point is that an agent can justify a choice — to itself, to a user,\nor in a chain plan — WITHOUT re-deriving semantics from gadget text.\nRe-derivation from text is what the whole classifier exists to prevent,\nand it is where an agent silently gets `mov rdi, rax ; ret` wrong.\n\nIt repeats `reads`, `stack_delta` and `terminator`, which also appear at\nthe top level of the record, deliberately: the object is meant to be\nquotable on its own.",
+          "properties": {
+            "clobbers": {
+              "description": "CLS-09 `clobbers`: registers written with a value the payload does\nNOT decide. A clobber is not \"unusable\" — `mov rdi, rax ; ret`\nclobbers rdi and tells you to control rax instead — but it is what\n`no_clobber` rejects.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "reads": {
+              "description": "Registers read (`regs_read`): the inputs that must already hold what\nyou want.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "sets": {
+              "description": "CLS-09 `sets`: registers this gadget writes with a value the chain\nPAYLOAD decides. This is what `set_reg` matches, and it is a strict\nsubset of `regs_written` — `xor rdi, rdi ; ret` writes rdi and sets\nnothing.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "stack_delta": {
+              "description": "Net stack-pointer movement in bytes, terminator included. `null`\nmeans UNKNOWN (a non-constant effect, an unmodelled form, or the\ntext classification path) and must never be read as zero.",
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "terminator": {
+              "description": "CLS-09 terminator class: `ret`, `ret-imm`, `jmp-reg`, `jmp-mem`,\n`call-reg`, `call-mem`, `syscall`, `far`, `other`. Finer than the\nrecord's `terminator`, and the spelling the `terminator` filter\naccepts.",
+              "type": "string"
+            },
+            "why": {
+              "description": "One sentence naming the payload offset each set register comes from,\nwhat is clobbered, the stack movement and the terminator.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sets",
+            "reads",
+            "clobbers",
+            "terminator",
+            "why"
+          ],
+          "type": "object"
+        },
         "GadgetRecord": {
           "additionalProperties": false,
           "description": "One gadget, in the shape every gadget-returning tool emits.\n\nInvariant: the field set does not depend on the request. A gadget from a\nscan with no `section` parameter carries `\"section\": null`, not a missing\nkey; an x86-64 ELF carries `\"arch\": null` and `\"delay_slot\": false`, not\nnothing at all. `tests/schema_conformance.rs` asserts the four shapes\nthat used to differ — plain, `section=.text`, MIPS, and the fat Mach-O —\nhave identical key sets.",
@@ -2186,6 +3823,10 @@
             "dispatcher": {
               "description": "JOP/COP dispatcher heuristic.",
               "type": "boolean"
+            },
+            "explanation": {
+              "$ref": "#/$defs/Explanation",
+              "description": "ECO-01: why this gadget is here, in the query's own vocabulary."
             },
             "id": {
               "description": "Stable identity: `g_` + base32 of the first 10 bytes of\n`blake3(binary_sha256 || vaddr_le || bytes)`. Independent of every\nscan parameter, so the same gadget has the same id across calls,\nprocesses and cache evictions. Pass a list of these to\n`get_gadgets`.",
@@ -2253,7 +3894,7 @@
               "type": "integer"
             },
             "stack_delta": {
-              "description": "Net change to the stack pointer. **Always `null` in v0.3**: the\ncomputation is ECO-07/CLS-09 and lands in v0.4. The field is here\nnow so the record shape does not change when it does.",
+              "description": "Net change to the stack pointer, in bytes, with the terminator's\nown pop included — `pop rdi ; ret` is 16 on x86-64. CLS-09 landed\nthe computation in v0.4; the field existed (always `null`) in v0.3\nso the record shape would not change when it did.\n\n`null` is UNKNOWN, not zero: a non-constant effect (`xchg rsp,\nrax`), an architecture or instruction form the model does not prove,\nor a gadget classified from text. `max_stack_delta` rejects it\nrather than assuming.",
               "format": "int64",
               "type": [
                 "integer",
@@ -2304,7 +3945,8 @@
             "terminator",
             "dispatcher",
             "privileged",
-            "low_confidence"
+            "low_confidence",
+            "explanation"
           ],
           "type": "object"
         },
@@ -2456,6 +4098,225 @@
         "cache",
         "cache_key",
         "fallback_section_names",
+        "warnings"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Report the binary's exploit mitigations, so an agent can decide whether ROP is even the right technique before it scans. ELF: nx (PT_GNU_STACK), pie (ET_DYN + DF_1_PIE/PT_INTERP/DT_DEBUG, distinguishing a PIE executable from a shared object), relro, canary, fortify, rpath, runpath. PE: aslr, dep, high_entropy_va, guard_cf and cet_compat as SEPARATE answers read from separate directories (CFG validates indirect CALL targets and does NOT check a ret; only cet_compat means a shadow stack), safe_seh, force_integrity. Mach-O: pie, nx_stack, nx_heap, code_signature, hardened_runtime — per SLICE for a fat container, in `slices`, because the slices genuinely disagree. Every entry is {name, enabled, evidence, detail} where `enabled` is true, false, or the string \"unknown\" — never false standing in for \"could not tell\" — and `evidence` names the header field that decided it, or the one whose absence made it unknown. The order is the loader's and is meaningful; `name` is the stable key. No scan is performed.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "binary_path": {
+          "description": "Absolute path to the binary; must be inside one of the server's\nallow_roots (get_server_config lists them).",
+          "type": "string"
+        },
+        "timeout_secs": {
+          "description": "Per-request timeout in seconds (default 60, max 300).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "binary_path"
+      ],
+      "type": "object"
+    },
+    "name": "get_mitigations",
+    "outputSchema": {
+      "$defs": {
+        "EnabledValue": {
+          "anyOf": [
+            {
+              "description": "A header field decided it.",
+              "type": "boolean"
+            },
+            {
+              "$ref": "#/$defs/UnknownTag",
+              "description": "Nothing in the file decides it; `evidence` says why."
+            }
+          ],
+          "description": "`true` / `false` / `\"unknown\"` — the JSON contract ECO-06 names."
+        },
+        "MitigationRecord": {
+          "additionalProperties": false,
+          "description": "One mitigation, with the evidence that decided it.",
+          "properties": {
+            "detail": {
+              "description": "The refinement, from a closed vocabulary: `full`/`partial`/`none`\nfor relro, `pie-executable`/`shared-object`/`fixed-address-executable`\nfor pie, the `__*_chk` names for fortify, the GuardFlags word for\nguard_cf, the path for rpath/runpath.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "enabled": {
+              "$ref": "#/$defs/EnabledValue",
+              "description": "`true`, `false`, or `\"unknown\"` — never `false` standing in for\n\"could not tell\"."
+            },
+            "evidence": {
+              "description": "The header field that decided it, or the one whose absence made the\nanswer unknown. Never empty.",
+              "type": "string"
+            },
+            "name": {
+              "description": "The stable key: `nx`, `pie`, `relro`, `canary`, `fortify`, `rpath`,\n`runpath` (ELF); `aslr`, `dep`, `high_entropy_va`, `guard_cf`,\n`cet_compat`, `safe_seh`, `force_integrity` (PE); `pie`, `nx_stack`,\n`nx_heap`, `code_signature`, `hardened_runtime` (Mach-O).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "enabled",
+            "evidence"
+          ],
+          "type": "object"
+        },
+        "SliceMitigations": {
+          "additionalProperties": false,
+          "description": "One slice of a fat (Universal) Mach-O.",
+          "properties": {
+            "arch": {
+              "description": "rop-finder's arch spelling (`x64`), the one `find_gadgets` reports.",
+              "type": "string"
+            },
+            "mitigations": {
+              "description": "This slice's report, in loader order.",
+              "items": {
+                "$ref": "#/$defs/MitigationRecord"
+              },
+              "type": "array"
+            },
+            "slice": {
+              "description": "The Mach-O spelling (`x86_64`) — this is the value `arch` takes.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "arch",
+            "slice",
+            "mitigations"
+          ],
+          "type": "object"
+        },
+        "UnknownTag": {
+          "description": "The single string `\"unknown\"`.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "Warning": {
+          "additionalProperties": false,
+          "description": "A non-fatal fact the agent has to know to read the result correctly\n(CRIT-03 item 4).\n\n`fallback_section_names` used to be a bare boolean with no explanation,\nand truncation was announced nowhere at all. Every entry has a stable\n`code` to branch on and a `message` to show a human.",
+          "properties": {
+            "code": {
+              "description": "Stable machine-readable tag: `low_confidence_classification`,\n`fallback_section_names`, `universal_slice_selected`, `truncated`,\n`sections_truncated`, `imports_truncated`, `ids_not_found`,\n`unmapped_info_fields`.",
+              "type": "string"
+            },
+            "detail": {
+              "description": "Free-form detail (the slice name, the architecture, …).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "field": {
+              "description": "The response field the warning is about, when it is about one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "Human-readable explanation.",
+              "type": "string"
+            },
+            "returned": {
+              "description": "Entries returned in that field.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "total": {
+              "description": "Entries that exist.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "arch": {
+          "description": "rop-finder's arch spelling; `null` for a fat container, whose\nslices disagree.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "binary_label": {
+          "description": "The binary's path relative to its allow root — what the audit log\nrecords, never the caller's spelling.",
+          "type": "string"
+        },
+        "binary_sha256": {
+          "description": "SHA-256 of the analysed file.",
+          "type": "string"
+        },
+        "format": {
+          "description": "`elf`, `pe`, `macho`, `universal` or `raw`.",
+          "type": "string"
+        },
+        "mitigations": {
+          "description": "The report, in the loader's own order. Empty for a raw blob (see\n`note`) and for a fat Mach-O (see `slices`) — never empty because a\nmitigation was skipped.",
+          "items": {
+            "$ref": "#/$defs/MitigationRecord"
+          },
+          "type": "array"
+        },
+        "note": {
+          "description": "Why the report is EMPTY, when it is. `null` otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "slices": {
+          "description": "One report per slice of a fat Mach-O; `[]` for every other\ncontainer. The flags genuinely differ between slices.",
+          "items": {
+            "$ref": "#/$defs/SliceMitigations"
+          },
+          "type": "array"
+        },
+        "warnings": {
+          "description": "Non-fatal facts. Always present; `[]` when there are none.",
+          "items": {
+            "$ref": "#/$defs/Warning"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "format",
+        "mitigations",
+        "slices",
+        "binary_sha256",
+        "binary_label",
         "warnings"
       ],
       "type": "object"
@@ -2781,10 +4642,35 @@
             "null"
           ]
         },
+        "max_stack_delta": {
+          "description": "ECO-01: keep only gadgets whose net stack movement is KNOWN and at\nmost this many bytes (the terminator's own pop included, so\n`pop rdi ; ret` is 16 on x86-64). A gadget whose delta is unknown is\nREJECTED, never assumed to be 0.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "no_clobber": {
+          "description": "ECO-01: none of these registers may be CLOBBERED — written with a\nvalue the payload does not decide. Matched against the classifier's\n`clobbers`, NOT `regs_written`: `pop rdi ; ret` survives\n`no_clobber: [\"rdi\"]` and `mov rdi, rax ; ret` does not. Elements\nmay also be comma-separated.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "order": {
           "description": "Result ordering; see find_gadgets. Default \"rank\".",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "pivot": {
+          "description": "ECO-12: the stack-pivot preset — keep only gadgets carrying the\n`stack-pivot` label.",
+          "type": [
+            "boolean",
             "null"
           ]
         },
@@ -2802,8 +4688,22 @@
             "null"
           ]
         },
+        "search": {
+          "description": "ECO-01: ropper-style wildcard matcher over the instruction\nSEQUENCE, e.g. \"pop rdi; ret\". `?` is one character, `%` is any run\ninside one instruction (so a bare `%` is any single instruction).\nThe instructions must appear as a contiguous run, so\n\"pop rdi; ret\" also matches \"xor eax, eax ; pop rdi ; ret\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "set_reg": {
+          "description": "ECO-01: keep only gadgets that SET all of these registers — write\nthem with a value the chain PAYLOAD decides. Strictly stronger than\n`writes_reg`: `xor rdi, rdi ; ret` writes rdi and sets nothing.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "terminator": {
-          "description": "Terminator kind: \"ret\", \"jmp\", \"call\", \"syscall\", \"none\", \"any\".",
+          "description": "Terminator kind: \"ret\", \"jmp\", \"call\", \"syscall\", \"none\", \"any\",\nor a CLS-09 class (\"bare-ret\", \"ret-imm\", \"jmp-reg\", ...).",
           "type": [
             "string",
             "null"
@@ -2835,6 +4735,57 @@
     "name": "run_ropgadget_command",
     "outputSchema": {
       "$defs": {
+        "Explanation": {
+          "additionalProperties": false,
+          "description": "ECO-01: why this gadget is in the answer, in the vocabulary the query\nwas written in.\n\nThe point is that an agent can justify a choice — to itself, to a user,\nor in a chain plan — WITHOUT re-deriving semantics from gadget text.\nRe-derivation from text is what the whole classifier exists to prevent,\nand it is where an agent silently gets `mov rdi, rax ; ret` wrong.\n\nIt repeats `reads`, `stack_delta` and `terminator`, which also appear at\nthe top level of the record, deliberately: the object is meant to be\nquotable on its own.",
+          "properties": {
+            "clobbers": {
+              "description": "CLS-09 `clobbers`: registers written with a value the payload does\nNOT decide. A clobber is not \"unusable\" — `mov rdi, rax ; ret`\nclobbers rdi and tells you to control rax instead — but it is what\n`no_clobber` rejects.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "reads": {
+              "description": "Registers read (`regs_read`): the inputs that must already hold what\nyou want.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "sets": {
+              "description": "CLS-09 `sets`: registers this gadget writes with a value the chain\nPAYLOAD decides. This is what `set_reg` matches, and it is a strict\nsubset of `regs_written` — `xor rdi, rdi ; ret` writes rdi and sets\nnothing.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "stack_delta": {
+              "description": "Net stack-pointer movement in bytes, terminator included. `null`\nmeans UNKNOWN (a non-constant effect, an unmodelled form, or the\ntext classification path) and must never be read as zero.",
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "terminator": {
+              "description": "CLS-09 terminator class: `ret`, `ret-imm`, `jmp-reg`, `jmp-mem`,\n`call-reg`, `call-mem`, `syscall`, `far`, `other`. Finer than the\nrecord's `terminator`, and the spelling the `terminator` filter\naccepts.",
+              "type": "string"
+            },
+            "why": {
+              "description": "One sentence naming the payload offset each set register comes from,\nwhat is clobbered, the stack movement and the terminator.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sets",
+            "reads",
+            "clobbers",
+            "terminator",
+            "why"
+          ],
+          "type": "object"
+        },
         "GadgetRecord": {
           "additionalProperties": false,
           "description": "One gadget, in the shape every gadget-returning tool emits.\n\nInvariant: the field set does not depend on the request. A gadget from a\nscan with no `section` parameter carries `\"section\": null`, not a missing\nkey; an x86-64 ELF carries `\"arch\": null` and `\"delay_slot\": false`, not\nnothing at all. `tests/schema_conformance.rs` asserts the four shapes\nthat used to differ — plain, `section=.text`, MIPS, and the fat Mach-O —\nhave identical key sets.",
@@ -2864,6 +4815,10 @@
             "dispatcher": {
               "description": "JOP/COP dispatcher heuristic.",
               "type": "boolean"
+            },
+            "explanation": {
+              "$ref": "#/$defs/Explanation",
+              "description": "ECO-01: why this gadget is here, in the query's own vocabulary."
             },
             "id": {
               "description": "Stable identity: `g_` + base32 of the first 10 bytes of\n`blake3(binary_sha256 || vaddr_le || bytes)`. Independent of every\nscan parameter, so the same gadget has the same id across calls,\nprocesses and cache evictions. Pass a list of these to\n`get_gadgets`.",
@@ -2931,7 +4886,7 @@
               "type": "integer"
             },
             "stack_delta": {
-              "description": "Net change to the stack pointer. **Always `null` in v0.3**: the\ncomputation is ECO-07/CLS-09 and lands in v0.4. The field is here\nnow so the record shape does not change when it does.",
+              "description": "Net change to the stack pointer, in bytes, with the terminator's\nown pop included — `pop rdi ; ret` is 16 on x86-64. CLS-09 landed\nthe computation in v0.4; the field existed (always `null`) in v0.3\nso the record shape would not change when it did.\n\n`null` is UNKNOWN, not zero: a non-constant effect (`xchg rsp,\nrax`), an architecture or instruction form the model does not prove,\nor a gadget classified from text. `max_stack_delta` rejects it\nrather than assuming.",
               "format": "int64",
               "type": [
                 "integer",
@@ -2982,7 +4937,8 @@
             "terminator",
             "dispatcher",
             "privileged",
-            "low_confidence"
+            "low_confidence",
+            "explanation"
           ],
           "type": "object"
         },
@@ -3231,6 +5187,24 @@
             "null"
           ]
         },
+        "max_stack_delta": {
+          "description": "ECO-01: keep only gadgets whose net stack movement is KNOWN and at\nmost this many bytes (the terminator's own pop included, so\n`pop rdi ; ret` is 16 on x86-64). A gadget whose delta is unknown is\nREJECTED, never assumed to be 0.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "no_clobber": {
+          "description": "ECO-01: none of these registers may be CLOBBERED — written with a\nvalue the payload does not decide. Matched against the classifier's\n`clobbers`, NOT `regs_written`: `pop rdi ; ret` survives\n`no_clobber: [\"rdi\"]` and `mov rdi, rax ; ret` does not. Elements\nmay also be comma-separated.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "offset": {
           "description": "Offset added to gadget addresses (hex string).",
           "type": [
@@ -3248,6 +5222,13 @@
         "pattern": {
           "description": "Regex matched against gadget text (e.g. \"pop r.*; ret\"); if the\npattern is not a valid regex it is matched as a literal substring.",
           "type": "string"
+        },
+        "pivot": {
+          "description": "ECO-12: the stack-pivot preset — keep only gadgets carrying the\n`stack-pivot` label.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "preserves_regs": {
           "description": "Keep only gadgets that write NONE of these registers.",
@@ -3270,6 +5251,13 @@
             "null"
           ]
         },
+        "search": {
+          "description": "ECO-01: ropper-style wildcard matcher over the instruction\nSEQUENCE, e.g. \"pop rdi; ret\". `?` is one character, `%` is any run\ninside one instruction (so a bare `%` is any single instruction).\nThe instructions must appear as a contiguous run, so\n\"pop rdi; ret\" also matches \"xor eax, eax ; pop rdi ; ret\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "section": {
           "description": "Executable section name(s); comma-separated, `*` globbing.",
           "type": [
@@ -3277,8 +5265,15 @@
             "null"
           ]
         },
+        "set_reg": {
+          "description": "ECO-01: keep only gadgets that SET all of these registers — write\nthem with a value the chain PAYLOAD decides. Strictly stronger than\n`writes_reg`: `xor rdi, rdi ; ret` writes rdi and sets nothing.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "terminator": {
-          "description": "Terminator kind: \"ret\", \"jmp\", \"call\", \"syscall\", \"none\", \"any\".",
+          "description": "Terminator kind: \"ret\", \"jmp\", \"call\", \"syscall\", \"none\", \"any\",\nor a CLS-09 class (\"bare-ret\", \"ret-imm\", \"jmp-reg\", \"jmp-mem\",\n\"call-reg\", \"call-mem\", \"far\", \"other\").",
           "type": [
             "string",
             "null"
@@ -3310,6 +5305,57 @@
     "name": "search_gadgets_by_pattern",
     "outputSchema": {
       "$defs": {
+        "Explanation": {
+          "additionalProperties": false,
+          "description": "ECO-01: why this gadget is in the answer, in the vocabulary the query\nwas written in.\n\nThe point is that an agent can justify a choice — to itself, to a user,\nor in a chain plan — WITHOUT re-deriving semantics from gadget text.\nRe-derivation from text is what the whole classifier exists to prevent,\nand it is where an agent silently gets `mov rdi, rax ; ret` wrong.\n\nIt repeats `reads`, `stack_delta` and `terminator`, which also appear at\nthe top level of the record, deliberately: the object is meant to be\nquotable on its own.",
+          "properties": {
+            "clobbers": {
+              "description": "CLS-09 `clobbers`: registers written with a value the payload does\nNOT decide. A clobber is not \"unusable\" — `mov rdi, rax ; ret`\nclobbers rdi and tells you to control rax instead — but it is what\n`no_clobber` rejects.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "reads": {
+              "description": "Registers read (`regs_read`): the inputs that must already hold what\nyou want.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "sets": {
+              "description": "CLS-09 `sets`: registers this gadget writes with a value the chain\nPAYLOAD decides. This is what `set_reg` matches, and it is a strict\nsubset of `regs_written` — `xor rdi, rdi ; ret` writes rdi and sets\nnothing.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "stack_delta": {
+              "description": "Net stack-pointer movement in bytes, terminator included. `null`\nmeans UNKNOWN (a non-constant effect, an unmodelled form, or the\ntext classification path) and must never be read as zero.",
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "terminator": {
+              "description": "CLS-09 terminator class: `ret`, `ret-imm`, `jmp-reg`, `jmp-mem`,\n`call-reg`, `call-mem`, `syscall`, `far`, `other`. Finer than the\nrecord's `terminator`, and the spelling the `terminator` filter\naccepts.",
+              "type": "string"
+            },
+            "why": {
+              "description": "One sentence naming the payload offset each set register comes from,\nwhat is clobbered, the stack movement and the terminator.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sets",
+            "reads",
+            "clobbers",
+            "terminator",
+            "why"
+          ],
+          "type": "object"
+        },
         "GadgetRecord": {
           "additionalProperties": false,
           "description": "One gadget, in the shape every gadget-returning tool emits.\n\nInvariant: the field set does not depend on the request. A gadget from a\nscan with no `section` parameter carries `\"section\": null`, not a missing\nkey; an x86-64 ELF carries `\"arch\": null` and `\"delay_slot\": false`, not\nnothing at all. `tests/schema_conformance.rs` asserts the four shapes\nthat used to differ — plain, `section=.text`, MIPS, and the fat Mach-O —\nhave identical key sets.",
@@ -3339,6 +5385,10 @@
             "dispatcher": {
               "description": "JOP/COP dispatcher heuristic.",
               "type": "boolean"
+            },
+            "explanation": {
+              "$ref": "#/$defs/Explanation",
+              "description": "ECO-01: why this gadget is here, in the query's own vocabulary."
             },
             "id": {
               "description": "Stable identity: `g_` + base32 of the first 10 bytes of\n`blake3(binary_sha256 || vaddr_le || bytes)`. Independent of every\nscan parameter, so the same gadget has the same id across calls,\nprocesses and cache evictions. Pass a list of these to\n`get_gadgets`.",
@@ -3406,7 +5456,7 @@
               "type": "integer"
             },
             "stack_delta": {
-              "description": "Net change to the stack pointer. **Always `null` in v0.3**: the\ncomputation is ECO-07/CLS-09 and lands in v0.4. The field is here\nnow so the record shape does not change when it does.",
+              "description": "Net change to the stack pointer, in bytes, with the terminator's\nown pop included — `pop rdi ; ret` is 16 on x86-64. CLS-09 landed\nthe computation in v0.4; the field existed (always `null`) in v0.3\nso the record shape would not change when it did.\n\n`null` is UNKNOWN, not zero: a non-constant effect (`xchg rsp,\nrax`), an architecture or instruction form the model does not prove,\nor a gadget classified from text. `max_stack_delta` rejects it\nrather than assuming.",
               "format": "int64",
               "type": [
                 "integer",
@@ -3457,7 +5507,8 @@
             "terminator",
             "dispatcher",
             "privileged",
-            "low_confidence"
+            "low_confidence",
+            "explanation"
           ],
           "type": "object"
         },

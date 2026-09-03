@@ -2,11 +2,12 @@
 //! (TAXONOMY.md R1-R12, high confidence).
 
 use iced_x86::{
-    Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess,
-    OpKind, Register,
+    Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfo, InstructionInfoFactory,
+    Mnemonic, OpAccess, OpKind, Register,
 };
 use rf_scan::Gadget;
 
+use crate::x86_effect::Analyzer;
 use crate::{
     push_unique, push_unique_class, quality_score_full, Class, Classification, Terminator,
     PRECEDENCE,
@@ -157,7 +158,7 @@ fn is_sp(r: Register) -> bool {
 }
 
 fn reg_name(r: Register) -> String {
-    format!("{r:?}").to_lowercase()
+    crate::x86_effect::reg_str(r).to_string()
 }
 
 fn access_reads(a: OpAccess) -> bool {
@@ -235,7 +236,7 @@ struct InsnEffect {
 /// performs is payload and is kept — `ret 0x10` advances rsp by 0x18 exactly
 /// as `add rsp, 0x10 ; ret` does, and used to be `other` while the other was
 /// `stack-pivot` (CLS-13).
-fn effect_of(insn: &Instruction, factory: &mut InstructionInfoFactory, anchor: bool) -> InsnEffect {
+fn effect_of(insn: &Instruction, info: &InstructionInfo, anchor: bool) -> InsnEffect {
     let m = insn.mnemonic();
     let mut e = InsnEffect::default();
     if m == Mnemonic::Nop {
@@ -253,7 +254,6 @@ fn effect_of(insn: &Instruction, factory: &mut InstructionInfoFactory, anchor: b
         return e;
     }
 
-    let info = factory.info(insn);
     if is_syscall(m) {
         e.labels.push(Class::Syscall);
     }
@@ -446,6 +446,17 @@ pub(crate) fn classify_x86(g: &Gadget, bits: u32) -> Classification {
 
     let n = insns.len();
     let mut terminator = Terminator::None;
+    // CLS-09. The decode this analysis needs is the one already in hand, and
+    // the `InstructionInfo` it needs is the one `effect_of` already asks for,
+    // so both consume the same single `factory.info()` call per instruction:
+    // the semantic layer rides along on the classification pass instead of
+    // adding one of its own.
+    //
+    // `g.insns` is the text the *scanner* printed. If this decode does not
+    // reproduce it instruction for instruction, the gadget in front of the
+    // user is not the one being analysed, and nothing is claimed about it.
+    let trustworthy = !insns.is_empty() && (g.insns.is_empty() || insns.len() == g.insns.len());
+    let mut analyzer = Analyzer::new(bits, trustworthy);
     for (i, insn) in insns.iter().enumerate() {
         // R10: the final control-transfer anchor is the gadget mechanism.
         // iced marks syscall as FlowControl::Call — syscall gates are payload,
@@ -459,7 +470,9 @@ pub(crate) fn classify_x86(g: &Gadget, bits: u32) -> Classification {
         if !anchor && insn.flow_control() == FlowControl::ConditionalBranch {
             mid_branches += 1;
         }
-        let e = effect_of(insn, &mut factory, anchor);
+        let info = factory.info(insn);
+        analyzer.step(insn, info, anchor, i + 1 == n);
+        let e = effect_of(insn, info, anchor);
         pointer_deps += e.pointer_deps;
         for r in e.read {
             push_unique(&mut regs_read, r);
@@ -502,6 +515,7 @@ pub(crate) fn classify_x86(g: &Gadget, bits: u32) -> Classification {
 
     let primary = last_class.unwrap_or(Class::Other);
     labels.sort_by_key(|c| c.name());
+    let eff = analyzer.finish();
     Classification {
         primary,
         labels,
@@ -519,6 +533,11 @@ pub(crate) fn classify_x86(g: &Gadget, bits: u32) -> Classification {
         mid_branches,
         dispatcher,
         terminator,
+        terminator_target: eff.target,
+        stack_delta: eff.stack_delta,
+        transfers: eff.transfers,
+        sets: eff.sets,
+        clobbers: eff.clobbers,
         privileged,
         low_confidence: false,
     }

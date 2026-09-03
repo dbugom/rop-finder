@@ -52,12 +52,12 @@ impl Family {
     /// SPARC prints `op src1, src2, dst`; every other family here prints the
     /// destination first. Getting this backwards is what made SPARC's
     /// `regs_written` full of immediates (`0xad5a0`) in the text path.
-    fn dest_is_last(self) -> bool {
+    pub(crate) fn dest_is_last(self) -> bool {
         self == Family::Sparc
     }
 
     /// Stack-pointer names, normalized (no `$`/`%` sigil).
-    fn sp_names(self) -> &'static [&'static str] {
+    pub(crate) fn sp_names(self) -> &'static [&'static str] {
         match self {
             Family::Arm => &["sp", "r13"],
             Family::Arm64 => &["sp", "wsp"],
@@ -69,7 +69,7 @@ impl Family {
     }
 
     /// The return-address / link register, as the terminator test uses it.
-    fn link_names(self) -> &'static [&'static str] {
+    pub(crate) fn link_names(self) -> &'static [&'static str] {
         match self {
             Family::Arm => &["lr", "r14"],
             Family::Arm64 => &["lr", "x30"],
@@ -92,11 +92,11 @@ impl Family {
         }
     }
 
-    fn is_sp(self, n: &str) -> bool {
+    pub(crate) fn is_sp(self, n: &str) -> bool {
         self.sp_names().contains(&n)
     }
 
-    fn is_pc(self, n: &str) -> bool {
+    pub(crate) fn is_pc(self, n: &str) -> bool {
         matches!(n, "pc" | "r15" | "npc")
     }
 
@@ -745,6 +745,10 @@ pub(crate) fn classify_detail(g: &Gadget, arch: Arch, det: &[InsnDetail]) -> cra
     }
     let primary = last_class.unwrap_or(Class::Other);
     labels.sort_by_key(|c| c.name());
+    // CLS-09. Deliberately narrower than the x86 analysis — see
+    // `crate::generic_effect` for exactly which forms are computed on which
+    // family and why everything else is `None`.
+    let eff = crate::generic_effect::analyze(f, det, term_idx, arch.addr_size() as i64);
     crate::Classification {
         primary,
         labels,
@@ -762,6 +766,11 @@ pub(crate) fn classify_detail(g: &Gadget, arch: Arch, det: &[InsnDetail]) -> cra
         mid_branches,
         dispatcher,
         terminator,
+        terminator_target: eff.target,
+        stack_delta: eff.stack_delta,
+        transfers: eff.transfers,
+        sets: eff.sets,
+        clobbers: eff.clobbers,
         privileged,
         low_confidence: false,
     }

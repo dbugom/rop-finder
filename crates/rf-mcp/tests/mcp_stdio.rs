@@ -45,10 +45,17 @@ async fn mcp_stdio_end_to_end() {
         // MCP-DESIGN fix #8 part C: stable ids are only useful if they can
         // be resolved back.
         "get_gadgets",
+        // v0.4: ECO-01/ECO-12 (the constraint search and its pivot
+        // preset), CLI-05/ECO-02 (the non-gadget searches) and ECO-06
+        // (checksec).
+        "find_gadgets_by_effect",
+        "find_string",
+        "find_bytes",
+        "get_mitigations",
     ] {
         assert!(names.contains(&want), "missing tool {want}: {names:?}");
     }
-    assert_eq!(tools.len(), 10, "unexpected extra tools: {names:?}");
+    assert_eq!(tools.len(), 14, "unexpected extra tools: {names:?}");
     for t in tools {
         assert!(t["description"].is_string());
         assert_eq!(t["inputSchema"]["type"], "object");

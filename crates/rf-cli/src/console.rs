@@ -595,6 +595,21 @@ mod tests {
             nojop: false,
             nosys: false,
             multibr: false,
+            // v0.4 (ECO-01/ECO-09): the constraint query and output
+            // formats. All absent = the v0.3 behaviour, unchanged.
+            version: None,
+            set_reg: None,
+            from_stack: false,
+            no_clobber: None,
+            reads_reg: None,
+            max_stack_delta: None,
+            max_side_effects: None,
+            max_insns: None,
+            terminator: None,
+            search: None,
+            pivot: false,
+            format: None,
+            chain_format: None,
             // CLS-08's three semantic filters; None = unfiltered.
             class: None,
             label: None,

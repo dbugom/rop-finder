@@ -35,6 +35,10 @@ use crate::semantics::{sort_indices, Order, Semantics};
 pub const SCAN_URI_PREFIX: &str = "ropfinder://scan/";
 /// Suffix of a scan NDJSON URI.
 pub const SCAN_URI_SUFFIX: &str = "/gadgets.ndjson";
+/// URI prefix for a non-gadget search's NDJSON (ECO-09).
+pub const SEARCH_URI_PREFIX: &str = "ropfinder://search/";
+/// Suffix of a search NDJSON URI.
+pub const SEARCH_URI_SUFFIX: &str = "/hits.ndjson";
 /// MIME type reported for the resource.
 pub const NDJSON_MIME: &str = "application/x-ndjson";
 
@@ -42,6 +46,35 @@ pub const NDJSON_MIME: &str = "application/x-ndjson";
 #[must_use]
 pub fn scan_uri(cache_key: &str) -> String {
     format!("{SCAN_URI_PREFIX}{cache_key}{SCAN_URI_SUFFIX}")
+}
+
+/// The URI for a pinned `find_string` / `find_bytes` result (ECO-09).
+///
+/// A search has no `CachedScan` to re-render from, so the NDJSON body is
+/// pinned as text under this key; the store, its budget and its TTL are the
+/// scan store's.
+#[must_use]
+pub fn search_uri(key: &str) -> String {
+    format!("{SEARCH_URI_PREFIX}{key}{SEARCH_URI_SUFFIX}")
+}
+
+/// The key named by a `ropfinder://search/<key>/hits.ndjson` URI, under the
+/// same `[A-Za-z0-9-]` rule as a scan key — it becomes a FILE NAME under
+/// `--workspace-dir`.
+#[must_use]
+pub fn search_key_of(uri: &str) -> Option<&str> {
+    let key = uri
+        .strip_prefix(SEARCH_URI_PREFIX)?
+        .strip_suffix(SEARCH_URI_SUFFIX)?;
+    valid_key(key).then_some(key)
+}
+
+/// A pinned key is only ever `[A-Za-z0-9-]`, never empty and never longer
+/// than 200 characters: it is joined to `--workspace-dir` as a file name.
+fn valid_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 200
+        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 /// The cache key named by a `ropfinder://scan/<key>/gadgets.ndjson` URI.
@@ -58,10 +91,7 @@ pub fn cache_key_of(uri: &str) -> Option<&str> {
     // `rf_cache::make_key` produces `v<schema>-<64 hex>--<64 hex>`, which is
     // 133 characters; the cap is generous but finite because the key
     // becomes a FILE NAME under --workspace-dir.
-    let ok = !key.is_empty()
-        && key.len() <= 200
-        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
-    ok.then_some(key)
+    valid_key(key).then_some(key)
 }
 
 /// Render the whole scan as NDJSON in the default `rank` order.
@@ -199,6 +229,24 @@ mod tests {
             assert_eq!(cache_key_of(bad), None, "{bad} must not parse");
         }
         assert_eq!(cache_key_of(&scan_uri("deadbeef")), Some("deadbeef"));
+    }
+
+    /// The search namespace obeys the same rule, and the two namespaces do
+    /// not accept each other's URIs — a scan key must not be servable as a
+    /// text body, or a `resources/read` would return the wrong document.
+    #[test]
+    fn the_search_namespace_is_separate_and_equally_strict() {
+        assert_eq!(search_key_of(&search_uri("abc123")), Some("abc123"));
+        assert_eq!(search_key_of(&scan_uri("abc123")), None);
+        assert_eq!(cache_key_of(&search_uri("abc123")), None);
+        for bad in [
+            "ropfinder://search/../../etc/passwd/hits.ndjson",
+            "ropfinder://search//hits.ndjson",
+            "ropfinder://search/a b/hits.ndjson",
+            "ropfinder://search/abc123/gadgets.ndjson",
+        ] {
+            assert_eq!(search_key_of(bad), None, "{bad} must not parse");
+        }
     }
 
     /// One record per line, ranked, and every line is a complete

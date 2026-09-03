@@ -52,6 +52,7 @@ crates/
 tests/
   fixtures/     # binaries copied from ROPgadget's test suite (all formats)
   parity.py     # output-parity harness against ROPgadget (run with python)
+  capability_matrix.py  # the CLI and the MCP server expose the same tool
 ```
 
 ## Phase roadmap (PLAN.md §7)
@@ -549,10 +550,21 @@ half that decides whether running this is safe for you.
 ## Parity harness
 
 ```sh
-python tests/parity.py            # uses debug binary
-python tests/parity.py --release  # uses release binary + timing comparison
-python tests/chain_parity.py      # --ropchain parity (ELF x86/x64 fixtures)
+python tests/parity.py             # uses debug binary
+python tests/parity.py --release   # uses release binary + timing comparison
+python tests/chain_parity.py       # --ropchain parity (ELF x86/x64 fixtures)
+python tests/flag_conformance.py   # every ROPgadget flag, stdout byte for byte
+python tests/capability_matrix.py  # the CLI and the MCP server must agree
 ```
+
+`capability_matrix.py` is the ECO-02 gate and needs no oracle: it enumerates
+the CLI's flags from clap's own `--help`, the MCP surface from the server's
+own `tools/list`, maps them through a declared equivalence table in which
+every asymmetry carries a written reason, and then asks both surfaces the
+same 31 questions and compares the gadget sets element by element. It exists
+because "the CLI is behind its own MCP server" was fixed once by hand and
+came back: two front ends, one shared vocabulary, and `--reads-reg rax` and
+`reads_reg: "rax"` still answered 2,888 and 2,147 gadgets.
 
 Compares post-dedup `(vaddr, bytes)` gadget sets against
 `python ../ropgadget/ROPgadget.py --binary <f> --depth 10 --dump` for the

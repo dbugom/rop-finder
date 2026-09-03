@@ -25,16 +25,19 @@ use std::fmt;
 use std::process::ExitCode;
 
 mod console;
+mod format;
+mod info;
 mod out;
+mod query;
 mod search;
 
 use clap::Parser;
 use globset::{Glob, GlobSetBuilder};
 use rf_core::{
-    Arch, Binary, Endianness, Image, LoadedBinary, MachOBinary, RawBinary, Section, UniversalBinary,
+    Arch, Binary, Endianness, Image, LoadedBinary, MachOBinary, Mitigations, RawBinary, Section,
+    UniversalBinary,
 };
 use rf_scan::{Gadget, ScanOptions};
-use serde::Serialize;
 
 /// `--version` body (CLAIM-10). clap prints `"rop-finder "` in front of
 /// it, so the first line completes the usual `name version` line and the
@@ -74,9 +77,27 @@ fn long_version() -> &'static str {
     name = "rop-finder",
     version,
     long_version = long_version(),
+    disable_version_flag = true,
     about = "Fast Rust ROP/JOP/SYS gadget finder (ROPgadget rewrite)"
 )]
 pub struct Cli {
+    /// Display the version, the linked capstone build and the ROPgadget
+    /// attribution, and exit 0
+    ///
+    /// CLI-12: ROPgadget spells this `-v`/`--version` (args.py:75) and
+    /// rop-finder bound only clap's automatic `-V`, so every ROPgadget
+    /// script that starts with a `-v` capability probe died on
+    /// "unexpected argument '-v' found". Both shorts are bound here; the
+    /// text deliberately still differs from the oracle's four-line block,
+    /// because CLAIM-10 requires the linked capstone version to be in it.
+    #[arg(
+        short = 'v',
+        short_alias = 'V',
+        long = "version",
+        action = clap::ArgAction::Version
+    )]
+    pub version: Option<bool>,
+
     /// Specify a binary filename to analyze (optional with --console)
     #[arg(long)]
     pub binary: Option<String>,
@@ -222,6 +243,85 @@ pub struct Cli {
     #[arg(long = "writes-reg", value_name = "<reg[,reg...]>")]
     pub writes_reg: Option<String>,
 
+    // -- ECO-01 / ECO-12: the constraint query layer (v0.4) ---------------
+    // Every flag below is one `find_gadgets_by_effect` parameter of the
+    // same name in snake_case. See crates/rf-cli/src/query.rs.
+    /// Keep only gadgets that WRITE these registers with a value the chain
+    /// payload decides (rf_classify `sets`, full-width architectural names:
+    /// rdi not edi on x64, x0 not w0 on ARM64)
+    #[arg(long = "set-reg", value_name = "<reg[,reg...]>")]
+    pub set_reg: Option<String>,
+
+    /// Require the write to ORIGINATE in a pop or a stack-pointer-relative
+    /// load rather than an arbitrary computation ("xor rdi, rdi" sets rdi
+    /// but does not take it from the stack). Narrows --set-reg, or
+    /// --writes-reg, or — with neither — means "some register comes off
+    /// the payload"
+    #[arg(long = "from-stack")]
+    pub from_stack: bool,
+
+    /// Reject gadgets that CLOBBER any of these registers (comma-separated).
+    /// Clobber is the rf_classify partition, not regs_written: a register
+    /// written with a payload-controlled value is a `set`, not a clobber
+    #[arg(long = "no-clobber", value_name = "<reg[,reg...]>")]
+    pub no_clobber: Option<String>,
+
+    /// Keep only gadgets that READ ALL of these registers (comma-separated) — as an operand, an
+    /// address component, a transfer dependency or the terminator's target
+    #[arg(long = "reads-reg", value_name = "<reg[,reg...]>")]
+    pub reads_reg: Option<String>,
+
+    /// Keep only gadgets whose stack pointer moves at most N bytes
+    /// (terminator included). A gadget whose rsp effect is not provably
+    /// constant reports "unknown" and is REJECTED, never treated as 0
+    #[arg(
+        long = "max-stack-delta",
+        value_name = "<n>",
+        allow_negative_numbers = true
+    )]
+    pub max_stack_delta: Option<i64>,
+
+    /// Keep only gadgets with at most N side effects (TAXONOMY.md R11)
+    #[arg(long = "max-side-effects", value_name = "<n>")]
+    pub max_side_effects: Option<usize>,
+
+    /// Keep only gadgets with at most N instructions (the terminator counts)
+    #[arg(long = "max-insns", value_name = "<n>")]
+    pub max_insns: Option<usize>,
+
+    /// Keep only gadgets with this terminator; comma-separated, any-of.
+    /// Coarse: ret|jmp|call|syscall|none|any. Fine (CLS-09): bare-ret|
+    /// ret-imm|jmp-reg|jmp-mem|call-reg|call-mem|far|other. Coarse "ret"
+    /// includes ret imm16/retf/iret; "bare-ret" is the plain near return
+    /// only; "any" is no constraint. Same 13 values as the MCP
+    /// `terminator` parameter
+    #[arg(long = "terminator", value_name = "<kind[,kind...]>")]
+    pub terminator: Option<String>,
+
+    /// Ropper-style gadget-sequence search, e.g. "pop rdi; ret". Matches a
+    /// CONTIGUOUS run of instructions; `?` is any one character and `%` any
+    /// run of characters within one instruction. Not --re, which is
+    /// ROPgadget's per-instruction regex conjunction
+    #[arg(long = "search", value_name = "<pattern>")]
+    pub search: Option<String>,
+
+    /// Stack-pivot preset (ECO-12): exactly --label stack-pivot
+    #[arg(long)]
+    pub pivot: bool,
+
+    // -- ECO-09: output formats ------------------------------------------
+    /// Output format: human (default), json, jsonl, csv, raw. `jsonl`
+    /// STREAMS — records are written during the scan, in scan order rather
+    /// than the alphabetical order of the other formats. `raw` is the
+    /// undecorated listing; with --noinstr it is the address-only mode
+    #[arg(long = "format", value_name = "<fmt>")]
+    pub format: Option<String>,
+
+    /// --ropchain output: python (default), json, or raw (the packed
+    /// little-endian chain payload, written to stdout as BYTES)
+    #[arg(long = "chain-format", value_name = "<fmt>")]
+    pub chain_format: Option<String>,
+
     /// Cache scan results on disk, keyed by the binary's content hash plus
     /// all scan parameters. Cache directory: ROP_FINDER_CACHE_DIR, else
     /// %LOCALAPPDATA%/rop-finder/cache (Windows) or ~/.cache/rop-finder
@@ -325,38 +425,6 @@ pub struct Cli {
     /// SHT_NOBITS phantom hits. It does NOT change gadget text or layout
     #[arg(long)]
     pub compat: bool,
-}
-
-#[derive(Serialize)]
-struct JsonGadget<'a> {
-    vaddr: String,
-    bytes: String,
-    text: String,
-    /// Scan architecture — present for Universal (multi-slice) binaries.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub arch: Option<&'static str>,
-    /// Name of the section containing the gadget — present when --section
-    /// was used.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    section: Option<String>,
-    /// Phase 5 --classify fields (TAXONOMY.md): primary class, full label
-    /// set, register effects, side-effect count, and R12 quality score.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    class: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    labels: Option<Vec<&'static str>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    regs_written: Option<&'a [String]>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    regs_read: Option<&'a [String]>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    side_effects: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    quality: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dispatcher: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    low_confidence: Option<bool>,
 }
 
 /// ROB-06 default input cap: 512 MiB.
@@ -906,11 +974,20 @@ struct InfoView<'a> {
     entry: u64,
     sections: &'a [Section],
     imports: Vec<serde_json::Value>,
+    /// ECO-06: the exploit mitigations, as
+    /// `{name: {enabled: bool|"unknown", evidence, detail}}`.
+    mitigations: &'a Mitigations,
+    /// ECO-06: the symbol table, when the loader has one. `None` (rather
+    /// than `[]`) for a format whose symbols rf-core does not read yet, so
+    /// "no symbols in this file" and "not implemented for this format" are
+    /// distinguishable — the exact confusion the hardcoded empty `imports`
+    /// list created.
+    symbols: Option<Vec<serde_json::Value>>,
     delta: u64,
 }
 
 fn image_info(v: InfoView) -> serde_json::Value {
-    serde_json::json!({
+    let mut o = serde_json::json!({
         "format": v.format,
         "arch": arch_name(v.arch),
         "endianness": endian_name(v.endian),
@@ -919,7 +996,20 @@ fn image_info(v: InfoView) -> serde_json::Value {
         "entry": hexs(v.entry.wrapping_add(v.delta)),
         "sections": v.sections.iter().map(|s| section_json(s, v.delta)).collect::<Vec<_>>(),
         "imports": v.imports,
-    })
+        "mitigations": info::mitigations_json(v.mitigations),
+        "mitigations_order": info::mitigation_order_json(v.mitigations),
+    });
+    let map = o.as_object_mut().expect("json! built an object");
+    // An empty mitigation set is a fact with a reason (a raw blob has no
+    // headers); rendering `{}` alone would read as "nothing is enabled".
+    if let Some(note) = v.mitigations.note() {
+        map.insert("mitigations_note".into(), note.into());
+    }
+    if let Some(syms) = v.symbols {
+        map.insert("symbol_count".into(), syms.len().into());
+        map.insert("symbols".into(), syms.into());
+    }
+    o
 }
 
 fn macho_info(b: &MachOBinary, delta: u64) -> serde_json::Value {
@@ -931,6 +1021,8 @@ fn macho_info(b: &MachOBinary, delta: u64) -> serde_json::Value {
         entry: b.entry(),
         sections: b.sections(),
         imports: Vec::new(),
+        mitigations: b.mitigations(),
+        symbols: None,
         delta,
     })
 }
@@ -940,16 +1032,35 @@ fn macho_info(b: &MachOBinary, delta: u64) -> serde_json::Value {
 /// printed addresses match what a scan would emit.
 pub fn info_json(target: &Target, new_base: Option<u64>) -> serde_json::Value {
     match target {
-        Target::Elf(b) => image_info(InfoView {
-            format: "elf",
-            arch: Image::arch(b),
-            endian: Image::endianness(b),
-            image_base: b.image_base(),
-            entry: b.entry(),
-            sections: b.sections(),
-            imports: Vec::new(),
-            delta: rebase_delta(b.image_base(), new_base),
-        }),
+        Target::Elf(b) => {
+            let delta = rebase_delta(b.image_base(), new_base);
+            image_info(InfoView {
+                format: "elf",
+                arch: Image::arch(b),
+                endian: Image::endianness(b),
+                image_base: b.image_base(),
+                entry: b.entry(),
+                sections: b.sections(),
+                // ECO-06: this was `Vec::new()` — README documented it as
+                // "PE only; [] otherwise" — so ret2plt/ret2libc needed a
+                // second tool on every ELF. It is now the SHN_UNDEF subset
+                // of .dynsym/.symtab, with the DT_JMPREL GOT slot and a
+                // PLT address where one is provable.
+                imports: b
+                    .imports()
+                    .iter()
+                    .map(|s| info::elf_import_json(s, delta))
+                    .collect(),
+                mitigations: b.mitigations(),
+                symbols: Some(
+                    b.symbols()
+                        .iter()
+                        .map(|s| info::symbol_json(s, delta))
+                        .collect(),
+                ),
+                delta,
+            })
+        }
         Target::Pe(b) => {
             let delta = rebase_delta(b.image_base(), new_base);
             let imports = b
@@ -976,20 +1087,29 @@ pub fn info_json(target: &Target, new_base: Option<u64>) -> serde_json::Value {
                 entry: b.entry(),
                 sections: b.sections(),
                 imports,
+                mitigations: b.mitigations(),
+                symbols: None,
                 delta,
             })
         }
         Target::MachO(b) => macho_info(b, rebase_delta(b.image_base(), new_base)),
-        Target::Raw(b) => image_info(InfoView {
-            format: "raw",
-            arch: Image::arch(b),
-            endian: Image::endianness(b),
-            image_base: b.image_base(),
-            entry: b.entry(),
-            sections: std::slice::from_ref(b.section()),
-            imports: Vec::new(),
-            delta: rebase_delta(b.image_base(), new_base),
-        }),
+        Target::Raw(b) => {
+            // `RawBinary::mitigations()` returns by value (an empty set
+            // carrying its note), so it has to outlive the borrow.
+            let m = b.mitigations();
+            image_info(InfoView {
+                format: "raw",
+                arch: Image::arch(b),
+                endian: Image::endianness(b),
+                image_base: b.image_base(),
+                entry: b.entry(),
+                sections: std::slice::from_ref(b.section()),
+                imports: Vec::new(),
+                mitigations: &m,
+                symbols: None,
+                delta: rebase_delta(b.image_base(), new_base),
+            })
+        }
         Target::Universal(u) => {
             // Same convention as RegionView: the view base is the FIRST
             // slice's image base, so --base slides every slice by
@@ -1373,13 +1493,23 @@ pub fn run_scan_engine(view: &RegionView, opts: &ScanOptions) -> Result<Vec<Gadg
     if opts.max_gadgets.is_none() && opts.max_memory.is_none() {
         return rf_scan::scan_binary(view, opts).map_err(|e| e.to_string());
     }
-    rf_scan::scan_bounded(view, opts).map_err(|e| match e {
+    rf_scan::scan_bounded(view, opts).map_err(scan_error_message)
+}
+
+/// The user-facing wording for a scan-time failure.
+///
+/// Shared by the buffered and the streaming (`--format jsonl`) paths so that
+/// the same `--max-gadgets` produces the same sentence whichever format it
+/// was asked for; the raw `Error::Budget` Display says what happened but not
+/// what to do about it.
+pub fn scan_error_message(e: rf_scan::Error) -> String {
+    match e {
         rf_scan::Error::Budget { produced, limit } => format!(
             "scan budget exhausted after {produced} gadgets (limit {limit}); raise \
              --max-gadgets/--max-memory, lower --depth, or narrow the scan with --section"
         ),
         other => other.to_string(),
-    })
+    }
 }
 
 /// `--info` pipeline over in-memory bytes. `new_base` is the already-parsed
@@ -1692,6 +1822,27 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
         return Err("Need a binary filename (--binary/--console or --help)".to_string());
     }
 
+    // ECO-09. Parsed here, before any work, so `--format yaml` costs a
+    // message rather than a scan.
+    let (out_format, chain_format) = resolve_formats(&cli)?;
+    // ECO-01: one predicate, built once, applied by both the streaming and
+    // the buffered path.
+    let q = query::Query::parse(&query::QuerySpec {
+        class: cli.class.as_deref(),
+        label: cli.label.as_deref(),
+        writes_reg: cli.writes_reg.as_deref(),
+        set_reg: cli.set_reg.as_deref(),
+        from_stack: cli.from_stack,
+        no_clobber: cli.no_clobber.as_deref(),
+        reads_reg: cli.reads_reg.as_deref(),
+        max_stack_delta: cli.max_stack_delta,
+        max_side_effects: cli.max_side_effects,
+        max_insns: cli.max_insns,
+        terminator: cli.terminator.as_deref(),
+        search: cli.search.as_deref(),
+        pivot: cli.pivot,
+    })?;
+
     // --console: interactive REPL (binary optional, preloaded when given).
     if cli.console {
         return console::run_console(&cli, out);
@@ -1792,14 +1943,24 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
                 "[Warning] binary has no section names (stripped ELF?);                  executable segments are named PT_LOAD#n"
             );
         }
-        if cli.json {
-            let _ = writeln!(
-                out,
-                "{}",
-                serde_json::to_string_pretty(&outcome.chain.to_json()).unwrap()
-            );
-        } else {
-            let _ = write!(out, "{}", outcome.chain.to_python());
+        match chain_format {
+            format::ChainFormat::Json => {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string_pretty(&outcome.chain.to_json()).unwrap()
+                );
+            }
+            // ECO-09 part 2: MANUAL.md has advertised "raw bytes" chain
+            // output since v0.1 and `RopChain::to_bytes` was called only
+            // from unit tests. These are real bytes, not a hex dump —
+            // redirect them into a file or a harness's stdin.
+            format::ChainFormat::Raw => {
+                let _ = out.write_all(&outcome.chain.to_bytes());
+            }
+            format::ChainFormat::Python => {
+                let _ = write!(out, "{}", outcome.chain.to_python());
+            }
         }
         return Ok(0);
     }
@@ -1844,38 +2005,25 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
         if let Some(s) = &cli.string {
             let hits =
                 search::find_string(&target, delta, opts.offset, opts.range, s, compat_file)?;
-            if cli.json {
-                // Serialization of this simple structure cannot fail.
-                let _ = writeln!(
-                    out,
-                    "{}",
-                    serde_json::to_string_pretty(&search::search_json_string(&hits, width8))
-                        .unwrap()
-                );
+            if out_format.is_structured() {
+                let v = search::search_json_string(&hits, width8);
+                print_hit_records(&v, search::STRING_COLUMNS, out_format, out);
             } else {
                 search::print_string_hits(&hits, width8, out);
             }
         } else if let Some(op) = &cli.opcode {
             let hits = search::find_opcode(&target, delta, opts.offset, opts.range, op)?;
-            if cli.json {
-                let _ = writeln!(
-                    out,
-                    "{}",
-                    serde_json::to_string_pretty(&search::search_json_opcode(&hits, op, width8))
-                        .unwrap()
-                );
+            if out_format.is_structured() {
+                let v = search::search_json_opcode(&hits, op, width8);
+                print_hit_records(&v, search::OPCODE_COLUMNS, out_format, out);
             } else {
                 search::print_opcode_hits(&hits, op, width8, out);
             }
         } else if let Some(m) = &cli.memstr {
             let hits = search::find_memstr(&target, delta, opts.offset, opts.range, m, compat_file);
-            if cli.json {
-                let _ = writeln!(
-                    out,
-                    "{}",
-                    serde_json::to_string_pretty(&search::search_json_memstr(&hits, width8))
-                        .unwrap()
-                );
+            if out_format.is_structured() {
+                let v = search::search_json_memstr(&hits, width8);
+                print_hit_records(&v, search::MEMSTR_COLUMNS, out_format, out);
             } else {
                 search::print_memstr_hits(&hits, width8, out);
             }
@@ -1966,7 +2114,7 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
             &cli.re,
             cli.call_preceded,
             view.arch(),
-            cli.json,
+            out_format != format::OutFormat::Human,
             out,
         )?;
         search::print_mips_gadgets(
@@ -1976,6 +2124,62 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
             search::search_width8(&target, view.arch()),
             out,
         );
+        return Ok(0);
+    }
+
+    // ECO-09: the streaming path. Chosen BEFORE `acquire()`, because the
+    // whole point is that no `Vec<Gadget>` is ever built.
+    if format::can_stream(out_format, cli.rank, cli.cache, false) && !cli.silent {
+        let re = cli
+            .re
+            .as_deref()
+            .map(search::ReFilter::compile)
+            .transpose()?;
+        // apply_post_filters() only applies --callPreceded on x86/x64 and
+        // prints "Unsupported architecture." otherwise; the same rule here.
+        let cp_supported = matches!(view.arch(), Arch::X86 | Arch::X64);
+        let classifier =
+            (cli.classify || !q.is_empty()).then(|| rf_classify::Classifier::new(view.arch()));
+        let mut sink = format::JsonlSink::new(
+            out,
+            &opts,
+            view.addr_size(),
+            format::RecordCtx {
+                addr_size: view.addr_size(),
+                offset: opts.offset,
+                universal_arch,
+                selected_sections: prepared.selected_sections.as_deref(),
+                classify: cli.classify,
+            },
+            format::GadgetFilters {
+                re: re.as_ref(),
+                call_preceded: cli.call_preceded && cp_supported,
+                query: &q,
+                classify: classifier.as_ref(),
+            },
+        );
+        if let Err(e) = rf_scan::scan_binary_into(&view, &opts, &mut sink) {
+            // Records already written cannot be unwritten, so a budget hit
+            // leaves a partial stream on stdout plus this line on stderr and
+            // exit 2 - the same exit code the buffered path uses, which is
+            // what a script actually checks.
+            eprintln!("[Error] {}", scan_error_message(e));
+            return Ok(2);
+        }
+        // The oracle prints this line before the listing; a streamed
+        // listing has no "before", and it is a count over the whole run.
+        // It goes to stderr so the JSONL stream stays parseable, which is
+        // where the --json path already sent it.
+        if cli.call_preceded {
+            if cp_supported {
+                eprintln!(
+                    "Options().removeNonCallPreceded(): Filtered out {} gadgets.",
+                    sink.call_preceded_dropped()
+                );
+            } else {
+                eprintln!("Options().removeNonCallPreceded(): Unsupported architecture.");
+            }
+        }
         return Ok(0);
     }
 
@@ -1989,27 +2193,30 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
         &cli.re,
         cli.call_preceded,
         view.arch(),
-        cli.json,
+        out_format != format::OutFormat::Human,
         out,
     )?;
     let mut classes: Option<Vec<rf_classify::Classification>> = None;
-    // CLS-08: the classification is computed for every gadget and was only
-    // ever *printed*. `--class` / `--label` / `--writes-reg` make it
-    // queryable, which is the same surface the MCP server exposes as
-    // class/label/writes_reg — the two front ends must not diverge again.
-    let semantic = SemanticFilter::parse(
-        cli.class.as_deref(),
-        cli.label.as_deref(),
-        cli.writes_reg.as_deref(),
-    )?;
-    if cli.classify || cli.rank || !semantic.is_empty() {
+    // CLS-08 + ECO-01/ECO-12: the classification is computed for every
+    // gadget and was only ever *printed* before v0.3. The `--class` /
+    // `--label` / `--writes-reg` filters made it queryable; the v0.4
+    // constraint flags ask the question a practitioner actually has. Same
+    // predicate, same names, as the MCP `find_gadgets_by_effect` tool.
+    if cli.classify || cli.rank || !q.is_empty() {
         let (g, c) = classify_gadgets(gadgets, view.arch(), cli.rank);
         gadgets = g;
         classes = Some(c);
     }
     if let Some(cs) = classes.as_mut() {
-        if !semantic.is_empty() {
-            let keep: Vec<bool> = cs.iter().map(|c| semantic.matches(c)).collect();
+        if !q.is_empty() {
+            let keep: Vec<bool> = gadgets
+                .iter()
+                .zip(cs.iter())
+                .map(|(g, c)| {
+                    let text = g.text();
+                    q.matches(c, &text.split(" ; ").collect::<Vec<_>>())
+                })
+                .collect();
             let mut it = keep.iter();
             gadgets.retain(|_| *it.next().unwrap_or(&true));
             let mut it = keep.iter();
@@ -2028,113 +2235,148 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
     if cli.silent {
         return Ok(0);
     }
-    if cli.json {
-        // --rank alone reorders but does not add classification fields.
-        print_json(
-            &result,
-            opts.offset,
-            classes.as_deref().filter(|_| cli.classify),
-            out,
-        );
-    } else {
-        print_human(&result, cli.noinstr, cli.dump, out);
-    }
+    // --rank alone reorders but does not add classification fields.
+    let classes = classes.as_deref().filter(|_| cli.classify);
+    print_result(&result, opts.offset, classes, out_format, &cli, out);
     Ok(0)
 }
 
-/// CLS-08: the `--class` / `--label` / `--writes-reg` predicate.
+/// ECO-09: resolve `--format` / `--chain-format`, reconciling them with the
+/// older `--json` boolean.
 ///
-/// The MCP server's `class` / `label` / `writes_reg` parameters are the
-/// same three filters over the same [`rf_classify::Classification`], with
-/// the same any-of / any-of / all-of semantics and the same register-name
-/// normalization. ECO-02's finding is that the two front ends diverge; two
-/// spellings of one filter is how that starts.
-#[derive(Debug, Default)]
-struct SemanticFilter {
-    /// Primary class must be one of these. Empty = no constraint.
-    classes: Vec<String>,
-    /// At least one of these labels must be present.
-    labels: Vec<String>,
-    /// ALL of these registers must be written.
-    writes_regs: Vec<String>,
+/// `--json` predates both and cannot be removed — it is in the manual, in
+/// the MCP allowlist and in every existing script — so it stays as the
+/// spelling of `--format json` (and, under `--ropchain`, of
+/// `--chain-format json`). Asking for two different things at once is a
+/// usage error rather than a silent precedence rule, because a script that
+/// says `--json --format csv` has a bug either way and a quiet winner would
+/// hide it.
+fn resolve_formats(cli: &Cli) -> Result<(format::OutFormat, format::ChainFormat), String> {
+    let out = match cli.format.as_deref() {
+        Some(f) => {
+            let f = format::OutFormat::parse(f).ok_or_else(|| {
+                format!(
+                    "invalid --format {f:?}; valid values are {}",
+                    format::OutFormat::ALL.join(", ")
+                )
+            })?;
+            if cli.json && f != format::OutFormat::Json {
+                return Err(format!(
+                    "--json and --format {} conflict; --json means --format json",
+                    f.name()
+                ));
+            }
+            f
+        }
+        None if cli.json => format::OutFormat::Json,
+        None => format::OutFormat::Human,
+    };
+    let chain = match cli.chain_format.as_deref() {
+        Some(f) => {
+            let f = format::ChainFormat::parse(f).ok_or_else(|| {
+                format!(
+                    "invalid --chain-format {f:?}; valid values are {}",
+                    format::ChainFormat::ALL.join(", ")
+                )
+            })?;
+            if cli.json && f != format::ChainFormat::Json {
+                return Err(
+                    "--json and --chain-format conflict; --json means --chain-format json"
+                        .to_string(),
+                );
+            }
+            f
+        }
+        None if cli.json => format::ChainFormat::Json,
+        None => format::ChainFormat::Python,
+    };
+    Ok((out, chain))
 }
 
-impl SemanticFilter {
-    fn parse(
-        class: Option<&str>,
-        label: Option<&str>,
-        writes_reg: Option<&str>,
-    ) -> Result<Self, String> {
-        let split = |v: Option<&str>| -> Vec<String> {
-            v.map(|s| {
-                s.split(',')
-                    .map(str::trim)
-                    .filter(|x| !x.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default()
-        };
-        let valid: Vec<&str> = [
-            rf_classify::Class::RegWrite,
-            rf_classify::Class::StackPivot,
-            rf_classify::Class::MemRead,
-            rf_classify::Class::MemWrite,
-            rf_classify::Class::Arithmetic,
-            rf_classify::Class::Syscall,
-            rf_classify::Class::Dispatcher,
-            rf_classify::Class::Other,
-        ]
-        .iter()
-        .map(|c| c.name())
-        .collect();
-        let classes = split(class);
-        let labels = split(label);
-        for (flag, values) in [("--class", &classes), ("--label", &labels)] {
-            for v in values {
-                if !valid.contains(&v.as_str()) {
-                    return Err(format!(
-                        "invalid {flag} value {v:?}; valid values are {}",
-                        valid.join(", ")
-                    ));
+/// Render a search-mode hit list (`--string` / `--opcode` / `--memstr`) in
+/// one of the structured formats. `cols` fixes the CSV column order.
+fn print_hit_records(
+    hits: &serde_json::Value,
+    cols: &[&str],
+    fmt: format::OutFormat,
+    out: &mut dyn std::io::Write,
+) {
+    let empty = Vec::new();
+    let rows = hits.as_array().unwrap_or(&empty);
+    match fmt {
+        format::OutFormat::Jsonl => {
+            for r in rows {
+                let _ = writeln!(out, "{r}");
+            }
+        }
+        format::OutFormat::Csv => {
+            let _ = writeln!(out, "{}", cols.join(","));
+            for r in rows {
+                let cells: Vec<String> = cols
+                    .iter()
+                    .map(|c| match &r[*c] {
+                        serde_json::Value::Null => String::new(),
+                        serde_json::Value::String(s) => s.clone(),
+                        v => v.to_string(),
+                    })
+                    .collect();
+                let _ = writeln!(out, "{}", format::csv_join(&cells));
+            }
+        }
+        // Serialization of this simple structure cannot fail.
+        _ => {
+            let _ = writeln!(out, "{}", serde_json::to_string_pretty(hits).unwrap());
+        }
+    }
+}
+
+/// The buffered gadget listing, in whichever `--format` was asked for.
+fn print_result(
+    res: &ScanResult,
+    offset: u64,
+    classes: Option<&[rf_classify::Classification]>,
+    fmt: format::OutFormat,
+    cli: &Cli,
+    out: &mut dyn std::io::Write,
+) {
+    let ctx = format::RecordCtx {
+        addr_size: res.addr_size,
+        offset,
+        universal_arch: res.universal_arch,
+        selected_sections: res.selected_sections.as_deref(),
+        classify: cli.classify,
+    };
+    let rec = |i: usize| format::record(&res.gadgets[i], classes.map(|cs| &cs[i]), &ctx);
+    match fmt {
+        format::OutFormat::Human => print_human(res, cli.noinstr, cli.dump, out),
+        format::OutFormat::Json => {
+            let all: Vec<_> = (0..res.gadgets.len()).map(rec).collect();
+            let _ = writeln!(out, "{}", serde_json::to_string_pretty(&all).unwrap());
+        }
+        // The same records the streaming path emits; reached only when
+        // `--rank`/`--cache` forced the buffered path.
+        format::OutFormat::Jsonl => {
+            for i in 0..res.gadgets.len() {
+                if let Ok(line) = serde_json::to_string(&rec(i)) {
+                    let _ = writeln!(out, "{line}");
                 }
             }
         }
-        Ok(SemanticFilter {
-            classes,
-            labels,
-            writes_regs: split(writes_reg)
-                .iter()
-                .map(|r| {
-                    let t = r
-                        .strip_prefix('$')
-                        .or_else(|| r.strip_prefix('%'))
-                        .unwrap_or(r);
-                    t.to_ascii_lowercase()
-                })
-                .collect(),
-        })
-    }
-
-    fn is_empty(&self) -> bool {
-        self.classes.is_empty() && self.labels.is_empty() && self.writes_regs.is_empty()
-    }
-
-    fn matches(&self, c: &rf_classify::Classification) -> bool {
-        if !self.classes.is_empty() && !self.classes.iter().any(|n| n == c.primary.name()) {
-            return false;
+        format::OutFormat::Csv => {
+            let _ = writeln!(out, "{}", format::CSV_HEADER);
+            for i in 0..res.gadgets.len() {
+                let _ = writeln!(out, "{}", format::csv_row(&rec(i)));
+            }
         }
-        if !self.labels.is_empty()
-            && !self
-                .labels
-                .iter()
-                .any(|n| c.labels.iter().any(|l| l.name() == n))
-        {
-            return false;
+        format::OutFormat::Raw => {
+            for g in &res.gadgets {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    format::raw_line(g, res.addr_size, cli.noinstr, cli.dump)
+                );
+            }
         }
-        self.writes_regs
-            .iter()
-            .all(|r| c.regs_written.iter().any(|w| w == r))
     }
 }
 
@@ -2216,56 +2458,29 @@ pub fn section_of(selected: &[(String, u64, u64)], vaddr: u64) -> Option<String>
         .map(|(name, _, _)| name.clone())
 }
 
+/// The `--format json` record list. Kept as a named function because the
+/// crate's tests assert on the *typed* record rather than on parsed JSON.
 #[cfg(test)]
-fn to_json(res: &ScanResult, offset: u64) -> Vec<JsonGadget<'_>> {
+fn to_json(res: &ScanResult, offset: u64) -> Vec<format::GadgetRecord<'_>> {
     to_json_classified(res, offset, None)
 }
 
+#[cfg(test)]
 fn to_json_classified<'a>(
     res: &'a ScanResult,
     offset: u64,
     classes: Option<&'a [rf_classify::Classification]>,
-) -> Vec<JsonGadget<'a>> {
-    let arch = res.universal_arch.map(arch_name);
-    res.gadgets
-        .iter()
-        .enumerate()
-        .map(|(i, g)| {
-            let c = classes.map(|cs| &cs[i]);
-            JsonGadget {
-                vaddr: fmt_addr(g.vaddr, res.addr_size),
-                bytes: g.bytes_hex(),
-                text: g.text(),
-                arch,
-                section: res
-                    .selected_sections
-                    .as_deref()
-                    .and_then(|s| section_of(s, g.vaddr.wrapping_sub(offset))),
-                class: c.map(|c| c.primary.name()),
-                labels: c.map(|c| c.labels.iter().map(|l| l.name()).collect()),
-                regs_written: c.map(|c| c.regs_written.as_slice()),
-                regs_read: c.map(|c| c.regs_read.as_slice()),
-                side_effects: c.map(|c| c.side_effects),
-                quality: c.map(|c| c.quality),
-                dispatcher: c.map(|c| c.dispatcher),
-                low_confidence: c.map(|c| c.low_confidence),
-            }
-        })
+) -> Vec<format::GadgetRecord<'a>> {
+    let ctx = format::RecordCtx {
+        addr_size: res.addr_size,
+        offset,
+        universal_arch: res.universal_arch,
+        selected_sections: res.selected_sections.as_deref(),
+        classify: classes.is_some(),
+    };
+    (0..res.gadgets.len())
+        .map(|i| format::record(&res.gadgets[i], classes.map(|cs| &cs[i]), &ctx))
         .collect()
-}
-
-fn print_json(
-    res: &ScanResult,
-    offset: u64,
-    classes: Option<&[rf_classify::Classification]>,
-    out: &mut dyn std::io::Write,
-) {
-    // Serialization of this simple structure cannot fail.
-    let _ = writeln!(
-        out,
-        "{}",
-        serde_json::to_string_pretty(&to_json_classified(res, offset, classes)).unwrap()
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2542,6 +2757,21 @@ mod tests {
             nojop: false,
             nosys: false,
             multibr: false,
+            // v0.4 (ECO-01/ECO-09): the constraint query and output
+            // formats. All absent = the v0.3 behaviour, unchanged.
+            version: None,
+            set_reg: None,
+            from_stack: false,
+            no_clobber: None,
+            reads_reg: None,
+            max_stack_delta: None,
+            max_side_effects: None,
+            max_insns: None,
+            terminator: None,
+            search: None,
+            pivot: false,
+            format: None,
+            chain_format: None,
             // CLS-08's three semantic filters; None = unfiltered.
             class: None,
             label: None,
@@ -3094,20 +3324,38 @@ mod tests {
         let pop_rdi = rf_classify::classify(&g(vec![0x5f, 0xc3], &["pop rdi", "ret"]), Arch::X64);
         let bare_ret = rf_classify::classify(&g(vec![0xc3], &["ret"]), Arch::X64);
 
-        let empty = SemanticFilter::parse(None, None, None).unwrap();
+        let q = |spec: query::QuerySpec<'_>| query::Query::parse(&spec).unwrap();
+        let pop_rdi_insns = ["pop rdi", "ret"];
+        let ret_insns = ["ret"];
+
+        let empty = q(query::QuerySpec::default());
         assert!(empty.is_empty());
-        assert!(empty.matches(&pop_rdi) && empty.matches(&bare_ret));
+        assert!(empty.matches(&pop_rdi, &pop_rdi_insns));
+        assert!(empty.matches(&bare_ret, &ret_insns));
 
-        let f = SemanticFilter::parse(None, None, Some("%RDI")).unwrap();
-        assert_eq!(f.writes_regs, ["rdi"]);
-        assert!(f.matches(&pop_rdi));
-        assert!(!f.matches(&bare_ret));
+        let f = q(query::QuerySpec {
+            writes_reg: Some("%RDI"),
+            ..Default::default()
+        });
+        assert!(f.matches(&pop_rdi, &pop_rdi_insns));
+        assert!(!f.matches(&bare_ret, &ret_insns));
 
-        let f = SemanticFilter::parse(None, None, Some("rdi,rsi")).unwrap();
-        assert!(!f.matches(&pop_rdi), "all-of, not any-of");
+        let f = q(query::QuerySpec {
+            writes_reg: Some("rdi,rsi"),
+            ..Default::default()
+        });
+        assert!(!f.matches(&pop_rdi, &pop_rdi_insns), "all-of, not any-of");
 
-        assert!(SemanticFilter::parse(Some("nope"), None, None).is_err());
-        assert!(SemanticFilter::parse(None, Some("stack_pivot"), None).is_err());
+        assert!(query::Query::parse(&query::QuerySpec {
+            class: Some("nope"),
+            ..Default::default()
+        })
+        .is_err());
+        assert!(query::Query::parse(&query::QuerySpec {
+            label: Some("stack_pivot"),
+            ..Default::default()
+        })
+        .is_err());
     }
 
     /// ROB-04 on the `--opcode` path, which is the same decoder and was
@@ -3701,10 +3949,53 @@ mod tests {
         let info = info_json(&target, None);
         assert_eq!(info["format"], "elf");
         assert_eq!(info["arch"], "x64");
-        assert_eq!(info["imports"].as_array().unwrap().len(), 0);
         let sections = info["sections"].as_array().unwrap();
         assert!(sections.iter().any(|s| s["name"] == ".text"));
         assert!(info["entry"].as_str().unwrap().starts_with("0x"));
+
+        // ECO-06: `imports` was hardcoded `[]` for every ELF, so there was
+        // no ret2plt/ret2libc symbol resolution anywhere in the tool. It is
+        // now the SHN_UNDEF subset of the symbol tables.
+        let imports = info["imports"].as_array().unwrap();
+        assert!(!imports.is_empty(), "a dynamic ELF has undefined symbols");
+        let strcpy = imports
+            .iter()
+            .find(|i| i["symbol"] == "strcpy")
+            .expect("bash imports strcpy");
+        assert_eq!(strcpy["binding"], "GLOBAL");
+        // A DT_JMPREL relocation, not a guess.
+        assert!(
+            strcpy["got"].as_str().is_some_and(|g| g.starts_with("0x")),
+            "{strcpy}"
+        );
+        let symbols = info["symbols"].as_array().unwrap();
+        assert_eq!(
+            info["symbol_count"].as_u64().unwrap() as usize,
+            symbols.len()
+        );
+        assert!(symbols.len() >= imports.len());
+
+        // ECO-06: the mitigation report, with `unknown` as a first-class
+        // answer that states its reason.
+        let m = &info["mitigations"];
+        for key in ["nx", "pie", "relro", "canary", "fortify"] {
+            let v = &m[key];
+            assert!(!v.is_null(), "missing mitigation {key}");
+            assert!(
+                v["enabled"].is_boolean() || v["enabled"] == "unknown",
+                "{key}: enabled must be a bool or the string \"unknown\", got {}",
+                v["enabled"]
+            );
+            assert!(
+                v["evidence"].as_str().is_some_and(|e| !e.is_empty()),
+                "{key} has no evidence"
+            );
+        }
+        // The declaration order is carried beside the (alphabetical) map.
+        assert_eq!(
+            info["mitigations_order"],
+            serde_json::json!(["nx", "pie", "relro", "canary", "fortify", "rpath", "runpath"])
+        );
     }
 
     #[test]

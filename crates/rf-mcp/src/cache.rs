@@ -44,14 +44,37 @@ use crate::semantics::Semantics;
 /// outstanding cursor can page it.
 pub const DEFAULT_CURSOR_TTL: Duration = Duration::from_secs(300);
 
-/// A scan held open for an outstanding cursor, with the semantics derived
-/// from it.
+/// What a pinned entry holds.
+///
+/// Two shapes share one store, and one budget, deliberately: ECO-09 gives
+/// `find_string` / `find_bytes` the same streaming NDJSON resource a scan
+/// has, and a second store with its own budget would silently double the
+/// steady-state RSS that `--cache-mem-mb` is supposed to bound.
+enum PinPayload {
+    /// A gadget scan and the semantics derived from it.
+    Scan(PinnedScan),
+    /// An already-rendered NDJSON body (a non-gadget search result), with
+    /// its line count for `resources/list`.
+    Text { text: Arc<str>, lines: u64 },
+}
+
+/// An entry held open for an outstanding cursor.
 struct Pinned {
     key: String,
-    scan: Arc<CachedScan>,
-    sems: Arc<Vec<Semantics>>,
+    payload: PinPayload,
     bytes: usize,
     touched: Instant,
+}
+
+impl Pinned {
+    /// The count `resources/list` describes an entry by: gadgets for a
+    /// scan, lines for a rendered body.
+    fn count(&self) -> u64 {
+        match &self.payload {
+            PinPayload::Scan(p) => p.scan.gadgets.len() as u64,
+            PinPayload::Text { lines, .. } => *lines,
+        }
+    }
 }
 
 /// A pinned scan handed back to a request.
@@ -76,15 +99,43 @@ impl Pins {
         self.expire(&mut e);
         let p = e.iter_mut().find(|p| p.key == key)?;
         p.touched = Instant::now();
-        Some(PinnedScan {
-            scan: p.scan.clone(),
-            sems: p.sems.clone(),
-        })
+        match &p.payload {
+            PinPayload::Scan(s) => Some(s.clone()),
+            PinPayload::Text { .. } => None,
+        }
+    }
+
+    fn get_text(&self, key: &str) -> Option<Arc<str>> {
+        let mut e = self.entries.lock().ok()?;
+        self.expire(&mut e);
+        let p = e.iter_mut().find(|p| p.key == key)?;
+        p.touched = Instant::now();
+        match &p.payload {
+            PinPayload::Text { text, .. } => Some(text.clone()),
+            PinPayload::Scan(_) => None,
+        }
     }
 
     fn put(&self, key: &str, scan: Arc<CachedScan>, sems: Arc<Vec<Semantics>>) {
         let bytes =
             sems.iter().map(Semantics::heap_bytes).sum::<usize>() + rf_cache::SCAN_OVERHEAD_BYTES;
+        self.insert(key, PinPayload::Scan(PinnedScan { scan, sems }), bytes);
+    }
+
+    fn put_text(&self, key: &str, text: &str) {
+        let lines = text.lines().count() as u64;
+        let bytes = text.len() + rf_cache::SCAN_OVERHEAD_BYTES;
+        self.insert(
+            key,
+            PinPayload::Text {
+                text: Arc::from(text),
+                lines,
+            },
+            bytes,
+        );
+    }
+
+    fn insert(&self, key: &str, payload: PinPayload, bytes: usize) {
         let Ok(mut e) = self.entries.lock() else {
             return;
         };
@@ -100,8 +151,7 @@ impl Pins {
         }
         e.push(Pinned {
             key: key.to_string(),
-            scan,
-            sems,
+            payload,
             bytes,
             touched: Instant::now(),
         });
@@ -140,10 +190,7 @@ impl Pins {
 
     fn keys(&self) -> Vec<(String, u64)> {
         match self.entries.lock() {
-            Ok(e) => e
-                .iter()
-                .map(|p| (p.key.clone(), p.scan.gadgets.len() as u64))
-                .collect(),
+            Ok(e) => e.iter().map(|p| (p.key.clone(), p.count())).collect(),
             Err(_) => Vec::new(),
         }
     }
@@ -203,6 +250,19 @@ impl Cache {
     /// Pin a completed scan and its semantics for the cursor window.
     pub fn pin(&self, key: &str, scan: Arc<CachedScan>, sems: Arc<Vec<Semantics>>) {
         self.pins.put(key, scan, sems);
+    }
+
+    /// ECO-09: an already-rendered NDJSON body a `resources/read` can serve
+    /// — the non-gadget search results, which have no `CachedScan` to
+    /// render from. Shares the pinned store's budget and TTL.
+    pub fn pin_text(&self, key: &str, text: &str) {
+        self.pins.put_text(key, text);
+    }
+
+    /// A pinned NDJSON body, if that key names one.
+    #[must_use]
+    pub fn pinned_text(&self, key: &str) -> Option<Arc<str>> {
+        self.pins.get_text(key)
     }
 
     /// The pinned scans, as `(cache_key, gadget_count)` — exactly the set

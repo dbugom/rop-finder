@@ -11,6 +11,7 @@ A Rust engine for ROP/JOP/SYS gadget discovery and ROP chain generation, with an
 3. [Core concepts in 3 minutes](#3-core-concepts-in-3-minutes)
 4. [Quick start](#4-quick-start)
 5. [CLI reference](#5-cli-reference)
+   - [Constraint search: asking a real question](#constraint-search-asking-a-real-question)
    - [ROPgadget flag coverage](#ropgadget-flag-coverage)
    - [Known divergences](#known-divergences)
 6. [Use cases](#6-use-cases)
@@ -43,7 +44,7 @@ rop-finder is a rewrite of [ROPgadget](https://github.com/jonathansalwan/ROPgadg
 | **Chain generation** | Linux `execve("/bin//sh")` (x86/x64), emitted as a Python exploit script or JSON IR. Windows `VirtualProtect` (x86/x64) is **experimental** and prints a warning — see [UC6](#uc6--auto-generating-a-windows-virtualprotect-chain) |
 | **Address control** | `--base` rebase (RVA/ASLR workflows), `--offset` slide, `--section` filtering, `--range` trimming |
 | **Intelligence** | Semantic classification (reg-write, stack-pivot, …), quality ranking, JOP dispatcher detection — classification measured against a hand-labeled corpus (x86-64 macro-P 0.9959); ranking is an unevaluated heuristic (see [§8](#8-semantic-classification-and-quality-ranking)) |
-| **AI integration** | MCP server (`rop-finder-mcp`) exposing 10 tools to AI agents over stdio |
+| **AI integration** | MCP server (`rop-finder-mcp`) exposing 14 tools to AI agents over stdio |
 | **Speed** | ~6× faster than ROPgadget on x86/x64; 1.3–2.1× on ARM64/MIPS/PowerPC. Per-fixture timings and method: [`docs/measured-2026-09.md`](docs/measured-2026-09.md) |
 | **Robustness** | Structured errors with exit codes on malformed/corrupt binaries |
 
@@ -173,6 +174,26 @@ rop-finder --binary <file> [options]
 | `--callPreceded` | Keep only gadgets whose preceding bytes decode as an x86 `call` (backward-edge check) |
 | `--cfg-aware` | Keep only `endbr64/endbr32`-aligned gadget entries (forward-edge CET/IBT check). **Returns zero gadgets on every fixture in this repository** — see [UC9](#uc9--cetcfg-hardened-targets) |
 
+**Constraint search** (rop-finder extensions; see
+[the section below](#constraint-search-asking-a-real-question) for what each
+one means and the traps)
+
+| Flag | Effect |
+|---|---|
+| `--set-reg <reg[,reg...]>` | Gadget writes ALL of these with a value the chain payload decides |
+| `--from-stack` | ...and the write must come off the payload (a `pop`, or a load through the stack pointer), not an arbitrary computation |
+| `--no-clobber <r1,r2>` | Reject gadgets that clobber any of these |
+| `--reads-reg <reg[,reg...]>` | Gadget reads ALL of these — as an operand, an address component, a transfer dependency or the terminator's target |
+| `--max-stack-delta <n>` | Stack pointer moves at most `n` bytes. An unprovable delta is *rejected*, never treated as 0 |
+| `--max-side-effects <n>` | At most `n` side effects (TAXONOMY.md R11) |
+| `--max-insns <n>` | At most `n` instructions, terminator included |
+| `--terminator <kind>` | `ret`, `jmp`, `call`, `syscall`, `none`, `any`, or the fine `bare-ret`, `ret-imm`, `jmp-reg`, `jmp-mem`, `call-reg`, `call-mem`, `far`, `other`. Comma-separated (`,` or `\|`), any-of. The MCP `terminator` parameter takes the same 14 values, asserted by `tests/capability_matrix.py` |
+| `--search "<pattern>"` | Ropper-style instruction *sequence*, e.g. `"pop rdi; ret"`. `?` = one character, `%` = any run, within one instruction |
+| `--pivot` | Preset: exactly `--label stack-pivot` |
+| `--class <name>` | Primary class is one of these (`reg-write`, `stack-pivot`, `mem-read`, `mem-write`, `arithmetic`, `syscall`, `dispatcher`, `other`) |
+| `--label <name>` | Carries at least one of these labels (same vocabulary) |
+| `--writes-reg <r1,r2>` | Writes **all** of these, matched against `regs_written` (the operand's own spelling) |
+
 `--callPreceded` (backward edge: is this address a legitimate return site?)
 and `--cfg-aware` (forward edge: is this address a legitimate indirect-branch
 target?) are different checks. Neither substitutes for the other.
@@ -187,30 +208,129 @@ target?) are different checks. Neither substitutes for the other.
 | `--mipsrop <type>` | MIPS useful-gadget finder: `stackfinder\|system\|tails\|lia0\|registers` |
 | `--console` | Interactive REPL over the search engine (`--binary` optional; preloaded when given) |
 
+All three searches are scoped to the **mapped sections of the loaded image** —
+never raw file offsets, never bytes outside a section — and honour `--range`
+and `--offset` exactly as the oracle does. The human output is byte-identical
+to ROPgadget's; under `--format json|jsonl|csv` each hit is
+`{vaddr, section, length, <match|opcode|char>, writable, executable}`, so
+"is this string in a writable section?" is answered without a second tool.
+
 **Output**
 
 | Flag | Effect |
 |---|---|
-| `--json` | JSON array of `{vaddr, bytes, text, section, ...}` |
+| `--format <fmt>` | `human` (default), `json`, `jsonl`, `csv`, `raw`. See [§7](#7-output-formats) |
+| `--json` | The older spelling of `--format json`. Combining it with a different `--format` is a usage error, not a silent winner |
 | `--dump` | Append the gadget bytes to human output (` // hexbytes`) |
 | `--noinstr` | Print bare addresses: no instruction text, no dedup, no sort. Cannot combine with `--only` or `--re` |
 | `--silent` | Suppress gadget printing during analysis |
 | `--classify` | Add semantic fields to JSON (class, regs_written, quality, …). **rop-finder extension** |
 | `--rank` | Sort best-quality gadgets first. **rop-finder extension** |
 | `--cache` | Disk-cache scan results (see [§9](#9-performance-guide)). **rop-finder extension** |
-| `--info` | Print image metadata JSON and exit (no scan). **rop-finder extension** |
+| `--info` | Print image metadata JSON and exit (no scan): format, arch, sections, imports, **exploit mitigations with their evidence**, and the ELF symbol table. **rop-finder extension** — a `checksec` / `rabin2 -I` replacement |
 
 **Chain generation**
 
 | Flag | Effect |
 |---|---|
-| `--ropchain` | Generate a chain (Python script; JSON IR with `--json`) |
+| `--ropchain` | Generate a chain |
+| `--chain-format <fmt>` | `python` (default, the exploit script), `json` (the Chain IR), or `raw` — the packed little-endian payload, written to stdout as **bytes** for a non-Python harness. Redirect it: `--chain-format raw > chain.bin` |
 | `--chain <target>` | `linux-execve` (default) or `windows-virtualprotect` (**experimental**, prints a stderr warning — see [UC6](#uc6--auto-generating-a-windows-virtualprotect-chain)) |
 | `--api-addr <hex>` | Runtime address of the target API (Windows) |
 | `--shellcode-addr <hex>` | Where your shellcode will live (default: writable `.data`) |
 | `--shellcode-size <hex>` | `dwSize` for VirtualProtect (default `0x1000`) |
 
 **Exit codes:** `0` success · `1` usage error (bad flags, unknown section, missing gadgets) · `2` malformed/unreadable binary.
+
+### Constraint search: asking a real question
+
+The question a practitioner actually has is not "list every gadget". It is
+"give me a gadget that loads `rdi` off the stack and touches neither `rsi`
+nor `rdx`". Before v0.4 the only way to ask it was to dump 44,000 records to
+JSON and post-process them by hand, because the classifier computed the
+answer and no flag could read it.
+
+```sh
+rop-finder --binary ./elf-Linux-x64 \
+  --set-reg rdi --from-stack --no-clobber rsi,rdx \
+  --max-side-effects 1 --terminator ret
+```
+
+```
+Gadgets information
+============================================================
+0x0000000000401648 : pop rdi ; ret
+
+Unique gadgets found: 1
+```
+
+One gadget out of the fixture's 43,972. Each flag is one predicate over the
+semantic fields `rf-classify` derives from instruction metadata, so nothing
+here re-parses gadget text — and the **same names, in snake_case, are the
+parameters of the MCP `find_gadgets_by_effect` tool**, so a query is portable
+between you and an agent. A CI capability-matrix test fails the build if the
+two surfaces drift apart.
+
+**Four things that will bite you if you assume otherwise.**
+
+*`--set-reg` is not `--writes-reg`.* `--writes-reg` (v0.3) matches
+`regs_written`, which keeps the operand's own spelling, so `--writes-reg rax`
+does not match a gadget that writes `al`. `--set-reg` matches the `sets`
+partition, which uses full-width architectural names — `rdi` not `edi` on
+x86-64, `x0` not `w0` on ARM64 — and means something stronger: the payload
+decides the value. On `elf-Linux-x64`, `--set-reg rdi` returns 318 gadgets.
+
+*`--from-stack` is strictly stronger than `--set-reg`.* `xor rdi, rdi ; ret`
+sets `rdi`; it does not take it from your payload. Adding `--from-stack`
+narrows those 318 to 89.
+
+*A clobber is not a write, and not a disqualification.* `mov rdi, rax ; ret`
+*clobbers* `rdi` — you do not control `rax`, so you do not control the result
+— while still recording the transfer `rdi <- rax`, which a chain builder can
+satisfy by controlling `rax` first. `--no-clobber` filters on the clobber
+set, so `--no-clobber rax` is not defeated by a gadget that writes `al`, and
+does not reject `mov rdi, rax ; ret` merely for naming `rax`.
+
+*An unknown stack delta is not zero.* `--max-stack-delta 16` keeps only
+gadgets whose stack-pointer effect is **provably** at most 16 bytes. A gadget
+whose effect is not a constant — `xchg rsp, rax ; ret` — reports "unknown"
+and is rejected, because silently reading that as 0 is how a chain layout
+goes wrong. On `elf-Linux-x64`, `--terminator bare-ret` alone gives 4,130
+gadgets; adding `--max-stack-delta 16` gives 2,864.
+
+**`--terminator` takes two vocabularies.** The coarse `ret | jmp | call |
+syscall | none` is the shared spelling and the superset: `ret` includes
+`ret imm16`, `retf` and `iret`, all of which return but also move `rsp` or
+change privilege. When you mean a plain near return — the only terminator a
+`ret`-driven chain uses without extra machinery — ask for `bare-ret`. The
+rest of the nine-way classification (`ret-imm`, `jmp-reg`, `jmp-mem`,
+`call-reg`, `call-mem`, `far`, `other`) is available by name, `any` is the
+explicit "no constraint", and values are comma-separated (either `,` or `|`)
+and any-of. The MCP `terminator` parameter accepts exactly the same fourteen
+spellings with exactly the same meanings: `tests/capability_matrix.py` probes
+both surfaces with every candidate and fails if either accepts a value the
+other rejects.
+
+**`--search` is a sequence, `--re` is a conjunction.** They answer different
+questions and both are useful. `--re "pop.*|ret"` is ROPgadget's semantics:
+*every* `|`-separated pattern must match *some* instruction, in any order.
+`--search "pop rdi; ret"` is ropper's: those instructions, in that order,
+adjacent. `?` matches one character and `%` any run, inside one instruction,
+so `--search "pop r??; pop r??; ret"` finds 235 gadgets on `elf-Linux-x64`
+and `--search "pop rdi; ret"` finds exactly one.
+
+**`--pivot` is a preset, not a rule.** It is precisely `--label stack-pivot`
+— the label the classifier already computed and v0.3 made correct — so the
+two commands return the identical set, and a test asserts that. The label is
+broad (5,243 gadgets on `elf-Linux-x64`) because anything that writes the
+stack pointer qualifies; narrow it the way you would narrow any other query:
+
+```sh
+rop-finder --binary ./elf-Linux-x64 --pivot --max-insns 2 --terminator bare-ret
+# ... 56 gadgets, including
+# 0x0000000000400d1f : pop rsp ; ret
+# 0x0000000000452198 : xchg esp, eax ; ret
+```
 
 ### ROPgadget flag coverage
 
@@ -220,6 +340,34 @@ ROPgadget 7.7's complete argument list (`ropgadget/args.py:75-104`, all 30
 flags) against `pub struct Cli` in `crates/rf-cli/src/lib.rs`. Nothing is
 omitted.
 
+**The table is no longer the evidence.** A published status of "implemented"
+is a claim, and `--filter` spent a release marked implemented while it was a
+literal suffix match; `--align` spent one filtering unaligned starts instead
+of stepping to them. `tests/flag_conformance.py` (`CLI-12`) is what backs the
+column now: it reads the flag list out of the oracle's own `args.py`, builds
+68 invocations over it, runs both tools on all 24 fixtures and compares
+stdout **byte for byte** plus the exit code, so a flag that exists but
+behaves differently fails exactly as a missing one does. Every deliberate
+difference is declared in that file with a bounded predicate — "the address
+sets must be identical", "rop-finder may be short by at most 20 addresses" —
+and a declared divergence that stops happening is reported as STALE. Measured
+on this repository at `--depth 4`:
+
+```
+$ python tests/flag_conformance.py
+ROPgadget flags declared in args.py: 31
+  every one is exercised by at least one case
+matrix: 68 cases x 24 fixtures, depth 4
+cases run     : 1562 in 128s (6 workers)
+excused       : 164 declared divergences
+failures      : 0
+PASS: every ROPgadget flag behaves identically to the oracle, or diverges
+only in a declared and bounded way.
+```
+
+(31, not 30, because argparse contributes `-h`/`--help` that `args.py` does
+not declare.)
+
 | ROPgadget flag | Status here | Notes |
 |---|---|---|
 | `--binary <file>` | implemented | Same magic-byte format dispatch |
@@ -227,13 +375,13 @@ omitted.
 | `--norop` / `--nojop` / `--nosys` | implemented | |
 | `--multibr` | implemented | |
 | `--only <key>` | implemented | Same first-token matching — but see [known divergences](#known-divergences) on instruction text |
-| `--filter <key>` | **partial / divergent** | Literal suffix match, not ROPgadget's anchored regex |
+| `--filter <key>` | implemented | ROPgadget's `|`-separated alternation, full-matched against each mnemonic (`SCAN-01`, fixed in v0.2.0). Conformance-checked on all 24 fixtures |
 | `--re <re>` | implemented | Same split rule and per-instruction conjunction (`options.py:64-98`); an invalid pattern is a clean usage error here, an uncaught `re.error` there |
-| `--range <start-end>` | **partial** | Applied once, at section truncation. ROPgadget also re-filters the `--offset`-shifted addresses, so `--range` combined with `--offset` diverges |
+| `--range <start-end>` | implemented | Applied twice, as the oracle applies it: once truncating the section and once over the final `--offset`-shifted address (`SCAN-10`, fixed in v0.2.0). `--range` alone and `--range --offset` are both conformance-checked |
 | `--badbytes <bytes>` | implemented | Includes `aa-bb` ranges; checked on the final (rebased + slid) address in both tools |
 | `--offset <hexaddr>` | implemented | |
 | `--callPreceded` | implemented | Same six suffix heuristics (`options.py:100-120`). ROPgadget reads the preceding bytes with the `--offset` slide mixed in (an oracle bug); rop-finder reads the true preceding bytes, so `--callPreceded --offset` diverges |
-| `--align <n>` | **partial** | Full aligned backward stepping on the capstone architectures; on x86/x64 it constrains start addresses but does not extend the backward reach — see below |
+| `--align <n>` | **partial** | Aligned backward stepping (`ref - i*align`) on every architecture since v0.2.0 (`ANCH-01`), byte-identical to the oracle on 22 of the 24 fixtures. What is still missing is `gadgets.py:82-89`'s *byte-by-byte fallback*, taken when the anchor's own address is not `align`-aligned: rop-finder then finds a strict subset. Measured on `elf-Linux-x64 --depth 10`: 18 of 19,603 addresses missing at `--align 4` (0.09 %) and 16 of 9,731 at `--align 8` (0.16 %), every one a `movdqu xmmword ptr [rdi - N], xmm0 ; ret` behind an odd-addressed `ret`. Bounded by `tests/flag_conformance.py` so it cannot grow quietly |
 | `--all` | implemented | |
 | `--noinstr` | implemented | Same `--only` / `--re` conflict errors |
 | `--dump` | implemented | |
@@ -244,14 +392,24 @@ omitted.
 | `--string <regex>` | implemented | Byte regex over data sections (`core.py:159-180`) |
 | `--memstr <chars>` | implemented | Per-character search, executable then data (`core.py:202-227`) |
 | `--mipsrop <type>` | implemented | All five modes (`core.py:118-157`) |
-| `--console` | implemented | Prompt, messages, empty-line repeat and EOF semantics mirror `cmd.Cmd`; `string`/`opcode`/`memstr` additionally *run* the search here, where the oracle only lists them in `settings` |
+| `--console` | implemented | Prompt, messages, empty-line repeat and EOF semantics mirror `cmd.Cmd` byte for byte (conformance-checked); `string`/`opcode`/`memstr` additionally *run* the search here, where the oracle only lists them in `settings` |
 | `--ropchain` | **partial / divergent** | Linux `execve` for ELF x86/x64 only, same gadget search order and backtracking. Output is the script alone — no surrounding gadget dump or step log — and a missing gadget is a structured error, not print-and-return. `--chain windows-virtualprotect` is a rop-finder addition with no oracle |
-| `-v` / `--version` | **partial** | `--version` exits 0 and prints more than the oracle does: tool version, linked capstone version, the x86 formatter, and the ROPgadget attribution. `-V` prints the one-line version only. ROPgadget's single-dash `-v` spelling is not bound and exits 1 |
-| `-c` / `--checkUpdate` | **not implemented** | Deliberate: no network access from this tool, ever |
+| `-v` / `--version` | implemented, divergent text | Both `-v` (ROPgadget's spelling) and `-V` are bound and exit 0; `-v` was previously rejected as an unexpected argument, which broke any script starting with a capability probe (`CLI-12`). The text is deliberately not the oracle's four-line block: `--version` prints the tool version, the linked capstone build, the x86 formatter and the ROPgadget attribution, because `CLAIM-10` requires the disassembler build a parity report has to cite. The short forms print the one-line version |
+| `-c` / `--checkUpdate` | **not implemented, by decision** | The one flag the remediation plan puts explicitly out of scope: this tool makes no network request, ever. It is *refused* (exit 1) rather than silently ignored, and `tests/flag_conformance.py` asserts the refusal |
+
+There are no "not implemented" rows left except `-c`/`--checkUpdate`, and no
+"partial" ones except `--align`'s bounded shortfall and `--ropchain`'s
+by-design output shape.
 
 rop-finder additionally has `--section`, `--base`, `--info`, `--classify`,
 `--rank`, `--cache`, `--cfg-aware`, `--chain`, `--api-addr`,
-`--shellcode-addr` and `--shellcode-size`, none of which exist in ROPgadget.
+`--shellcode-addr`, `--shellcode-size`, `--compat`, `--max-file-size`,
+`--max-gadgets`, `--max-memory`, the `--format` / `--chain-format` output
+selectors and the whole [constraint query
+surface](#constraint-search-asking-a-real-question) — `--set-reg`,
+`--from-stack`, `--no-clobber`, `--reads-reg`, `--max-stack-delta`,
+`--max-side-effects`, `--max-insns`, `--terminator`, `--search`, `--pivot`,
+`--class`, `--label`, `--writes-reg` — none of which exist in ROPgadget.
 
 ### Known divergences
 
@@ -521,16 +679,20 @@ Claude Desktop, is a directory you did not choose and cannot see.
 <!-- BEGIN GENERATED: mcp-surface -->
 <!-- Generated by `cargo test -p rf-mcp --test manual_schema`. Do not edit by hand: the test regenerates it from the server's own tools/list and outputSchema and fails if this block has drifted. -->
 
-**The 10 tools:**
+**The 14 tools:**
 
 | Tool | Required parameters | What it does |
 |---|---|---|
 | `build_rop_chain` | `binary_path`, `target` | Build a ROP chain. |
+| `find_bytes` | `binary_path`, `opcode` | Find a byte sequence in the binary's MAPPED EXECUTABLE regions — the same regions find_gadgets walks. |
 | `find_gadgets` | `binary_path` | Find ROP gadgets in a binary (ret-terminated). |
+| `find_gadgets_by_effect` | `binary_path` | Find gadgets by their EFFECT, not their text: "set rdi from the stack, preserve rsi and rdx, at most one side effect, a clean ret" is one call. |
 | `find_jop_gadgets` | `binary_path` | Find JOP gadgets in a binary (jmp/call-terminated). |
+| `find_string` | `binary_path`, `string` | Find a string in the binary's MAPPED DATA sections — where "/bin/sh" lives, and at what address. |
 | `find_syscall_gadgets` | `binary_path` | Find SYS gadgets in a binary (syscall/sysenter/int). |
 | `get_binary_info` | `binary_path` | Get binary metadata as JSON: format, arch, endianness, addr_size, image_base, entry, sections (name/vaddr/size/executable/writable), PE imports (iat_v… |
 | `get_gadgets` | `binary_path`, `ids` | Resolve stable gadget ids (the `id` field of any gadget record, e.g. |
+| `get_mitigations` | `binary_path` | Report the binary's exploit mitigations, so an agent can decide whether ROP is even the right technique before it scans. |
 | `get_server_config` | (none) | Report the server's effective configuration: allow_roots (the only directories binary_path may name), max_depth, max_file_bytes, max_results, max_conc… |
 | `get_server_stats` | (none) | Report this session's counters: requests_total and requests_by_tool, ok/denied/timeout/cancelled/error totals, denied_consecutive and probing_suspecte… |
 | `run_ropgadget_command` | `binary_path`, `args` | Run a ROPgadget-style scan with explicit flags. |
@@ -558,10 +720,11 @@ Claude Desktop, is a directory you did not choose and cannot see.
 | `dispatcher` | boolean | JOP/COP dispatcher heuristic. |
 | `privileged` | boolean | Contains a privileged or undefined instruction, so it faults in user mode and cannot appear in a chain. |
 | `low_confidence` | boolean | The classification came from disassembly text rather than decoder metadata, so treat the semantic fields as advisory. |
+| `explanation` | `Explanation` | ECO-01: why this gadget is here, in the query's own vocabulary. |
 | `arch` | string \| null | Fat Mach-O slice this gadget came from; `null` for every other container. |
 | `class` | string \| null | Primary class (`reg-write`, `stack-pivot`, `mem-read`, `mem-write`, `arithmetic`, `syscall`, `dispatcher`, `other`); `null` when the architecture has… |
 | `section` | string \| null | Section containing the gadget; `null` when no `section` filter was applied (the scan then has no section table to consult). |
-| `stack_delta` | integer \| null | Net change to the stack pointer. |
+| `stack_delta` | integer \| null | Net change to the stack pointer, in bytes, with the terminator's own pop included — `pop rdi ; ret` is 16 on x86-64. |
 
 <!-- END GENERATED: mcp-surface -->
 
@@ -631,7 +794,11 @@ Gadgets information
 Unique gadgets found: 3211
 ```
 
-**JSON (`--json`):** an array of records —
+Pick one with `--format`. `--json` is the older spelling of `--format json`
+and still works; asking for both, differently, is a usage error rather than a
+silent winner.
+
+**JSON (`--format json`, or `--json`):** one array of records —
 
 ```json
 [
@@ -644,9 +811,114 @@ Unique gadgets found: 3211
 ]
 ```
 
-With `--classify`, records additionally carry `class`, `labels`, `regs_written`, `regs_read`, `side_effects`, `quality`, `dispatcher`, and (on MIPS/SPARC) `delay_slot: true` — a reminder that the instruction *after* a `jr $ra` executes too.
+With `--classify`, records additionally carry `class`, `labels`,
+`regs_written`, `regs_read`, `side_effects`, `quality`, `dispatcher`, and (on
+MIPS/SPARC) `delay_slot: true` — a reminder that the instruction *after* a
+`jr $ra` executes too. Since v0.4 they also carry the semantic fields the
+[constraint flags](#constraint-search-asking-a-real-question) filter on, so
+you can check a query by reading its own output: `sets`, `clobbers`,
+`regs_from_stack`, `stack_delta` (**`null` means unknown, never zero**),
+`terminator` and `terminator_class`.
 
-**Chain IR (`--ropchain --json`):** typed words (`GadgetAddr | Immediate | DataAddr | Padding | CodeAddr`) with per-word comments and source-gadget indices — every gadget address in a chain is validated against the actual scan output before emission.
+**JSON Lines (`--format jsonl`):** one record per line, **written during the
+scan**. This is the format for a 600 K-gadget image piped into `jq` or a
+database: nothing is buffered but the dedup key set, so the first record
+reaches the pipe long before the last gadget is found. Measured on
+`tests/fixtures/elf-Linux-x64` at `--depth 10`, median of 5 runs, peak
+working set read with `GetProcessMemoryInfo` after exit (Windows 11):
+
+| | peak RSS | total | first record |
+|---|---|---|---|
+| `--format json` | 67.8 MiB | 0.19 s | at the end |
+| `--format jsonl` | **50.0 MiB** | 0.16 s | **0.06 s** |
+| `--format human` | 58.8 MiB | 0.14 s | at the end |
+| `--silent` (full scan, no output at all) | 58.9 MiB | 0.12 s | — |
+
+The first JSONL record is out at 0.06 s — half the 0.12 s the *same scan*
+takes with output suppressed entirely, so it is emitted well before the
+buffered pipeline would have had anything to print. Peak RSS is strictly
+lower than `--format json` on every fixture measured (`elf-Linux-x64`
+−26.3 %, `elf-PPC64-bash` −27.1 %, `elf-x64-bash-v4.1.5.1` −24.7 %,
+`Linux_lib64.so` −21.7 %).
+
+**Where it does not help much, and why.** On
+`elf-Mips-Defcon-20-pwn100` the saving is only −1.1 % (369.5 vs 373.7 MiB)
+and the first record does not appear until 2.21 s of a 2.61 s scan. The
+output is not the peak there: `rf_scan::scan_binary_into` collects every
+work item's gadgets into one `Vec<Vec<Gadget>>` before draining them into
+the sink, so the disassembly is finished by the time the first record can be
+written. Making the scan push into the sink as it decodes would move that
+line, and it is a change inside `rf-scan`, not in the output layer.
+
+**Two honest caveats.** (1) `--format jsonl` emits in **scan order**, not the
+alphabetical order of the other formats — a sort has no first element until
+it has every element, so the ordering is exactly what streaming costs. The
+record *set* is identical, and a test asserts that under `--badbytes`,
+`--only`, `--all`, `--classify` and `--re`. (2) `--rank` and `--cache` each
+need the whole listing before they can emit anything, so combining either
+with `--format jsonl` produces the same JSONL bytes from the buffered path.
+
+**CSV (`--format csv`):** an RFC 4180 file with a fixed header row, so
+columns can be bound by position. Gadget text contains commas and is quoted.
+Columns absent from this run (no `--classify`, no `--section`) are empty
+cells, never missing columns.
+
+**Raw (`--format raw`):** the listing with no header, no rule and no count
+line — one gadget per line, for piping. Composed with `--noinstr` it is the
+address-only mode: `--format raw --noinstr` prints nothing but addresses.
+
+**Chain IR (`--ropchain --chain-format json`):** typed words (`GadgetAddr |
+Immediate | DataAddr | Padding | CodeAddr`) with per-word comments and
+source-gadget indices — every gadget address in a chain is validated against
+the actual scan output before emission.
+
+**Raw chain bytes (`--ropchain --chain-format raw`):** the packed
+little-endian payload itself, written to stdout as bytes, for a C, Go or
+fuzzer harness that has no use for a Python script. This manual advertised it
+from v0.1; until v0.4 no interface emitted it (`ECO-09`).
+
+```sh
+rop-finder --binary ./elf-Linux-x86 --ropchain --chain-format raw > chain.bin
+```
+
+**Image metadata (`--info`):** format, architecture, sections, imports, the
+ELF symbol table, and the exploit mitigations — see
+[§10](#10-troubleshooting--faq) and the example below. Every mitigation is
+reported as `{"enabled": true | false | "unknown", "evidence": "...",
+"detail": ...}`. **`"unknown"` is a first-class answer and always states its
+reason**, because a confident wrong boolean is worse than an admitted gap:
+
+```sh
+rop-finder --binary ./elf-Linux-x64 --info
+```
+
+```json
+"mitigations": {
+  "nx":      {"enabled": true,      "evidence": "PT_GNU_STACK p_flags=0x6 (RW): the kernel maps the stack non-executable", "detail": null},
+  "pie":     {"enabled": false,     "evidence": "e_type=ET_EXEC: the image declares a fixed load address...", "detail": "fixed-address-executable"},
+  "canary":  {"enabled": false,     "evidence": "no reference to __stack_chk_fail in any of the 2169 named symbols this image carries", "detail": null},
+  "fortify": {"enabled": "unknown", "evidence": "statically linked: 4 __*_chk symbol(s) ... a defined _chk proves only that the linked libc provides fortified variants", "detail": "..."}
+}
+```
+
+Keys are per format — ELF `nx/pie/relro/canary/fortify/rpath/runpath`, PE
+`aslr/dep/high_entropy_va/guard_cf/cet_compat/safe_seh/force_integrity`,
+Mach-O `pie/nx_stack/nx_heap/code_signature/hardened_runtime` — and the
+loader's declaration order is carried beside the map in
+`mitigations_order`. A raw blob has no headers, so its mitigation set is
+empty *by design* and `mitigations_note` says why. For a fat Mach-O there is
+one report per slice; the flags genuinely differ between slices.
+
+`imports` on an ELF is the `SHN_UNDEF` symbol set with the `DT_JMPREL` GOT
+slot and, where it is provable from the section layout, the PLT stub — the
+working set for a ret2plt or ret2libc chain. Before v0.4 it was hardcoded
+empty for every format but PE (`ECO-06`), so that work needed a second tool.
+
+`guard_cf` and `cet_compat` are separate keys reading separate directories:
+Windows Control Flow Guard checks indirect **call** targets and says nothing
+about a `ret`, while Intel CET is marked by a debug-directory record. The
+v0.2 hardened-PE warning can now say "GUARD_CF set, CET not marked"
+truthfully instead of conflating them (`CRIT-01`).
 
 ---
 

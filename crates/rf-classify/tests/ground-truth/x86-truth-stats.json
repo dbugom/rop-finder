@@ -1,0 +1,16 @@
+{
+  "candidates_read": 1200,
+  "skipped": 160,
+  "skipped_by_reason": {
+    "early transfer": 80,
+    "emu_start": 4,
+    "not faithfully emulated": 59,
+    "ret imm16 >= 0x8000": 17
+  },
+  "trials_per_gadget": 6,
+  "verified": 500,
+  "verified_per_fixture": {
+    "elf-Linux-x64": 250,
+    "elf-Linux-x86": 250
+  }
+}

@@ -41,9 +41,14 @@ use rf_core::Arch;
 use rf_scan::{Detailer, Gadget, InsnDetail};
 use serde::Serialize;
 
+mod effect;
 mod generic;
+mod generic_effect;
 mod text;
 mod x86;
+mod x86_effect;
+
+pub use effect::{TerminatorClass, TerminatorTarget, Transfer, ValueDst, ValueSrc};
 
 /// Semantic classes (TAXONOMY.md table). `Other` is the fallback for
 /// gadgets with no labeled instruction (pure control flow, nop).
@@ -189,6 +194,83 @@ pub struct Classification {
     pub dispatcher: bool,
     /// How the gadget hands control on.
     pub terminator: Terminator,
+    /// How the terminating transfer picks its target — the register/memory
+    /// distinction [`Terminator`] deliberately does not carry, so that the
+    /// v0.3 spellings of `terminator` stayed byte-identical (CLS-09).
+    /// Combined with `terminator` by
+    /// [`Classification::terminator_class`].
+    ///
+    /// Default for the text path and for gadgets with no terminator:
+    /// [`TerminatorTarget::Implicit`].
+    pub terminator_target: TerminatorTarget,
+    /// **Net change of the stack pointer across the whole gadget**, in bytes,
+    /// or `None` when the effect is not provably constant (CLS-09).
+    ///
+    /// The terminating transfer is included, because the payload bytes it
+    /// consumes are payload bytes: `pop rdi ; ret` is `Some(16)` on x86-64,
+    /// `ret` alone is `Some(8)`, `add rsp, 0x28 ; ret` is `Some(0x30)`. This
+    /// is what a concrete execution of the gadget would leave in `rsp`, which
+    /// is how `tests/ground-truth/oracle_unicorn.py` measures it.
+    ///
+    /// **`None` is a real answer.** A confident wrong stack delta silently
+    /// corrupts a chain layout, so every gadget whose rsp effect depends on a
+    /// register, on memory, or on a path not taken reports `None` rather than
+    /// a number: `xchg rsp, rax`, `pop rsp`, `mov rsp, rbp`, `add rsp, rax`,
+    /// `and rsp, -16`, `leave` (rsp becomes rbp+8), `iret*` (the pop count
+    /// depends on a privilege change), `add esp, 8` in 64-bit code (a 32-bit
+    /// write truncates rsp), and any gadget with a branch before its last
+    /// instruction or a byte that does not decode.
+    ///
+    /// **Which architectures compute it.**
+    ///
+    /// | arch | computed |
+    /// |---|---|
+    /// | arch | computed for |
+    /// |---|---|
+    /// | x86, x86-64 | **fully**, via iced-x86: the pop/push family, `call`, `ret`, `ret imm16`, `retf`, `pusha`/`popa`, `pushf`/`popf`, `enter`, `inc`/`dec rsp`, `add`/`sub rsp, imm`, `lea rsp, [rsp+d]` |
+    /// | ARM, ARM-Thumb | `push {…}` / `pop {…}` register lists, and `add`/`sub sp, sp, #imm`. **`ldm`/`stm` are `None`**, because their base register is printed inside the same operand list as the transfer list |
+    /// | ARM64 | `add`/`sub sp, sp, #imm` only. **`ldp`/`stp`/`ldr`/`str` through `sp` are `None`**: `rf_scan::InsnDetail` does not carry capstone's write-back flag, so `ldr x0, [sp], #16` and `ldr x0, [sp, #16]` are indistinguishable here and they differ by 16 |
+    /// | MIPS 32/64, RISC-V 32/64 | `addi(u)`/`daddi(u)`/`addiw`/`c.addi`/`c.addi16sp` on the stack pointer. Loads and stores through the stack pointer contribute 0, which is sound because neither ISA has a write-back addressing mode |
+    /// | PowerPC 32/64 | `addi r1, r1, imm` and the `stwu`/`stdu`/`lwzu`/… *update* forms based on `r1`. The indexed update forms (`stwux`) are `None`; plain `r1`-based loads and stores contribute 0 |
+    /// | SPARC (all) | **never**, not even 0 — `save`/`restore` rotate a register window, so they move the stack pointer without naming it and "this instruction does not mention `%sp`" proves nothing |
+    /// | any gadget on the text fallback path | **never** — no decoder metadata |
+    ///
+    /// On every architecture, anything not in that list that names the stack
+    /// pointer as an operand, or reaches memory through it, yields `None`.
+    pub stack_delta: Option<i64>,
+    /// Value movements inside the gadget, in program order (CLS-09).
+    ///
+    /// This is the field `--from-stack` is built on: it distinguishes
+    /// `rdi <- [rsp+8]` from `rdi <- rax` from `rdi <- [rbx+0x10]` (naming
+    /// rbx as the register that must already be attacker-controlled) from
+    /// `rdi <- 0x1234`. A register written twice appears twice; the last
+    /// entry for a destination is the one that survives.
+    ///
+    /// Empty on the text fallback path, and for instruction shapes the
+    /// analysis does not model.
+    pub transfers: Vec<Transfer>,
+    /// Registers the gadget writes with a value the chain payload decides —
+    /// a pop, an rsp-relative load, a folded constant, or any known function
+    /// of those (CLS-09).
+    ///
+    /// Names are architectural full-width (`rax` in 64-bit code, `eax` in
+    /// 32-bit, `x0` rather than `w0` on ARM64), because `mov al, [rsp]`
+    /// controls al but not rax and the question a chain author asks is about
+    /// rax. `sets` and [`Classification::clobbers`] partition the full-width
+    /// registers the gadget writes; neither ever contains the stack pointer,
+    /// whose movement is [`Classification::stack_delta`].
+    pub sets: Vec<String>,
+    /// Registers the gadget writes with a value the chain payload does *not*
+    /// decide — it came from an incoming register, from non-stack memory, or
+    /// from the incoming flags (CLS-09).
+    ///
+    /// This is what `--no-clobber rsi,rdx` filters on, and it is a strictly
+    /// stronger statement than "the register appears in `regs_written`":
+    /// `pop rsi ; ret` writes rsi and clobbers nothing, `mov rsi, rax ; ret`
+    /// writes rsi and clobbers it. When a clobber has a known source, the
+    /// corresponding [`Transfer`] names it, so a chain builder can decide to
+    /// control the source instead of rejecting the gadget.
+    pub clobbers: Vec<String>,
     /// The gadget contains a privileged or undefined instruction (`hlt`,
     /// `ud2`, `int3`, `cli`, `in`/`out`, `lgdt`, …): it faults or traps in
     /// user mode, so it cannot appear in a chain.
@@ -205,6 +287,147 @@ impl Classification {
     /// need field access.)
     pub fn terminator(&self) -> Terminator {
         self.terminator
+    }
+
+    /// The nine-way `ret / ret-imm / jmp-reg / jmp-mem / call-reg / call-mem
+    /// / syscall / far / other` classification the query layer filters on
+    /// (CLS-09).
+    ///
+    /// Derived from [`Classification::terminator`] and
+    /// [`Classification::terminator_target`] rather than stored, so there is
+    /// one source of truth. A *direct* `jmp 0x400340` or `call 0x401120` is
+    /// `Other`: neither is reachable from a chain without the address being
+    /// what you wanted anyway.
+    pub fn terminator_class(&self) -> TerminatorClass {
+        match self.terminator {
+            Terminator::Ret => TerminatorClass::Ret,
+            Terminator::RetImm => TerminatorClass::RetImm,
+            Terminator::Retf | Terminator::Iret | Terminator::Far => TerminatorClass::Far,
+            Terminator::Syscall => TerminatorClass::Syscall,
+            Terminator::Jmp => match self.terminator_target {
+                TerminatorTarget::Register { .. } => TerminatorClass::JmpReg,
+                TerminatorTarget::Memory { .. } => TerminatorClass::JmpMem,
+                _ => TerminatorClass::Other,
+            },
+            Terminator::Call => match self.terminator_target {
+                TerminatorTarget::Register { .. } => TerminatorClass::CallReg,
+                TerminatorTarget::Memory { .. } => TerminatorClass::CallMem,
+                _ => TerminatorClass::Other,
+            },
+            Terminator::None => TerminatorClass::Other,
+        }
+    }
+
+    /// Does the gadget write `reg` with a value the chain payload decides?
+    /// The predicate behind `--set-reg`.
+    ///
+    /// `reg` is matched case-insensitively against the full-width names in
+    /// [`Classification::sets`].
+    pub fn sets_reg(&self, reg: &str) -> bool {
+        self.sets.iter().any(|r| r.eq_ignore_ascii_case(reg))
+    }
+
+    /// Does the gadget write `reg` with a value the chain payload does *not*
+    /// decide? The predicate behind `--no-clobber`.
+    pub fn clobbers_reg(&self, reg: &str) -> bool {
+        self.clobbers.iter().any(|r| r.eq_ignore_ascii_case(reg))
+    }
+
+    /// Does the gadget clobber any of `regs`? `--no-clobber rsi,rdx` is
+    /// `!c.clobbers_any(["rsi", "rdx"])`.
+    pub fn clobbers_any<I, S>(&self, regs: I) -> bool
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        regs.into_iter().any(|r| self.clobbers_reg(r.as_ref()))
+    }
+
+    /// Is `reg`'s final value loaded straight off the chain payload — a pop,
+    /// or a load whose base is the stack pointer? The predicate behind
+    /// `--from-stack`, and strictly stronger than [`Classification::sets_reg`]:
+    /// `xor rdi, rdi ; ret` sets rdi without taking it from the stack.
+    ///
+    /// Uses the *last* transfer that writes `reg`, so
+    /// `pop rdi ; mov rdi, rax ; ret` is not from-stack.
+    pub fn reg_from_stack(&self, reg: &str) -> bool {
+        self.last_transfer_to(reg)
+            .is_some_and(Transfer::is_stack_load)
+    }
+
+    /// The payload offset, in bytes from the stack pointer at gadget entry,
+    /// that supplies `reg` — `Some(0)` for rdi in `pop rdi ; pop rsi ; ret`
+    /// and `Some(8)` for rsi. `None` when `reg` is not loaded from the stack
+    /// or the offset is not constant.
+    pub fn stack_offset_of(&self, reg: &str) -> Option<i64> {
+        match &self.last_transfer_to(reg)?.src {
+            ValueSrc::Stack { offset } => *offset,
+            _ => None,
+        }
+    }
+
+    /// The last [`Transfer`] whose destination is register `reg`.
+    pub fn last_transfer_to(&self, reg: &str) -> Option<&Transfer> {
+        self.transfers.iter().rev().find(|t| {
+            t.dst
+                .register()
+                .is_some_and(|d| d.eq_ignore_ascii_case(reg))
+        })
+    }
+
+    /// Every memory write the gadget performs, as `(destination, source)`
+    /// pairs — the write-what-where primitive a chain builder looks for.
+    pub fn memory_writes(&self) -> impl Iterator<Item = &Transfer> {
+        self.transfers.iter().filter(|t| t.dst.is_memory())
+    }
+
+    /// Is `reg` an *input* of this gadget? The predicate behind
+    /// `--reads-reg` / `reads_reg`.
+    ///
+    /// No single field answers this, which is why it lives here rather than
+    /// being re-derived per front end — it was, and the two spellings
+    /// disagreed by 741 gadgets on `elf-Linux-x64` at depth 4 because one of
+    /// them left the terminator out. Three sources are unioned:
+    ///
+    /// 1. [`Classification::regs_read`], the v0.3 list. It keeps the
+    ///    *operand's* spelling (`al`, `edi`), so on its own `reads_reg("rax")`
+    ///    would miss `add al, cl`.
+    /// 2. The transfer relations, which carry full-width names: a register
+    ///    read as a value source ([`ValueSrc::Register`]), as an address
+    ///    component (base or index, on either side), as a declared dependency
+    ///    ([`Transfer::needs`]), or as the destination of a read-modify-write.
+    /// 3. The terminator's own target register. `jmp rax` reads rax — it is
+    ///    the branch target, and a chain builder asking which gadgets consume
+    ///    rax must be given the JOP dispatchers.
+    ///
+    /// Matching is case-insensitive on every source.
+    pub fn reads_reg(&self, reg: &str) -> bool {
+        if self.regs_read.iter().any(|r| r.eq_ignore_ascii_case(reg)) {
+            return true;
+        }
+        if self
+            .terminator_target
+            .register()
+            .is_some_and(|r| r.eq_ignore_ascii_case(reg))
+        {
+            return true;
+        }
+        let hit = |o: &Option<String>| o.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(reg));
+        self.transfers.iter().any(|t| {
+            t.needs.iter().any(|r| r.eq_ignore_ascii_case(reg))
+                || match &t.src {
+                    ValueSrc::Register { reg: r } => r.eq_ignore_ascii_case(reg),
+                    ValueSrc::Memory { base, index, .. }
+                    | ValueSrc::Address { base, index, .. } => hit(base) || hit(index),
+                    _ => false,
+                }
+                || match &t.dst {
+                    ValueDst::Memory { base, index, .. } => hit(base) || hit(index),
+                    // A read-modify-write reads its destination register.
+                    ValueDst::Register { reg: r } => t.rmw && r.eq_ignore_ascii_case(reg),
+                    _ => false,
+                }
+        })
     }
 }
 

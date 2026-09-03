@@ -52,6 +52,20 @@ impl RawBinary {
     pub fn entry(&self) -> u64 {
         0
     }
+
+    /// ECO-06 — an empty report, with the reason stated.
+    ///
+    /// A raw blob has no container headers at all: no `PT_GNU_STACK`, no
+    /// `DllCharacteristics`, no Mach-O flags word. Reporting `nx: false`
+    /// here would claim the file was inspected and found unprotected, which
+    /// is a different statement from "there was nothing to inspect", so the
+    /// set is empty and [`Mitigations::note`](crate::Mitigations::note)
+    /// carries the reason.
+    pub fn mitigations(&self) -> crate::Mitigations {
+        crate::Mitigations::unavailable(
+            "raw blob: the input has no container headers (the arch, mode and endianness came              from --rawArch/--rawMode/--rawEndian, not from the file), so no mitigation can be              read from it",
+        )
+    }
 }
 
 impl crate::Image for RawBinary {

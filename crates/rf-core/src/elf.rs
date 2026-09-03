@@ -3,6 +3,8 @@
 use goblin::elf::program_header::{pt_to_str, PF_W, PF_X, PT_LOAD};
 use goblin::elf::section_header::{SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS};
 
+use crate::mitigations::Mitigations;
+use crate::symbols::Symbol;
 use crate::util::ByteBudget;
 use crate::Error;
 
@@ -97,6 +99,21 @@ pub struct ElfBinary {
     sections: Vec<Section>,
     /// ROPgadget-compatible scan regions: program headers with `PF_X`.
     exec_regions: Vec<Section>,
+    /// ECO-06 — checksec-grade mitigation report, read from the headers at
+    /// parse time (see `elf_info.rs`). A handful of header lookups.
+    mitigations: Mitigations,
+    /// ECO-06 — `.dynsym` + `.symtab`, with the GOT slot and (where it can
+    /// be derived exactly) the PLT stub of every PLT-called import.
+    ///
+    /// Built eagerly, unlike v0.3's on-demand capstone detail, because the
+    /// canary and FORTIFY verdicts are themselves symbol queries — the
+    /// report cannot be produced without walking these tables. Measured
+    /// cost of the whole ECO-06 addition on `cargo test --release`, 50 loads
+    /// each: `elf-x64-bash-v4.1.5.1` 766 us -> 1035 us, `elf-ARM64-bash`
+    /// 806 us -> 1046 us, `Linux_lib64.so` 815 us -> 899 us, `elf-Linux-x64`
+    /// 814 us -> 872 us. That is +58..269 us once per load, against scans
+    /// measured in seconds.
+    symbols: Vec<Symbol>,
 }
 
 impl ElfBinary {
@@ -150,6 +167,11 @@ impl ElfBinary {
         let exec_regions: Vec<Section> =
             segments.iter().filter(|s| s.executable).cloned().collect();
 
+        // ECO-06. Read from the already-parsed goblin headers, so this adds
+        // no second pass over the file; `sections` is passed pre-rebase so
+        // `.plt` addresses are the ones the file declares.
+        let info = crate::elf_info::collect(&elf, &sections, arch);
+
         Ok(ElfBinary {
             class,
             machine,
@@ -159,6 +181,8 @@ impl ElfBinary {
             image_base,
             sections,
             exec_regions,
+            mitigations: info.mitigations,
+            symbols: info.symbols,
         })
     }
 
@@ -222,8 +246,51 @@ impl ElfBinary {
         for s in &mut self.exec_regions {
             s.vaddr = s.vaddr.wrapping_add(delta);
         }
+        // ECO-06 — symbol, GOT and PLT addresses live in the same address
+        // space as the sections, so `--base 0` yields RVAs for them too.
+        for sym in &mut self.symbols {
+            sym.rebase(delta);
+        }
         self.entry = self.entry.wrapping_add(delta);
         self.image_base = new_base;
+    }
+
+    /// ECO-06 — the checksec-grade mitigation report for this ELF.
+    ///
+    /// Keys, in report order: `nx`, `pie`, `relro`, `canary`, `fortify`,
+    /// `rpath`, `runpath` (the constants in [`crate::mitigations`]). Every
+    /// entry carries `enabled` (`true`/`false`/`unknown`) plus the header
+    /// evidence that decided it; RELRO and PIE also carry a `detail`
+    /// (`partial`/`full`, `pie-executable`/`shared-object`).
+    ///
+    /// Computed once at parse time; the accessor itself is free. See the
+    /// [`symbols`](Self::symbols) field for what that costs per load.
+    pub fn mitigations(&self) -> &Mitigations {
+        &self.mitigations
+    }
+
+    /// ECO-06 — every named symbol from `.dynsym` and `.symtab`, dynamic
+    /// table first, each table in its own index order.
+    ///
+    /// A PLT-called import carries [`Symbol::got`](crate::Symbol::got) — the
+    /// exact `DT_JMPREL` `r_offset` the dynamic linker patches — and, on x86
+    /// and x86-64 where the stub width is provably 16 bytes,
+    /// [`Symbol::plt`](crate::Symbol::plt). All addresses move with
+    /// [`rebase`](Self::rebase).
+    pub fn symbols(&self) -> &[Symbol] {
+        &self.symbols
+    }
+
+    /// ECO-06 — the undefined symbols this image expects another object to
+    /// provide: the ret2plt / ret2libc working set.
+    pub fn imports(&self) -> Vec<&Symbol> {
+        self.symbols.iter().filter(|s| s.is_import).collect()
+    }
+
+    /// Look a symbol up by name, preferring `.dynsym` (declaration order
+    /// puts it first), which is what a ret2plt lookup wants.
+    pub fn symbol(&self, name: &str) -> Option<&Symbol> {
+        self.symbols.iter().find(|s| s.name == name)
     }
 
     /// Map `e_machine` + ELF class to the shared [`Arch`](crate::Arch)

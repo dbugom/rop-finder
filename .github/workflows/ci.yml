@@ -383,6 +383,100 @@ jobs:
           name: doc-claims
           path: doc-claims.json
 
+  # ------------------------------------------------------------------------
+  # ECO-02 - "the CLI is behind its own MCP server". v0.3 closed that finding
+  # by hand, which fixed it once; Phase 4 then had two agents implement the
+  # same query surface on the two front ends in the same week, against an
+  # agreed vocabulary, and still ship `--reads-reg rax` and
+  # `reads_reg: "rax"` returning 2888 and 2147 gadgets for the same question.
+  # This job is the structural version: it enumerates both surfaces from the
+  # tools themselves (clap's --help, and the server's own tools/list), maps
+  # them through a declared table that must carry a REASON for every
+  # asymmetry, and then asks both surfaces the same 31 questions and compares
+  # the gadget sets. A capability that lands on one side only fails here on
+  # the commit that adds it.
+  # ------------------------------------------------------------------------
+
+  capability-matrix:
+    name: CLI <-> MCP capability matrix (ECO-02)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal --no-self-update
+          cargo --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: capmatrix-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: capmatrix-${{ runner.os }}-cargo-
+
+      # Both front ends, because the gate is that they agree.
+      - name: cargo build --release -p rf-cli -p rf-mcp
+        run: cargo build --release -p rf-cli -p rf-mcp
+
+      # No ROPgadget oracle: this gate compares rop-finder against itself.
+      - name: tests/capability_matrix.py
+        env:
+          RF_NO_BUILD: '1'
+        run: python3 tests/capability_matrix.py
+
+  # ------------------------------------------------------------------------
+  # CLI-12 - the flag-conformance matrix. Derives the flag list from the
+  # oracle's own args.py and compares stdout byte for byte, so a flag that
+  # exists but behaves differently fails exactly as a missing one does.
+  # Divergences are declared in the harness with a finding ID and a bound;
+  # one that stops happening is reported as STALE.
+  # ------------------------------------------------------------------------
+
+  flag-conformance:
+    name: ROPgadget flag conformance (CLI-12)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal --no-self-update
+          cargo --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: flagconf-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: flagconf-${{ runner.os }}-cargo-
+
+      - name: Check out the ROPgadget oracle (pinned)
+        run: |
+          set -euo pipefail
+          git clone --no-checkout https://github.com/JonathanSalwan/ROPgadget "$RUNNER_TEMP/ropgadget"
+          git -C "$RUNNER_TEMP/ropgadget" checkout b6e3fe31af46
+          python3 -m venv "$RUNNER_TEMP/venv-oracle"
+          "$RUNNER_TEMP/venv-oracle/bin/pip" install --disable-pip-version-check capstone==5.0.7
+
+      - name: cargo build --release -p rf-cli
+        run: cargo build --release -p rf-cli
+
+      - name: tests/flag_conformance.py
+        env:
+          ROPGADGET_PATH: ${{ runner.temp }}/ropgadget/ROPgadget.py
+          ROPGADGET_PYTHON: ${{ runner.temp }}/venv-oracle/bin/python
+          RF_NO_BUILD: '1'
+        run: python3 tests/flag_conformance.py
+
   bench:
     name: criterion regression band (CLAIM-02 / PERF-08)
     runs-on: ubuntu-22.04

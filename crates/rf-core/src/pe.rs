@@ -105,6 +105,9 @@ pub struct PeBinary {
     imports: Vec<PeImport>,
     /// Optional-header DllCharacteristics (GUARD_CF etc.).
     dll_characteristics: u16,
+    /// ECO-06 — DllCharacteristics plus the load-config and debug-directory
+    /// fields the header word alone cannot answer (see `pe_info.rs`).
+    mitigations: crate::mitigations::Mitigations,
 }
 
 impl PeBinary {
@@ -193,6 +196,10 @@ impl PeBinary {
             .map(|o| o.windows_fields.dll_characteristics)
             .unwrap_or(0);
 
+        // ECO-06 — read the load-config and debug directories once, here,
+        // where the file bytes are still in hand.
+        let mitigations = crate::pe_info::report(&crate::pe_info::facts(&pe, bytes));
+
         Ok(PeBinary {
             machine,
             arch,
@@ -203,6 +210,7 @@ impl PeBinary {
             exec_regions,
             imports,
             dll_characteristics,
+            mitigations,
         })
     }
 
@@ -260,6 +268,23 @@ impl PeBinary {
     /// available hardening marker for `--cfg-aware` guidance.
     pub fn guard_cf(&self) -> bool {
         self.dll_characteristics & 0x4000 != 0
+    }
+
+    /// Optional-header `DllCharacteristics`, verbatim.
+    pub fn dll_characteristics(&self) -> u16 {
+        self.dll_characteristics
+    }
+
+    /// ECO-06 — the checksec-grade mitigation report for this PE.
+    ///
+    /// Keys, in report order: `aslr`, `dep`, `high_entropy_va`, `guard_cf`,
+    /// `cet_compat`, `safe_seh`, `force_integrity` (the constants in
+    /// [`crate::mitigations`]). `guard_cf` and `cet_compat` are deliberately
+    /// separate: CFG is a forward-edge check on indirect calls and does
+    /// nothing to a `ret`, while CET's shadow stack is what actually breaks
+    /// ROP, and the two live in different directories.
+    pub fn mitigations(&self) -> &crate::mitigations::Mitigations {
+        &self.mitigations
     }
 
     /// Rebase the binary to `new_base`: shifts every section vaddr, the

@@ -7,6 +7,7 @@
 use std::io::Write;
 
 use regex::bytes::Regex as ByteRegex;
+use regex::bytes::RegexBuilder as ByteRegexBuilder;
 use regex::Regex;
 use rf_core::{Arch, Section};
 use rf_scan::Gadget;
@@ -129,14 +130,62 @@ fn printable_mapped(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Compile a pattern with PYTHON `bytes`-regex semantics.
+///
+/// CLI-05: `re.finditer(s.encode(), opcodes)` in `core.py:171` compiles a
+/// *bytes* pattern, where `.` is "any byte except a newline" and
+/// `\w`/`\d`/`\s` are the ASCII classes. `regex::bytes::Regex::new`
+/// defaults to Unicode mode, where `.` is "any UTF-8 encoded codepoint
+/// except a newline" and will not match a byte that cannot begin (or
+/// continue) a valid UTF-8 sequence. That difference is not theoretical:
+/// on `tests/fixtures/elf-ARM64-bash`, `--string "m..n"` matches the
+/// bytes `6d be b6 6e` at 0x404147 in `.gnu.hash` for the oracle and did not
+/// match here, so rop-finder silently returned 286 hits where ROPgadget
+/// returns 287. `unicode(false)` makes the two engines agree byte for byte.
+fn byte_regex(pattern: &str) -> Result<ByteRegex, regex::Error> {
+    ByteRegexBuilder::new(pattern).unicode(false).build()
+}
+
+/// Where a search hit lives, for the structured output.
+///
+/// The shared v0.4 query spec requires every non-gadget search result to
+/// name its section and that section's permissions, because "is this string
+/// writable?" is the question a write-what-where chain actually asks. The
+/// human output is unchanged - it is byte-compared against ROPgadget, which
+/// prints only the address and the match.
+#[derive(Debug, Clone)]
+pub struct HitSite {
+    /// Section name, or `None` for a raw blob's single unnamed region.
+    pub section: Option<String>,
+    pub writable: bool,
+    pub executable: bool,
+}
+
+impl HitSite {
+    fn of(sec: &Section) -> HitSite {
+        HitSite {
+            section: (!sec.name.is_empty()).then(|| sec.name.clone()),
+            writable: sec.writable,
+            executable: sec.executable,
+        }
+    }
+}
+
 pub struct StringHit {
     pub vaddr: u64,
     pub matched: String,
+    pub site: HitSite,
+}
+
+pub struct OpcodeHit {
+    pub vaddr: u64,
+    pub site: HitSite,
 }
 
 pub struct MemStrHit {
     pub vaddr: u64,
     pub ch: char,
+    pub site: HitSite,
 }
 
 /// `--compat` (CLI-11): re-materialise a section's content the way
@@ -185,8 +234,8 @@ pub fn find_string(
     pattern: &str,
     compat_file: Option<&[u8]>,
 ) -> Result<Vec<StringHit>, String> {
-    let re = ByteRegex::new(pattern)
-        .map_err(|e| format!("invalid --string byte regex {pattern:?}: {e}"))?;
+    let re =
+        byte_regex(pattern).map_err(|e| format!("invalid --string byte regex {pattern:?}: {e}"))?;
     let mut hits = Vec::new();
     for sec in data_sections(target) {
         let content = compat_bytes(&sec, compat_file);
@@ -194,17 +243,20 @@ pub fn find_string(
             bytes: content.into_owned(),
             ..sec
         };
+        let site = HitSite::of(&sec);
         let vaddr = sec.vaddr.wrapping_add(delta);
         let Some((start, ops)) = section_in_range(vaddr, &sec.bytes, range) else {
             continue;
         };
         for m in re.find_iter(ops) {
             let r = m.start();
-            // oracle: opcodes[ref:ref + len(s)] — len of the PATTERN.
-            let end = (r + pattern.len()).min(ops.len());
+            // oracle: opcodes[ref:ref + len(s)] — `len` of the PATTERN
+            // *string*, which in Python 3 counts CHARACTERS, not bytes.
+            let end = (r + pattern.chars().count()).min(ops.len());
             hits.push(StringHit {
                 vaddr: offset.wrapping_add(start).wrapping_add(r as u64),
                 matched: printable_mapped(&ops[r..end]),
+                site: site.clone(),
             });
         }
     }
@@ -219,26 +271,33 @@ pub fn find_opcode(
     offset: u64,
     range: Option<(u64, u64)>,
     hexstr: &str,
-) -> Result<Vec<u64>, String> {
+) -> Result<Vec<OpcodeHit>, String> {
     let raw = crate::hex_decode(hexstr)
         .ok_or_else(|| format!("invalid --opcode {hexstr:?} (even-length hex expected)"))?;
     let mut hits = Vec::new();
     for sec in exec_search_sections(target) {
+        let site = HitSite::of(&sec);
         let vaddr = sec.vaddr.wrapping_add(delta);
         let Some((start, ops)) = section_in_range(vaddr, &sec.bytes, range) else {
             continue;
+        };
+        let mut push = |r: usize| {
+            hits.push(OpcodeHit {
+                vaddr: offset.wrapping_add(start).wrapping_add(r as u64),
+                site: site.clone(),
+            });
         };
         if raw.is_empty() {
             // unhexlify("") == b"" — Python finditer(b"", data) matches at
             // every position, including the end.
             for r in 0..=ops.len() {
-                hits.push(offset.wrapping_add(start).wrapping_add(r as u64));
+                push(r);
             }
             continue;
         }
         for (r, w) in ops.windows(raw.len()).enumerate() {
             if w == raw.as_slice() {
-                hits.push(offset.wrapping_add(start).wrapping_add(r as u64));
+                push(r);
             }
         }
     }
@@ -273,7 +332,7 @@ pub fn find_memstr(
     for ch in memstr.chars() {
         let mut buf = [0u8; 4];
         let pat = ch.encode_utf8(&mut buf);
-        let Ok(re) = ByteRegex::new(pat) else {
+        let Ok(re) = byte_regex(pat) else {
             continue; // oracle: re.error swallowed by `except: pass`
         };
         'sections: for sec in &sections {
@@ -285,6 +344,7 @@ pub fn find_memstr(
                 hits.push(MemStrHit {
                     vaddr: offset.wrapping_add(start).wrapping_add(m.start() as u64),
                     ch,
+                    site: HitSite::of(sec),
                 });
                 break 'sections; // the bare `raise`: first match only
             }
@@ -302,10 +362,10 @@ pub fn print_string_hits(hits: &[StringHit], width8: bool, out: &mut dyn Write) 
     }
 }
 
-pub fn print_opcode_hits(hits: &[u64], hexstr: &str, width8: bool, out: &mut dyn Write) {
+pub fn print_opcode_hits(hits: &[OpcodeHit], hexstr: &str, width8: bool, out: &mut dyn Write) {
     let _ = writeln!(out, "Opcodes information\n{RULE60}");
-    for &v in hits {
-        let _ = writeln!(out, "{} : {}", fmt_search_addr(v, width8), hexstr);
+    for h in hits {
+        let _ = writeln!(out, "{} : {}", fmt_search_addr(h.vaddr, width8), hexstr);
     }
 }
 
@@ -318,26 +378,83 @@ pub fn print_memstr_hits(hits: &[MemStrHit], width8: bool, out: &mut dyn Write) 
 
 /// JSON output (rop-finder extension; the oracle has no --json). vaddr is
 /// the search-width-formatted hex string, matching the human output.
+/// Column order for the CSV rendering of each search mode, and the field
+/// order a reader can rely on.
+///
+/// CLI-05 / ECO-02: the shared v0.4 query spec fixes this vocabulary for
+/// both front ends - `{vaddr, section, length, escaped preview, writable,
+/// executable}`. `match` / `opcode` / `char` is the "escaped preview" slot,
+/// named after what it previews; for `--string` it is already
+/// printable-escaped by `printable_mapped`, exactly as the human line is.
+pub const STRING_COLUMNS: &[&str] = &[
+    "vaddr",
+    "section",
+    "length",
+    "match",
+    "writable",
+    "executable",
+];
+pub const OPCODE_COLUMNS: &[&str] = &[
+    "vaddr",
+    "section",
+    "length",
+    "opcode",
+    "writable",
+    "executable",
+];
+pub const MEMSTR_COLUMNS: &[&str] = &[
+    "vaddr",
+    "section",
+    "length",
+    "char",
+    "writable",
+    "executable",
+];
+
+fn hit_object(
+    vaddr: u64,
+    width8: bool,
+    length: usize,
+    key: &str,
+    value: serde_json::Value,
+    site: &HitSite,
+) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert("vaddr".into(), fmt_search_addr(vaddr, width8).into());
+    m.insert("length".into(), length.into());
+    m.insert(key.into(), value);
+    m.insert(
+        "section".into(),
+        match &site.section {
+            Some(n) => serde_json::Value::String(n.clone()),
+            None => serde_json::Value::Null,
+        },
+    );
+    m.insert("writable".into(), site.writable.into());
+    m.insert("executable".into(), site.executable.into());
+    serde_json::Value::Object(m)
+}
+
 pub fn search_json_string(hits: &[StringHit], width8: bool) -> serde_json::Value {
     hits.iter()
         .map(|h| {
-            serde_json::json!({
-                "vaddr": fmt_search_addr(h.vaddr, width8),
-                "match": h.matched,
-            })
+            hit_object(
+                h.vaddr,
+                width8,
+                h.matched.chars().count(),
+                "match",
+                h.matched.clone().into(),
+                &h.site,
+            )
         })
         .collect::<Vec<_>>()
         .into()
 }
 
-pub fn search_json_opcode(hits: &[u64], hexstr: &str, width8: bool) -> serde_json::Value {
+pub fn search_json_opcode(hits: &[OpcodeHit], hexstr: &str, width8: bool) -> serde_json::Value {
+    let len = hexstr.len() / 2;
     hits.iter()
-        .map(|&v| {
-            serde_json::json!({
-                "vaddr": fmt_search_addr(v, width8),
-                "opcode": hexstr,
-            })
-        })
+        .map(|h| hit_object(h.vaddr, width8, len, "opcode", hexstr.into(), &h.site))
         .collect::<Vec<_>>()
         .into()
 }
@@ -345,10 +462,14 @@ pub fn search_json_opcode(hits: &[u64], hexstr: &str, width8: bool) -> serde_jso
 pub fn search_json_memstr(hits: &[MemStrHit], width8: bool) -> serde_json::Value {
     hits.iter()
         .map(|h| {
-            serde_json::json!({
-                "vaddr": fmt_search_addr(h.vaddr, width8),
-                "char": h.ch.to_string(),
-            })
+            hit_object(
+                h.vaddr,
+                width8,
+                h.ch.len_utf8(),
+                "char",
+                h.ch.to_string().into(),
+                &h.site,
+            )
         })
         .collect::<Vec<_>>()
         .into()
@@ -364,26 +485,52 @@ pub fn search_json_memstr(hits: &[MemStrHit], width8: bool) -> serde_json::Value
 /// Invalid regex: the oracle dies with an uncaught re.error (exit 1); we
 /// return a usage error (exit 1) — same code, clean message.
 pub fn apply_re_filter(gadgets: &mut Vec<Gadget>, re: &str) -> Result<(), String> {
-    let pieces: Vec<&str> = if re.contains('|') {
-        let spaced: Vec<&str> = re.split(" | ").collect();
-        if spaced.len() == 1 {
-            re.split('|').collect()
-        } else {
-            spaced
-        }
-    } else {
-        vec![re]
-    };
-    let mut pats = Vec::with_capacity(pieces.len());
-    for p in pieces {
-        pats.push(Regex::new(p).map_err(|e| format!("invalid --re pattern {p:?}: {e}"))?);
-    }
+    let f = ReFilter::compile(re)?;
     gadgets.retain(|g| {
         let text = g.text();
         let insns: Vec<&str> = text.split(" ; ").collect();
-        pats.iter().all(|p| insns.iter().any(|i| p.is_match(i)))
+        f.matches(&insns)
     });
     Ok(())
+}
+
+/// `--re`, compiled once.
+///
+/// ECO-09's streaming path applies `--re` per gadget as the scan runs, so
+/// the patterns cannot be rebuilt inside the retain closure any more. This
+/// is the same predicate [`apply_re_filter`] uses — it *is* what
+/// `apply_re_filter` uses — so the streaming and buffered paths cannot
+/// disagree about what `--re` means.
+#[derive(Debug)]
+pub struct ReFilter {
+    pats: Vec<Regex>,
+}
+
+impl ReFilter {
+    pub fn compile(re: &str) -> Result<ReFilter, String> {
+        let pieces: Vec<&str> = if re.contains('|') {
+            let spaced: Vec<&str> = re.split(" | ").collect();
+            if spaced.len() == 1 {
+                re.split('|').collect()
+            } else {
+                spaced
+            }
+        } else {
+            vec![re]
+        };
+        let mut pats = Vec::with_capacity(pieces.len());
+        for p in pieces {
+            pats.push(Regex::new(p).map_err(|e| format!("invalid --re pattern {p:?}: {e}"))?);
+        }
+        Ok(ReFilter { pats })
+    }
+
+    /// Every pattern must match at least one instruction.
+    pub fn matches(&self, insns: &[&str]) -> bool {
+        self.pats
+            .iter()
+            .all(|p| insns.iter().any(|i| p.is_match(i)))
+    }
 }
 
 /// options.py:100-120 `__isGadgetCallPreceded`, re-exported from the engine.

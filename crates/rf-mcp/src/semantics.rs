@@ -17,7 +17,7 @@
 //! panic lived: nothing here ever re-derives semantics from a response.
 
 use rf_cache::{CachedGadget, CachedScan};
-use rf_classify::{Class, Classification, Classifier, RankKey};
+use rf_classify::{Class, Classification, Classifier, RankKey, TerminatorClass};
 use rf_core::Arch;
 use serde_json::json;
 
@@ -42,6 +42,43 @@ pub const CLASS_NAMES: &[&str] = &[
 /// an agent asks is "can this gadget hand control to the next word of my
 /// chain", not "which encoding".
 pub const TERMINATOR_KINDS: &[&str] = &["ret", "jmp", "call", "syscall", "none", "any"];
+
+/// The FINE terminator vocabulary the `terminator` parameter also accepts
+/// (CLS-09's [`TerminatorClass`]): `ret-imm`, `jmp-reg`, `jmp-mem`,
+/// `call-reg`, `call-mem`, `far`, `other`.
+///
+/// `terminator` therefore takes a union: the six coarse kinds above answer
+/// "can this hand control to the next word of my chain", and these answer
+/// "how, exactly" — `jmp-reg` is a JOP dispatcher target and `jmp-mem` is
+/// not, and no coarse kind separates them. A value is looked up in the
+/// coarse set first, so `ret` keeps meaning *every* returning form and
+/// `ret-imm` narrows it.
+pub const TERMINATOR_CLASSES: &[&str] = TerminatorClass::ALL;
+
+/// The spelling for the NARROW near return, [`TerminatorClass::Ret`].
+///
+/// `ret` is taken by the coarse kind — deliberately, because the shared
+/// query spec names `ret` and a user typing the spec's word must never
+/// silently get less than every returning form. That leaves
+/// `TerminatorClass::Ret` (the bare `c3`, excluding `ret imm16`, `retf`
+/// and `iret`) with no name at all, which is a capability the CLI had and
+/// this surface did not: `--terminator bare-ret` answered on one side and
+/// was a usage error on the other. Same token, same meaning, both sides.
+pub const TERMINATOR_BARE_RET: &str = "bare-ret";
+
+/// Every accepted `terminator` value, coarse then fine, for an error
+/// message.
+#[must_use]
+pub fn terminator_vocabulary() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = TERMINATOR_KINDS.to_vec();
+    v.push(TERMINATOR_BARE_RET);
+    for f in TERMINATOR_CLASSES {
+        if !v.contains(f) {
+            v.push(f);
+        }
+    }
+    v
+}
 
 // ---------------------------------------------------------------------------
 // The per-gadget record
@@ -91,7 +128,10 @@ impl Semantics {
                 strs(&c.regs_written)
                     + strs(&c.regs_read)
                     + strs(&c.regs_from_stack)
+                    + strs(&c.sets)
+                    + strs(&c.clobbers)
                     + c.labels.len() * 8
+                    + c.transfers.len() * 96
             })
     }
 
@@ -116,6 +156,20 @@ impl Semantics {
     #[must_use]
     pub fn regs_read(&self) -> &[String] {
         self.class.as_ref().map_or(&[], |c| &c.regs_read)
+    }
+
+    /// The `reads_reg` predicate, which is NOT `regs_read().contains()`.
+    ///
+    /// `regs_read` keeps the operand's own spelling (`al`, not `rax`) and
+    /// says nothing about the terminator, so the containment test this used
+    /// to be missed every JOP dispatcher: `jmp rax` reads rax and did not
+    /// answer `reads_reg: "rax"`. Measured against the CLI's `--reads-reg`
+    /// on elf-Linux-x64 at depth 4, the two surfaces returned 2147 and 2888
+    /// gadgets for the same question. Both now call the one predicate on
+    /// [`rf_classify::Classification`].
+    #[must_use]
+    pub fn reads_reg(&self, reg: &str) -> bool {
+        self.class.as_ref().is_some_and(|c| c.reads_reg(reg))
     }
 
     #[must_use]
@@ -164,6 +218,60 @@ impl Semantics {
         self.class
             .as_ref()
             .map_or("none", |c| c.terminator().kind())
+    }
+
+    /// CLS-09's nine-way terminator class (`ret`, `ret-imm`, `jmp-reg`,
+    /// `jmp-mem`, `call-reg`, `call-mem`, `syscall`, `far`, `other`).
+    #[must_use]
+    pub fn terminator_class(&self) -> &'static str {
+        self.class
+            .as_ref()
+            .map_or("other", |c| c.terminator_class().name())
+    }
+
+    /// CLS-09 `sets`: registers written with a value the chain payload
+    /// decides. NOT `regs_written` — see [`Semantics::clobbers`].
+    #[must_use]
+    pub fn sets(&self) -> &[String] {
+        self.class.as_ref().map_or(&[], |c| &c.sets)
+    }
+
+    /// CLS-09 `clobbers`: registers written with a value the payload does
+    /// not decide. `mov rdi, rax ; ret` clobbers rdi — which does not make
+    /// the gadget unusable, only dependent on rax.
+    #[must_use]
+    pub fn clobbers(&self) -> &[String] {
+        self.class.as_ref().map_or(&[], |c| &c.clobbers)
+    }
+
+    /// CLS-09 net stack-pointer movement. `None` is UNKNOWN, never zero.
+    #[must_use]
+    pub fn stack_delta(&self) -> Option<i64> {
+        self.class.as_ref().and_then(|c| c.stack_delta)
+    }
+
+    /// Does the payload decide `reg`'s final value (`--set-reg`)?
+    #[must_use]
+    pub fn sets_reg(&self, reg: &str) -> bool {
+        self.class.as_ref().is_some_and(|c| c.sets_reg(reg))
+    }
+
+    /// Is `reg` loaded straight off the chain payload (`--from-stack`)?
+    #[must_use]
+    pub fn reg_from_stack(&self, reg: &str) -> bool {
+        self.class.as_ref().is_some_and(|c| c.reg_from_stack(reg))
+    }
+
+    /// Payload offset, in bytes from entry sp, that supplies `reg`.
+    #[must_use]
+    pub fn stack_offset_of(&self, reg: &str) -> Option<i64> {
+        self.class.as_ref().and_then(|c| c.stack_offset_of(reg))
+    }
+
+    /// Does the gadget clobber `reg` (`--no-clobber`)?
+    #[must_use]
+    pub fn clobbers_reg(&self, reg: &str) -> bool {
+        self.class.as_ref().is_some_and(|c| c.clobbers_reg(reg))
     }
 }
 
@@ -384,6 +492,21 @@ fn norm_reg(s: &str) -> String {
     t.to_ascii_lowercase()
 }
 
+/// Split every element of a list parameter, so `["rsi", "rdx"]` and
+/// `["rsi,rdx"]` are the same request. The MCP spelling of `no_clobber` is
+/// an array (`{"no_clobber": ["rsi","rdx"]}`); the CLI spelling is one
+/// comma-separated value (`--no-clobber rsi,rdx`), and an agent that
+/// transliterates the flag straight into the array must not silently ask
+/// for a register called "rsi,rdx".
+fn split_each(v: &[String]) -> Vec<String> {
+    v.iter()
+        .flat_map(|s| s.split([',', '|']))
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn split_list(v: Option<&str>) -> Vec<String> {
     v.map(|s| {
         s.split([',', '|'])
@@ -415,10 +538,39 @@ pub struct GadgetFilter {
     /// `pop`, or a load based on the stack pointer). With no `writes_regs`,
     /// at least one register must be.
     pub from_stack: bool,
-    /// Terminator kind; `"any"` and `None` mean no constraint.
-    pub terminator: Option<String>,
+    /// Coarse terminator kinds ([`Terminator::kind`]); any-of. Empty means
+    /// no constraint, and so does a value of `"any"`.
+    ///
+    /// `terminator` is a comma-separated any-of list, exactly as the CLI's
+    /// `--terminator` is: `"ret,jmp"` is one question, not a usage error,
+    /// and the two surfaces are compared value by value by
+    /// `tests/capability_matrix.py`.
+    pub terminator_kinds: Vec<String>,
+    /// The FINE terminator classes ([`TerminatorClass`]) named in the same
+    /// list; any-of, unioned with [`Self::terminator_kinds`].
+    pub terminator_classes: Vec<String>,
     pub max_side_effects: Option<u32>,
     pub max_insns: Option<u32>,
+
+    // ---- ECO-01 / CLS-09, v0.4 ------------------------------------------
+    /// `set_reg`: the gadget must SET all of these — write them with a
+    /// value the chain payload decides. Strictly stronger than
+    /// `writes_regs`, which is satisfied by `xor rdi, rdi`.
+    pub set_regs: Vec<String>,
+    /// `no_clobber`: none of these may be CLOBBERED. Matched against
+    /// `Classification::clobbers`, not `regs_written` — `mov rdi, rax`
+    /// clobbers rdi, and `pop rdi` does not.
+    pub no_clobber: Vec<String>,
+    /// `max_stack_delta`: the gadget's net stack movement must be KNOWN
+    /// and at most this. An unknown delta is rejected, never treated as 0
+    /// (CLS-09: `xchg rsp, rax ; ret` has an unknown delta and must not
+    /// silently pass a layout budget).
+    pub max_stack_delta: Option<i64>,
+    /// `pivot`: the ECO-12 preset — the gadget carries the `stack-pivot`
+    /// label (as a primary class or as a secondary one).
+    pub pivot: bool,
+    /// `search`: the ropper-style wildcard instruction-sequence matcher.
+    pub search: Option<crate::pattern::SeqPattern>,
 }
 
 /// The filter parameters exactly as the request carries them, before any
@@ -435,6 +587,12 @@ pub struct RawFilter<'a> {
     pub terminator: Option<&'a str>,
     pub max_side_effects: Option<u32>,
     pub max_insns: Option<u32>,
+    // ECO-01 / CLS-09, v0.4.
+    pub set_reg: Option<&'a str>,
+    pub no_clobber: &'a [String],
+    pub max_stack_delta: Option<i64>,
+    pub pivot: Option<bool>,
+    pub search: Option<&'a str>,
 }
 
 impl GadgetFilter {
@@ -457,18 +615,53 @@ impl GadgetFilter {
                 }
             }
         }
-        if let Some(t) = raw.terminator {
-            if !TERMINATOR_KINDS.contains(&t) {
+        // `terminator` accepts the coarse kind first (so `ret` keeps
+        // meaning every returning form) and CLS-09's fine class second.
+        let mut terminator_kinds: Vec<String> = Vec::new();
+        let mut terminator_classes: Vec<String> = Vec::new();
+        let mut terminator_any = false;
+        // Comma-separated any-of, trimmed and lowercased — the same
+        // normalisation the CLI applies to `--terminator`. Before this,
+        // `terminator: "RET"` was a usage_error here and a working query
+        // there, and `"ret,jmp"` likewise.
+        for t in split_list(raw.terminator) {
+            let t = t.to_ascii_lowercase();
+            if t == "any" {
+                terminator_any = true;
+            } else if TERMINATOR_KINDS.contains(&t.as_str()) {
+                terminator_kinds.push(t);
+            } else if t == TERMINATOR_BARE_RET {
+                terminator_classes.push(TerminatorClass::Ret.name().to_string());
+            } else if TerminatorClass::parse(&t).is_some() {
+                terminator_classes.push(t);
+            } else {
+                let vocab = terminator_vocabulary();
                 return Err(ToolError::with_details(
                     ErrorCode::UsageError,
                     format!(
                         "unknown terminator {t:?}; valid values are {}",
-                        TERMINATOR_KINDS.join(", ")
+                        vocab.join(", ")
                     ),
-                    json!({"parameter": "terminator", "valid": TERMINATOR_KINDS, "got": t}),
+                    json!({"parameter": "terminator", "valid": vocab, "got": t}),
                 ));
             }
         }
+        if terminator_any {
+            // `any` is "no constraint" and wins over anything beside it, as
+            // `--terminator any,ret` does on the CLI.
+            terminator_kinds.clear();
+            terminator_classes.clear();
+        }
+        let search = match raw.search {
+            Some(pat) => Some(crate::pattern::SeqPattern::parse(pat).map_err(|e| {
+                ToolError::with_details(
+                    ErrorCode::UsageError,
+                    e,
+                    json!({"parameter": "search", "got": pat}),
+                )
+            })?),
+            None => None,
+        };
         Ok(GadgetFilter {
             classes,
             labels,
@@ -485,9 +678,21 @@ impl GadgetFilter {
                 .map(|r| norm_reg(r))
                 .collect(),
             from_stack: raw.from_stack.unwrap_or(false),
-            terminator: raw.terminator.filter(|t| *t != "any").map(str::to_string),
+            terminator_kinds,
+            terminator_classes,
             max_side_effects: raw.max_side_effects,
             max_insns: raw.max_insns,
+            set_regs: split_list(raw.set_reg)
+                .iter()
+                .map(|r| norm_reg(r))
+                .collect(),
+            no_clobber: split_each(raw.no_clobber)
+                .iter()
+                .map(|r| norm_reg(r))
+                .collect(),
+            max_stack_delta: raw.max_stack_delta,
+            pivot: raw.pivot.unwrap_or(false),
+            search,
         })
     }
 
@@ -500,9 +705,15 @@ impl GadgetFilter {
             && self.reads_regs.is_empty()
             && self.preserves_regs.is_empty()
             && !self.from_stack
-            && self.terminator.is_none()
+            && self.terminator_kinds.is_empty()
+            && self.terminator_classes.is_empty()
             && self.max_side_effects.is_none()
             && self.max_insns.is_none()
+            && self.set_regs.is_empty()
+            && self.no_clobber.is_empty()
+            && self.max_stack_delta.is_none()
+            && !self.pivot
+            && self.search.is_none()
     }
 
     /// Does this gadget satisfy every constraint?
@@ -524,24 +735,64 @@ impl GadgetFilter {
         if !self.writes_regs.iter().all(|r| written.contains(r)) {
             return false;
         }
-        if !self.reads_regs.iter().all(|r| s.regs_read().contains(r)) {
+        if !self.reads_regs.iter().all(|r| s.reads_reg(r)) {
             return false;
         }
         if self.preserves_regs.iter().any(|r| written.contains(r)) {
             return false;
         }
+        // CLS-09 `sets` — a payload-decided write, which `regs_written`
+        // does not distinguish: `xor rdi, rdi ; ret` writes rdi and sets
+        // nothing.
+        if !self.set_regs.iter().all(|r| s.sets_reg(r)) {
+            return false;
+        }
+        // CLS-09 `clobbers` — NOT `regs_written`. `pop rdi ; ret` writes
+        // rdi and clobbers nothing, so `no_clobber: ["rdi"]` keeps it,
+        // while `mov rdi, rax ; ret` is dropped.
+        if self.no_clobber.iter().any(|r| s.clobbers_reg(r)) {
+            return false;
+        }
         if self.from_stack {
-            let stack = s.regs_from_stack();
-            if self.writes_regs.is_empty() {
-                if stack.is_empty() {
+            // Anchored on `set_reg` when there is one (CLS-09's
+            // `reg_from_stack`), on `writes_reg` otherwise (the v0.3
+            // spelling), and on "anything at all" when neither is given.
+            let anchor = if self.set_regs.is_empty() {
+                &self.writes_regs
+            } else {
+                &self.set_regs
+            };
+            if anchor.is_empty() {
+                if s.regs_from_stack().is_empty() {
                     return false;
                 }
-            } else if !self.writes_regs.iter().all(|r| stack.contains(r)) {
+            } else if !anchor.iter().all(|r| s.reg_from_stack(r)) {
                 return false;
             }
         }
-        if let Some(t) = &self.terminator {
-            if s.terminator_kind() != t {
+        if self.pivot && !s.labels().contains(&"stack-pivot") {
+            return false;
+        }
+        if let Some(max) = self.max_stack_delta {
+            // `None` is UNKNOWN. Accepting it here is the mistake CLS-09
+            // names: it would put `xchg rsp, rax ; ret` inside a layout
+            // budget it does not respect.
+            match s.stack_delta() {
+                Some(d) if d <= max => {}
+                _ => return false,
+            }
+        }
+        if !(self.terminator_kinds.is_empty() && self.terminator_classes.is_empty()) {
+            let kind = s.terminator_kind();
+            let class = s.terminator_class();
+            let ok = self.terminator_kinds.iter().any(|t| t == kind)
+                || self.terminator_classes.iter().any(|t| t == class);
+            if !ok {
+                return false;
+            }
+        }
+        if let Some(pat) = &self.search {
+            if !pat.matches(&s.insns) {
                 return false;
             }
         }

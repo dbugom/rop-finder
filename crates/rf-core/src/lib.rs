@@ -18,6 +18,17 @@
 //! total materialised per view is bounded so a header table cannot multiply
 //! a small file into gigabytes of copies.
 //!
+//! **Mitigations and symbols (ECO-06).** Every loader also reports what a
+//! `checksec` run would tell you — [`ElfBinary::mitigations`],
+//! [`PeBinary::mitigations`], [`MachOBinary::mitigations`],
+//! [`RawBinary::mitigations`] — as `{name: {enabled, evidence, detail}}`
+//! where `enabled` is the tri-state [`Enabled`]. A reader that cannot see
+//! the deciding bytes answers [`Enabled::Unknown`] with a stated reason
+//! rather than defaulting to a boolean. [`ElfBinary::symbols`] adds the
+//! `.dynsym`/`.symtab` listing, with the GOT slot (and, where provable, the
+//! PLT stub) of every PLT-called import. See the [`mitigations`] module for
+//! the report contract and the divergences from `checksec.sh`.
+//!
 //! Section model: names and flags come from each format's section headers
 //! (ELF `SHF_EXECINSTR`, PE `IMAGE_SCN_MEM_EXECUTE`, Mach-O instruction
 //! attributes). Scan regions mirror ROPgadget's loaders: executable
@@ -28,10 +39,15 @@
 mod arch;
 mod binary;
 mod elf;
+mod elf_info;
 mod error;
 mod macho;
+mod macho_info;
+pub mod mitigations;
 mod pe;
+mod pe_info;
 mod raw;
+mod symbols;
 mod universal;
 mod util;
 
@@ -40,6 +56,8 @@ pub use binary::{Binary, Format, LoadedBinary};
 pub use elf::{ElfBinary, ElfClass, ModeDivergence, Section};
 pub use error::Error;
 pub use macho::MachOBinary;
+pub use mitigations::{Enabled, Mitigation, Mitigations};
 pub use pe::{PeBinary, PeImport};
 pub use raw::RawBinary;
+pub use symbols::{Symbol, SymbolTable};
 pub use universal::{SliceInfo, UniversalBinary};

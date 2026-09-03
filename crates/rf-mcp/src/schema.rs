@@ -189,6 +189,91 @@ impl Warning {
 // Gadget records
 // ---------------------------------------------------------------------------
 
+/// ECO-01: why this gadget is in the answer, in the vocabulary the query
+/// was written in.
+///
+/// The point is that an agent can justify a choice — to itself, to a user,
+/// or in a chain plan — WITHOUT re-deriving semantics from gadget text.
+/// Re-derivation from text is what the whole classifier exists to prevent,
+/// and it is where an agent silently gets `mov rdi, rax ; ret` wrong.
+///
+/// It repeats `reads`, `stack_delta` and `terminator`, which also appear at
+/// the top level of the record, deliberately: the object is meant to be
+/// quotable on its own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Explanation {
+    /// CLS-09 `sets`: registers this gadget writes with a value the chain
+    /// PAYLOAD decides. This is what `set_reg` matches, and it is a strict
+    /// subset of `regs_written` — `xor rdi, rdi ; ret` writes rdi and sets
+    /// nothing.
+    pub sets: Vec<String>,
+    /// Registers read (`regs_read`): the inputs that must already hold what
+    /// you want.
+    pub reads: Vec<String>,
+    /// CLS-09 `clobbers`: registers written with a value the payload does
+    /// NOT decide. A clobber is not "unusable" — `mov rdi, rax ; ret`
+    /// clobbers rdi and tells you to control rax instead — but it is what
+    /// `no_clobber` rejects.
+    pub clobbers: Vec<String>,
+    /// Net stack-pointer movement in bytes, terminator included. `null`
+    /// means UNKNOWN (a non-constant effect, an unmodelled form, or the
+    /// text classification path) and must never be read as zero.
+    pub stack_delta: Option<i64>,
+    /// CLS-09 terminator class: `ret`, `ret-imm`, `jmp-reg`, `jmp-mem`,
+    /// `call-reg`, `call-mem`, `syscall`, `far`, `other`. Finer than the
+    /// record's `terminator`, and the spelling the `terminator` filter
+    /// accepts.
+    pub terminator: String,
+    /// One sentence naming the payload offset each set register comes from,
+    /// what is clobbered, the stack movement and the terminator.
+    pub why: String,
+}
+
+impl Explanation {
+    /// Build the explanation for one classified gadget.
+    #[must_use]
+    pub fn build(s: &crate::semantics::Semantics) -> Explanation {
+        let sets = s.sets().to_vec();
+        let clobbers = s.clobbers().to_vec();
+        let terminator = s.terminator_class().to_string();
+        let mut parts: Vec<String> = Vec::new();
+        if s.class.is_none() {
+            parts.push("no classifier for this architecture".to_string());
+        } else if sets.is_empty() {
+            parts.push("sets no register from the payload".to_string());
+        } else {
+            let each: Vec<String> = sets
+                .iter()
+                .map(|r| match s.stack_offset_of(r) {
+                    Some(off) => format!("{r} from stack[{off:+}]"),
+                    None if s.reg_from_stack(r) => format!("{r} from the stack"),
+                    None => r.clone(),
+                })
+                .collect();
+            parts.push(format!("sets {}", each.join(", ")));
+        }
+        parts.push(if clobbers.is_empty() {
+            "clobbers nothing".to_string()
+        } else {
+            format!("clobbers {}", clobbers.join(", "))
+        });
+        parts.push(match s.stack_delta() {
+            Some(d) => format!("stack delta {d:+}"),
+            None => "stack delta unknown".to_string(),
+        });
+        parts.push(format!("ends in {terminator}"));
+        Explanation {
+            sets,
+            reads: s.regs_read().to_vec(),
+            clobbers,
+            stack_delta: s.stack_delta(),
+            terminator,
+            why: parts.join("; "),
+        }
+    }
+}
+
 /// One gadget, in the shape every gadget-returning tool emits.
 ///
 /// Invariant: the field set does not depend on the request. A gadget from a
@@ -244,9 +329,15 @@ pub struct GadgetRecord {
     pub regs_from_stack: Vec<String>,
     /// Instructions that earn at least one label.
     pub side_effects: u32,
-    /// Net change to the stack pointer. **Always `null` in v0.3**: the
-    /// computation is ECO-07/CLS-09 and lands in v0.4. The field is here
-    /// now so the record shape does not change when it does.
+    /// Net change to the stack pointer, in bytes, with the terminator's
+    /// own pop included — `pop rdi ; ret` is 16 on x86-64. CLS-09 landed
+    /// the computation in v0.4; the field existed (always `null`) in v0.3
+    /// so the record shape would not change when it did.
+    ///
+    /// `null` is UNKNOWN, not zero: a non-constant effect (`xchg rsp,
+    /// rax`), an architecture or instruction form the model does not prove,
+    /// or a gadget classified from text. `max_stack_delta` rejects it
+    /// rather than assuming.
     pub stack_delta: Option<i64>,
     /// TAXONOMY.md R12 quality score, higher is cleaner.
     pub quality: i32,
@@ -266,6 +357,8 @@ pub struct GadgetRecord {
     /// The classification came from disassembly text rather than decoder
     /// metadata, so treat the semantic fields as advisory.
     pub low_confidence: bool,
+    /// ECO-01: why this gadget is here, in the query's own vocabulary.
+    pub explanation: Explanation,
 }
 
 impl GadgetRecord {
@@ -294,15 +387,14 @@ impl GadgetRecord {
             regs_read: s.regs_read().to_vec(),
             regs_from_stack: s.regs_from_stack().to_vec(),
             side_effects: s.side_effects(),
-            // ECO-07/CLS-09, v0.4. The field exists now so the record's
-            // shape does not change when the computation lands.
-            stack_delta: None,
+            stack_delta: s.stack_delta(),
             quality: s.quality(),
             usability: s.rank.usability,
             terminator: s.terminator().to_string(),
             dispatcher: s.dispatcher(),
             privileged: s.privileged(),
             low_confidence: s.low_confidence(),
+            explanation: Explanation::build(s),
         }
     }
 }
@@ -409,12 +501,63 @@ pub struct SectionRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ImportRecord {
-    pub dll: String,
+    /// PE only: the DLL the symbol comes from. `null` on an ELF, which has
+    /// no per-symbol library name — the loader resolves by name across the
+    /// whole `DT_NEEDED` set.
+    pub dll: Option<String>,
+    /// The symbol name. Present for every format.
     pub symbol: String,
-    /// CHWIN-03: the IAT slot the loader patches. Dereference this.
-    pub iat_vaddr: String,
-    /// The `IMAGE_IMPORT_BY_NAME` record holding the name string.
-    pub hint_name_vaddr: String,
+    /// PE only: the IAT slot the loader patches — dereference this. `null`
+    /// on an ELF (`got` is the equivalent).
+    pub iat_vaddr: Option<String>,
+    /// PE only: the `IMAGE_IMPORT_BY_NAME` record holding the name string.
+    pub hint_name_vaddr: Option<String>,
+    /// ELF only: the symbol's own `st_value`, rebased. `null` when it is 0,
+    /// which is "no address" rather than "address 0" — the psABI puts a PLT
+    /// stub here on ARM/AArch64/SPARC/RISC-V and nothing on x86/x64/PPC.
+    pub addr: Option<String>,
+    /// ELF only: the `DT_JMPREL` relocation slot — the GOT cell this symbol
+    /// is written into. An exact relocation field, not a guess.
+    pub got: Option<String>,
+    /// ELF only: the PLT stub, reported ONLY when it is provable from a
+    /// byte-exact `.plt`/`.plt.sec` layout or an `st_value` that lands
+    /// inside `.plt`. `null` everywhere else, because a wrong PLT address
+    /// silently produces a chain that jumps into the middle of a stub.
+    pub plt: Option<String>,
+    /// ELF only: `STT_*` as a name — `func`, `object`, `notype`, `ifunc`.
+    pub sym_type: Option<String>,
+    /// ELF only: `STB_*` as a name — `global`, `weak`, `local`.
+    pub binding: Option<String>,
+}
+
+/// One symbol from an ELF's `.dynsym` or `.symtab` (ECO-06).
+///
+/// This is the ret2plt/ret2libc working set: without it, resolving
+/// `system` in a target meant leaving rop-finder for a second tool.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SymbolRecord {
+    /// Symbol name; never empty (unnamed entries are dropped by the
+    /// loader).
+    pub name: String,
+    /// `st_value`, rebased. `null` when it is 0 — "no address", not
+    /// "address 0".
+    pub addr: Option<String>,
+    pub size: u64,
+    /// `STT_*` as a name: `notype`, `object`, `func`, `section`, `file`,
+    /// `common`, `tls`, `ifunc`.
+    pub sym_type: String,
+    /// `STB_*` as a name: `local`, `global`, `weak`.
+    pub binding: String,
+    /// Which table it came from: `dynsym` or `symtab`.
+    pub table: String,
+    /// `st_shndx == SHN_UNDEF` — an import, i.e. something the loader will
+    /// resolve elsewhere.
+    pub is_import: bool,
+    /// The `DT_JMPREL` GOT slot, when this symbol has one.
+    pub got: Option<String>,
+    /// The PLT stub, when it is provable.
+    pub plt: Option<String>,
 }
 
 /// One slice of a fat (Universal) Mach-O.
@@ -433,6 +576,10 @@ pub struct SliceRecord {
     pub slice: Option<String>,
     pub slice_offset: Option<String>,
     pub slice_size: Option<u64>,
+    /// Same meaning as [`InfoResponse::symbols`], per slice.
+    pub symbols: Vec<SymbolRecord>,
+    /// Same meaning as [`InfoResponse::symbol_count`], per slice.
+    pub symbol_count: Option<u64>,
 }
 
 /// `get_binary_info`. Fixed shape across every container format: an ELF
@@ -454,6 +601,15 @@ pub struct InfoResponse {
     /// Fat Mach-O only: the scan tools refuse this binary without `arch`.
     pub arch_selection_required: Option<bool>,
     pub slices: Vec<SliceRecord>,
+    /// ECO-06: the ELF symbol table (`.dynsym` first, then `.symtab`), which
+    /// is what a ret2plt/ret2libc chain resolves against. `[]` for a format
+    /// whose symbols are not read — `symbol_count` is how you tell that
+    /// apart from "this file has none".
+    pub symbols: Vec<SymbolRecord>,
+    /// How many symbols the parser found BEFORE `max_symbols` truncation,
+    /// or `null` when this format's symbols are not read at all. `0` and
+    /// `null` are different answers and this field is the difference.
+    pub symbol_count: Option<u64>,
     pub binary_sha256: String,
     pub warnings: Vec<Warning>,
 }
@@ -483,6 +639,22 @@ fn as_array(v: Option<Value>) -> Vec<Value> {
     }
 }
 
+/// Discard the mitigation report `rf_cli::info_json` now carries.
+///
+/// ECO-06 gives the MCP its own `get_mitigations` tool, whose record is
+/// typed (`enabled` is a bool or the string `"unknown"`, never a bare
+/// `false`) and whose ORDER is the loader's — order that a
+/// `serde_json::Value` object cannot preserve, because this crate's maps
+/// are sorted. Re-rendering the same report inside `get_binary_info` would
+/// therefore be a second, worse copy of it, and would change the shape of
+/// a response whose fixed shape is a v0.3 guarantee. Consumed explicitly so
+/// the `unmapped_info_fields` warning still fires for a field nobody
+/// decided about.
+fn drop_mitigations(o: &mut serde_json::Map<String, Value>) {
+    o.remove("mitigations");
+    o.remove("mitigations_order");
+}
+
 impl SectionRecord {
     fn from_value(v: Value) -> Option<SectionRecord> {
         let mut o = match v {
@@ -506,10 +678,36 @@ impl ImportRecord {
             _ => return None,
         };
         Some(ImportRecord {
-            dll: as_str(take(&mut o, "dll")).unwrap_or_default(),
+            dll: as_str(take(&mut o, "dll")),
             symbol: as_str(take(&mut o, "symbol")).unwrap_or_default(),
-            iat_vaddr: as_str(take(&mut o, "iat_vaddr")).unwrap_or_default(),
-            hint_name_vaddr: as_str(take(&mut o, "hint_name_vaddr")).unwrap_or_default(),
+            iat_vaddr: as_str(take(&mut o, "iat_vaddr")),
+            hint_name_vaddr: as_str(take(&mut o, "hint_name_vaddr")),
+            addr: as_str(take(&mut o, "addr")),
+            got: as_str(take(&mut o, "got")),
+            plt: as_str(take(&mut o, "plt")),
+            // `type` is a Rust keyword; the wire name is rf-cli's.
+            sym_type: as_str(take(&mut o, "type")),
+            binding: as_str(take(&mut o, "binding")),
+        })
+    }
+}
+
+impl SymbolRecord {
+    fn from_value(v: Value) -> Option<SymbolRecord> {
+        let mut o = match v {
+            Value::Object(o) => o,
+            _ => return None,
+        };
+        Some(SymbolRecord {
+            name: as_str(take(&mut o, "name")).unwrap_or_default(),
+            addr: as_str(take(&mut o, "addr")),
+            size: as_u64(take(&mut o, "size")).unwrap_or(0),
+            sym_type: as_str(take(&mut o, "type")).unwrap_or_default(),
+            binding: as_str(take(&mut o, "binding")).unwrap_or_default(),
+            table: as_str(take(&mut o, "table")).unwrap_or_default(),
+            is_import: as_bool(take(&mut o, "is_import")).unwrap_or(false),
+            got: as_str(take(&mut o, "got")),
+            plt: as_str(take(&mut o, "plt")),
         })
     }
 }
@@ -520,6 +718,7 @@ impl SliceRecord {
             Value::Object(o) => o,
             _ => return None,
         };
+        drop_mitigations(&mut o);
         Some(SliceRecord {
             format: as_str(take(&mut o, "format")).unwrap_or_default(),
             arch: as_str(take(&mut o, "arch")),
@@ -538,6 +737,11 @@ impl SliceRecord {
             slice: as_str(take(&mut o, "slice")),
             slice_offset: as_str(take(&mut o, "slice_offset")),
             slice_size: as_u64(take(&mut o, "slice_size")),
+            symbol_count: as_u64(take(&mut o, "symbol_count")),
+            symbols: as_array(take(&mut o, "symbols"))
+                .into_iter()
+                .filter_map(SymbolRecord::from_value)
+                .collect(),
         })
     }
 }
@@ -566,6 +770,7 @@ impl InfoResponse {
                 serde_json::Map::new()
             }
         };
+        drop_mitigations(&mut o);
         let out = InfoResponse {
             format: as_str(take(&mut o, "format")).unwrap_or_default(),
             arch: as_str(take(&mut o, "arch")),
@@ -586,6 +791,11 @@ impl InfoResponse {
             slices: as_array(take(&mut o, "slices"))
                 .into_iter()
                 .filter_map(SliceRecord::from_value)
+                .collect(),
+            symbol_count: as_u64(take(&mut o, "symbol_count")),
+            symbols: as_array(take(&mut o, "symbols"))
+                .into_iter()
+                .filter_map(SymbolRecord::from_value)
                 .collect(),
             binary_sha256,
             warnings: Vec::new(),
@@ -740,6 +950,18 @@ pub fn config_output_schema() -> Arc<JsonObject> {
     rmcp::handler::server::common::schema_for_output::<ConfigResponse>()
 }
 
+/// `outputSchema` for `find_string` / `find_bytes` (CLI-05 / ECO-02).
+#[must_use]
+pub fn search_output_schema() -> Arc<JsonObject> {
+    rmcp::handler::server::common::schema_for_output::<crate::find::SearchHitsResponse>()
+}
+
+/// `outputSchema` for `get_mitigations` (ECO-06).
+#[must_use]
+pub fn mitigations_output_schema() -> Arc<JsonObject> {
+    rmcp::handler::server::common::schema_for_output::<crate::checksec::MitigationsResponse>()
+}
+
 #[must_use]
 pub fn stats_output_schema() -> Arc<JsonObject> {
     rmcp::handler::server::common::schema_for_output::<StatsResponse>()
@@ -862,6 +1084,15 @@ mod tests {
             dispatcher: false,
             privileged: false,
             low_confidence: false,
+            explanation: Explanation {
+                sets: Vec::new(),
+                reads: Vec::new(),
+                clobbers: Vec::new(),
+                stack_delta: None,
+                terminator: "ret".into(),
+                why: "sets no register from the payload; clobbers nothing;                       stack delta unknown; ends in ret"
+                    .into(),
+            },
         };
         let v = serde_json::to_value(&rec).unwrap();
         let obj = v.as_object().unwrap();
@@ -888,10 +1119,25 @@ mod tests {
             "dispatcher",
             "privileged",
             "low_confidence",
+            // ECO-01, v0.4.
+            "explanation",
         ] {
             assert!(obj.contains_key(key), "missing {key} in {v}");
         }
-        assert_eq!(obj.len(), 22, "unexpected field count: {v}");
+        assert_eq!(obj.len(), 23, "unexpected field count: {v}");
+        for key in [
+            "sets",
+            "reads",
+            "clobbers",
+            "stack_delta",
+            "terminator",
+            "why",
+        ] {
+            assert!(
+                obj["explanation"].get(key).is_some(),
+                "missing explanation.{key} in {v}"
+            );
+        }
         assert!(obj["arch"].is_null());
         assert!(obj["section"].is_null());
     }
