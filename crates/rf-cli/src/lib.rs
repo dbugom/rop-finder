@@ -24,6 +24,9 @@
 use std::fmt;
 use std::process::ExitCode;
 
+mod console;
+mod search;
+
 use clap::Parser;
 use globset::{Glob, GlobSetBuilder};
 use rf_core::{
@@ -39,9 +42,9 @@ use serde::Serialize;
     about = "Fast Rust ROP/JOP/SYS gadget finder (ROPgadget rewrite)"
 )]
 pub struct Cli {
-    /// Specify a binary filename to analyze
+    /// Specify a binary filename to analyze (optional with --console)
     #[arg(long)]
-    pub binary: String,
+    pub binary: Option<String>,
 
     /// Depth for search engine (default 10)
     #[arg(long, default_value_t = 10)]
@@ -167,6 +170,63 @@ pub struct Cli {
     /// %LOCALAPPDATA%/rop-finder/cache (Windows) or ~/.cache/rop-finder
     #[arg(long)]
     pub cache: bool,
+
+    /// Search a string (byte regex, e.g. "m..n") in readable (data)
+    /// sections instead of gadget scanning
+    #[arg(long)]
+    pub string: Option<String>,
+
+    /// Search an opcode byte sequence (hex, e.g. c9c3) in executable
+    /// sections instead of gadget scanning
+    #[arg(long)]
+    pub opcode: Option<String>,
+
+    /// Search the first occurrence of each byte of the string across all
+    /// readable sections instead of gadget scanning
+    #[arg(long)]
+    pub memstr: Option<String>,
+
+    /// Regular expression over gadget instructions; every |-separated
+    /// pattern must match at least one instruction (options.py:64-98)
+    #[arg(long)]
+    pub re: Option<String>,
+
+    /// Only show gadgets immediately preceded by a call instruction
+    /// (x86/x64; options.py:100-120 heuristic)
+    #[arg(long = "callPreceded")]
+    pub call_preceded: bool,
+
+    /// Disable the gadget instruction printing: bare addresses, no dedup,
+    /// no sort
+    #[arg(long)]
+    pub noinstr: bool,
+
+    /// Append the gadget bytes to human output (" // hexbytes")
+    #[arg(long)]
+    pub dump: bool,
+
+    /// Suppress gadget printing during analysis (the callPreceded filter
+    /// line still prints, as in ROPgadget)
+    #[arg(long)]
+    pub silent: bool,
+
+    /// Align gadget addresses (overrides anchor stepping alignment, in
+    /// bytes; 0 = no alignment constraint)
+    #[arg(long)]
+    pub align: Option<usize>,
+
+    /// MIPS useful-gadget finder: stackfinder|system|tails|lia0|registers
+    #[arg(long)]
+    pub mipsrop: Option<String>,
+
+    /// Disable duplicate-gadget removal
+    #[arg(long)]
+    pub all: bool,
+
+    /// Interactive console (REPL) for the search engine; with --binary the
+    /// binary is preloaded
+    #[arg(long)]
+    pub console: bool,
 }
 
 #[derive(Serialize)]
@@ -707,6 +767,15 @@ pub struct ScanRequest {
     /// CFG/CET-aware scan (Phase 4b): keep only endbr64/endbr32-entering
     /// gadgets.
     pub cfg_aware: bool,
+    /// ROPgadget --align: anchor-stepping alignment override (engine
+    /// semantics, gadgets.py:66-67 — NOT a post-filter).
+    pub align: Option<usize>,
+    /// ROPgadget --callPreceded: capture prev bytes for the CLI filter.
+    pub call_preceded: bool,
+    /// ROPgadget --all: skip dedup.
+    pub all: bool,
+    /// ROPgadget --noinstr: skip dedup and sort; print bare addresses.
+    pub noinstr: bool,
 }
 
 impl Default for ScanRequest {
@@ -726,6 +795,10 @@ impl Default for ScanRequest {
             section: Vec::new(),
             thumb: false,
             cfg_aware: false,
+            align: None,
+            call_preceded: false,
+            all: false,
+            noinstr: false,
         }
     }
 }
@@ -796,6 +869,10 @@ fn request_options(req: &ScanRequest, raw: Option<RawSpec>) -> Result<ScanOption
         },
         thumb: req.thumb,
         cfg_aware: req.cfg_aware,
+        align: req.align,
+        call_preceded: req.call_preceded,
+        all: req.all,
+        noinstr: req.noinstr,
         parallel: true,
     };
     if let Some((_, _, raw_thumb)) = raw {
@@ -1107,6 +1184,51 @@ pub fn chain_bytes(
     })
 }
 
+/// Image base of a target (first slice for Universal) — the pre-rebase
+/// view base, used to compute the --base slide for the search sections.
+fn target_base(target: &Target) -> u64 {
+    match target {
+        Target::Elf(b) => b.image_base(),
+        Target::Pe(b) => b.image_base(),
+        Target::MachO(b) => b.image_base(),
+        Target::Raw(b) => b.image_base(),
+        Target::Universal(u) => u.slices()[0].image_base(),
+    }
+}
+
+/// options.py:22-33 — the post-scan gadget filters in oracle order: --re
+/// first, then --callPreceded. The "Filtered out" line prints even under
+/// --silent because Options runs inside __getGadgets, before the looking
+/// function's silent check.
+fn apply_post_filters(
+    gadgets: &mut Vec<Gadget>,
+    re: &Option<String>,
+    call_preceded: bool,
+    arch: Arch,
+    out: &mut dyn std::io::Write,
+) -> Result<(), String> {
+    if let Some(re) = re {
+        search::apply_re_filter(gadgets, re)?;
+    }
+    if call_preceded {
+        if matches!(arch, Arch::X86 | Arch::X64) {
+            let before = gadgets.len();
+            gadgets.retain(|g| g.prev.as_deref().is_some_and(search::is_call_preceded));
+            let _ = writeln!(
+                out,
+                "Options().removeNonCallPreceded(): Filtered out {} gadgets.",
+                before - gadgets.len()
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "Options().removeNonCallPreceded(): Unsupported architecture."
+            );
+        }
+    }
+    Ok(())
+}
+
 fn run(cli: Cli) -> Result<i32, String> {
     // Error precedence mirrors the pre-refactor CLI exactly: depth → file
     // read → raw spec → option parsing → binary load → (--info | --base →
@@ -1114,8 +1236,26 @@ fn run(cli: Cli) -> Result<i32, String> {
     if cli.depth < 2 {
         return Err("--depth must be >= 2".to_string());
     }
+    // args.py:108-112 cross-flag validation.
+    if cli.noinstr && cli.only.is_some() {
+        return Err("--noinstr and --only=<key> can't be used together".to_string());
+    }
+    if cli.noinstr && cli.re.is_some() {
+        return Err("--noinstr and --re=<re> can't be used together".to_string());
+    }
+    // args.py:142-143: a binary is required unless the console is requested.
+    if cli.binary.is_none() && !cli.console {
+        return Err("Need a binary filename (--binary/--console or --help)".to_string());
+    }
+
+    // --console: interactive REPL (binary optional, preloaded when given).
+    if cli.console {
+        return console::run_console(&cli);
+    }
+
+    let binary = cli.binary.as_deref().unwrap();
     let bytes =
-        std::fs::read(&cli.binary).map_err(|e| format!("cannot read {}: {e}", cli.binary))?;
+        std::fs::read(binary).map_err(|e| format!("cannot read {binary}: {e}"))?;
     let raw = parse_raw_spec(&cli)?;
 
     let req = ScanRequest {
@@ -1133,6 +1273,10 @@ fn run(cli: Cli) -> Result<i32, String> {
         section: cli.section.clone(),
         thumb: cli.thumb,
         cfg_aware: cli.cfg_aware,
+        align: cli.align,
+        call_preceded: cli.call_preceded,
+        all: cli.all,
+        noinstr: cli.noinstr,
     };
     let opts = match request_options(&req, raw) {
         Ok(o) => o,
@@ -1196,6 +1340,7 @@ fn run(cli: Cli) -> Result<i32, String> {
         return Ok(0);
     }
 
+    let orig_base = target_base(&target);
     let base = cli
         .base
         .as_deref()
@@ -1215,6 +1360,54 @@ fn run(cli: Cli) -> Result<i32, String> {
     }
     let universal_arch = view.universal.then_some(view.arch());
 
+    // core.py:248-261 dispatch order: console → string → opcode → memstr
+    // → mipsrop → gadget scan. Search modes ignore --section (the oracle
+    // has no --section); --base/--offset/--range apply.
+    if cli.string.is_some() || cli.opcode.is_some() || cli.memstr.is_some() {
+        if cli.silent {
+            return Ok(0); // core.py:163-164 etc.: search modes print nothing
+        }
+        let delta = view.base.wrapping_sub(orig_base);
+        let width8 = search::search_width8(&target, view.arch());
+        let mut out = std::io::stdout();
+        if let Some(s) = &cli.string {
+            let hits = search::find_string(&target, delta, opts.offset, opts.range, s)?;
+            if cli.json {
+                // Serialization of this simple structure cannot fail.
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&search::search_json_string(&hits, width8))
+                        .unwrap()
+                );
+            } else {
+                search::print_string_hits(&hits, width8, &mut out);
+            }
+        } else if let Some(op) = &cli.opcode {
+            let hits = search::find_opcode(&target, delta, opts.offset, opts.range, op)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&search::search_json_opcode(&hits, op, width8))
+                        .unwrap()
+                );
+            } else {
+                search::print_opcode_hits(&hits, op, width8, &mut out);
+            }
+        } else if let Some(m) = &cli.memstr {
+            let hits = search::find_memstr(&target, delta, opts.offset, opts.range, m);
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&search::search_json_memstr(&hits, width8))
+                        .unwrap()
+                );
+            } else {
+                search::print_memstr_hits(&hits, width8, &mut out);
+            }
+        }
+        return Ok(0);
+    }
+
     let do_scan = |view: &RegionView, opts: &ScanOptions| -> Result<Vec<Gadget>, i32> {
         match rf_scan::scan_binary(view, opts) {
             Ok(g) => Ok(g),
@@ -1226,48 +1419,89 @@ fn run(cli: Cli) -> Result<i32, String> {
             }
         }
     };
-    let mut gadgets = if cli.cache {
-        match cache_dir() {
-            Some(dir) => {
-                let key = cache_key(&bytes, &opts, &cli.section, base);
-                match cache_load(&dir, &key) {
-                    Some(g) => {
-                        eprintln!("[Cache] hit {} ({} gadgets)", &key[..16], g.len());
-                        g
-                    }
-                    None => {
-                        let g = match do_scan(&view, &opts) {
-                            Ok(g) => g,
-                            Err(c) => return Ok(c),
-                        };
-                        match cache_store(&dir, &key, &g) {
-                            Ok(()) => eprintln!(
-                                "[Cache] miss {} — stored {} gadgets",
-                                &key[..16],
-                                g.len()
-                            ),
-                            Err(e) => {
-                                eprintln!("[Cache] miss {} — store failed: {e}", &key[..16])
-                            }
+    // Gadget acquisition, shared by the --mipsrop and normal paths.
+    let acquire = || -> Result<Vec<Gadget>, i32> {
+        if cli.cache {
+            match cache_dir() {
+                Some(dir) => {
+                    let key = cache_key(&bytes, &opts, &cli.section, base);
+                    match cache_load(&dir, &key) {
+                        Some(g) => {
+                            eprintln!("[Cache] hit {} ({} gadgets)", &key[..16], g.len());
+                            Ok(g)
                         }
-                        g
+                        None => {
+                            let g = do_scan(&view, &opts)?;
+                            match cache_store(&dir, &key, &g) {
+                                Ok(()) => eprintln!(
+                                    "[Cache] miss {} — stored {} gadgets",
+                                    &key[..16],
+                                    g.len()
+                                ),
+                                Err(e) => {
+                                    eprintln!("[Cache] miss {} — store failed: {e}", &key[..16])
+                                }
+                            }
+                            Ok(g)
+                        }
                     }
                 }
-            }
-            None => {
-                eprintln!("[Cache] no cache directory (set ROP_FINDER_CACHE_DIR); scanning");
-                match do_scan(&view, &opts) {
-                    Ok(g) => g,
-                    Err(c) => return Ok(c),
+                None => {
+                    eprintln!("[Cache] no cache directory (set ROP_FINDER_CACHE_DIR); scanning");
+                    do_scan(&view, &opts)
                 }
             }
-        }
-    } else {
-        match do_scan(&view, &opts) {
-            Ok(g) => g,
-            Err(c) => return Ok(c),
+        } else {
+            do_scan(&view, &opts)
         }
     };
+
+    // --mipsrop (core.py:118-157): silent check first, then the mode
+    // check, then the header — all BEFORE the gadget scan.
+    if let Some(mode) = &cli.mipsrop {
+        if cli.silent {
+            return Ok(0);
+        }
+        let Some(regexes) = search::compile_mips_regexes(mode) else {
+            println!("Unrecognized option {mode}");
+            println!("Accepted options stackfinder|system|tails|lia0|registers");
+            return Ok(1); // analyze() -> False -> exit 1
+        };
+        println!("MIPS ROP ({mode})");
+        println!("{}", search::RULE60);
+        let mut gadgets = match acquire() {
+            Ok(g) => g,
+            Err(c) => return Ok(c),
+        };
+        apply_post_filters(
+            &mut gadgets,
+            &cli.re,
+            cli.call_preceded,
+            view.arch(),
+            &mut std::io::stdout(),
+        )?;
+        search::print_mips_gadgets(
+            &gadgets,
+            &regexes,
+            cli.dump,
+            search::search_width8(&target, view.arch()),
+            &mut std::io::stdout(),
+        );
+        return Ok(0);
+    }
+
+    let mut gadgets = match acquire() {
+        Ok(g) => g,
+        Err(c) => return Ok(c),
+    };
+    // options.py:22-33 — --re then --callPreceded, after the scan.
+    apply_post_filters(
+        &mut gadgets,
+        &cli.re,
+        cli.call_preceded,
+        view.arch(),
+        &mut std::io::stdout(),
+    )?;
     let mut classes: Option<Vec<rf_classify::Classification>> = None;
     if cli.classify || cli.rank {
         let (g, c) = classify_gadgets(gadgets, view.arch(), cli.rank);
@@ -1281,6 +1515,11 @@ fn run(cli: Cli) -> Result<i32, String> {
         selected_sections: prepared.selected_sections,
     };
 
+    // core.py:103-104 — --silent suppresses all gadget output (the
+    // callPreceded filter line above still printed, as in the oracle).
+    if cli.silent {
+        return Ok(0);
+    }
     if cli.json {
         // --rank alone reorders but does not add classification fields.
         print_json(
@@ -1289,7 +1528,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             classes.as_deref().filter(|_| cli.classify),
         );
     } else {
-        print_human(&result);
+        print_human(&result, cli.noinstr, cli.dump, &mut std::io::stdout());
     }
     Ok(0)
 }
@@ -1323,13 +1562,28 @@ pub fn fmt_addr(vaddr: u64, addr_size: usize) -> String {
     }
 }
 
-fn print_human(res: &ScanResult) {
-    println!("Gadgets information");
-    println!("============================================================");
+/// core.py:99-116 `__lookingForGadgets`. With --noinstr the gadget dicts
+/// carry no text, so the line is the bare address (core.py:110-111);
+/// --dump appends " // hexbytes" (core.py:112).
+fn print_human(res: &ScanResult, noinstr: bool, dump: bool, out: &mut dyn std::io::Write) {
+    let _ = noinstr; // noinstr gadgets have empty insns; text() is already ""
+    let _ = writeln!(out, "Gadgets information");
+    let _ = writeln!(out, "{}", search::RULE60);
     for g in &res.gadgets {
-        println!("{} : {}", fmt_addr(g.vaddr, res.addr_size), g.text());
+        let text = g.text();
+        let insts = if text.is_empty() {
+            String::new()
+        } else {
+            format!(" : {text}")
+        };
+        let bytes_str = if dump {
+            format!(" // {}", g.bytes_hex())
+        } else {
+            String::new()
+        };
+        let _ = writeln!(out, "{}{}{}", fmt_addr(g.vaddr, res.addr_size), insts, bytes_str);
     }
-    println!("\nUnique gadgets found: {}", res.gadgets.len());
+    let _ = writeln!(out, "\nUnique gadgets found: {}", res.gadgets.len());
 }
 
 /// Name of the selected section containing `vaddr` (a scan-view address,
@@ -1429,7 +1683,7 @@ fn cache_key(bytes: &[u8], opts: &ScanOptions, sections: &[String], base: Option
     let file_hash = sha256_hex(bytes);
     let param_hash = sha256_hex(
         format!(
-            "{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{:?}",
+            "{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{:?}|{:?}|{}|{}|{}",
             opts.depth,
             opts.rop,
             opts.jop,
@@ -1443,7 +1697,11 @@ fn cache_key(bytes: &[u8], opts: &ScanOptions, sections: &[String], base: Option
             opts.thumb,
             opts.cfg_aware,
             sections,
-            base
+            base,
+            opts.align,
+            opts.call_preceded,
+            opts.all,
+            opts.noinstr
         )
         .as_bytes(),
     );
@@ -1463,6 +1721,10 @@ struct CachedGadget {
     bytes: String,
     insns: Vec<String>,
     delay_slot: bool,
+    /// Hex of the up-to-9 preceding section bytes — present only in
+    /// --callPreceded scans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prev: Option<String>,
 }
 
 fn cache_load(dir: &std::path::Path, key: &str) -> Option<Vec<Gadget>> {
@@ -1487,8 +1749,19 @@ fn cache_load(dir: &std::path::Path, key: &str) -> Option<Vec<Gadget>> {
                 bytes: bytes?,
                 insns: c.insns,
                 delay_slot: c.delay_slot,
+                prev: c.prev.as_deref().and_then(hex_decode),
             })
         })
+        .collect()
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
         .collect()
 }
 
@@ -1503,6 +1776,13 @@ fn cache_store(dir: &std::path::Path, key: &str, gadgets: &[Gadget]) -> std::io:
                 bytes: g.bytes_hex(),
                 insns: g.insns.clone(),
                 delay_slot: g.delay_slot,
+                prev: g.prev.as_ref().map(|p| {
+                    let mut s = String::with_capacity(p.len() * 2);
+                    for b in p {
+                        s.push_str(&format!("{b:02x}"));
+                    }
+                    s
+                }),
             })
             .collect(),
     };
@@ -1540,7 +1820,7 @@ mod tests {
         raw_endian: Option<&str>,
     ) -> Cli {
         Cli {
-            binary: "x".into(),
+            binary: Some("x".into()),
             depth: 10,
             norop: false,
             nojop: false,
@@ -1568,6 +1848,18 @@ mod tests {
             classify: false,
             rank: false,
             cache: false,
+            string: None,
+            opcode: None,
+            memstr: None,
+            re: None,
+            call_preceded: false,
+            noinstr: false,
+            dump: false,
+            silent: false,
+            align: None,
+            mipsrop: None,
+            all: false,
+            console: false,
         }
     }
 
@@ -1603,6 +1895,10 @@ mod tests {
             offset: 0,
             thumb: false,
             cfg_aware: false,
+            align: None,
+            call_preceded: false,
+            all: false,
+            noinstr: false,
             parallel: true,
         }
     }
@@ -1640,6 +1936,7 @@ mod tests {
             bytes: vec![0u8; size as usize],
             executable: true,
             writable: false,
+            allocated: true,
         }
     }
 

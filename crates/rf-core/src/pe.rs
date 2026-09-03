@@ -102,6 +102,7 @@ impl PeBinary {
                 bytes: content,
                 executable,
                 writable: sec.characteristics & IMAGE_SCN_MEM_WRITE != 0,
+                allocated: true,
             };
             if executable {
                 exec_regions.push(section.clone());

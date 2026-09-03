@@ -282,6 +282,7 @@ fn gadget_from_cached(c: &CachedGadget) -> Option<rf_scan::Gadget> {
         bytes: bytes?,
         insns: c.text.split(" ; ").map(str::to_string).collect(),
         delay_slot: false,
+        prev: None,
     })
 }
 
@@ -534,6 +535,10 @@ fn query_to_request(q: &GadgetQuery, rop: bool, jop: bool, sys: bool) -> rf_cli:
         section: split_sections(q.section.as_deref()),
         thumb: false,
         cfg_aware: false,
+        align: None,
+        call_preceded: false,
+        all: false,
+        noinstr: false,
     }
 }
 
@@ -745,6 +750,10 @@ impl RopFinderMcp {
             section: Vec::new(),
             thumb: false,
             cfg_aware: q.cfg_aware.unwrap_or(false),
+            align: None,
+            call_preceded: false,
+            all: false,
+            noinstr: false,
         };
         let spec = rf_cli::ChainSpec {
             target: q.target.clone(),
@@ -945,6 +954,10 @@ impl RopFinderMcp {
             section: split_sections(q.section.as_deref()),
             thumb: false,
             cfg_aware: false,
+            align: None,
+            call_preceded: false,
+            all: false,
+            noinstr: false,
         };
         match self
             .run_scan(

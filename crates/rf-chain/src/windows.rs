@@ -389,6 +389,7 @@ mod tests {
             bytes: Vec::new(),
             insns: text.split(" ; ").map(|s| s.to_string()).collect(),
             delay_slot: false,
+            prev: None,
         }
     }
 

@@ -320,6 +320,7 @@ mod tests {
             bytes: bytes.to_vec(),
             insns: text.split(" ; ").map(|s| s.to_string()).collect(),
             delay_slot: false,
+            prev: None,
         }
     }
 

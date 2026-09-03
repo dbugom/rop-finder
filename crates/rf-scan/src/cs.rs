@@ -274,7 +274,7 @@ pub fn scan_anchor(
     delay_slot: bool,
     out: &mut Vec<Gadget>,
 ) {
-    let align = anchor.align();
+    let align = opts.align.unwrap_or_else(|| anchor.align());
     // Max decode window: from the deepest candidate start to the gadget end.
     let window = opts.depth.saturating_sub(1) * align.max(1) + anchor.size();
     // Per-start decode cache (memoization only — does not affect output).
@@ -335,6 +335,9 @@ pub fn scan_anchor(
                 bytes: code[start..end].to_vec(),
                 insns: format_gadget(cs, code, start, end, sec_vaddr),
                 delay_slot,
+                prev: opts
+                    .call_preceded
+                    .then(|| code[start.saturating_sub(9)..start].to_vec()),
             });
         }
     }

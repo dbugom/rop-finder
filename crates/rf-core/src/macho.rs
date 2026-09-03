@@ -130,6 +130,7 @@ impl MachOBinary {
                     bytes: content,
                     executable,
                     writable: false,
+                    allocated: true,
                 };
                 if executable {
                     exec_regions.push(section.clone());

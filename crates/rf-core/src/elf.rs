@@ -1,7 +1,7 @@
 //! ELF loading via goblin.
 
 use goblin::elf::program_header::{PF_W, PF_X, PT_LOAD};
-use goblin::elf::section_header::{SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS};
+use goblin::elf::section_header::{SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS};
 
 use crate::util::slice_clamped;
 use crate::Error;
@@ -42,6 +42,10 @@ pub struct Section {
     pub executable: bool,
     /// `SHF_WRITE` (or `PF_W` for the segment fallback).
     pub writable: bool,
+    /// `SHF_ALLOC` — occupies memory at runtime. Always true for
+    /// PE/Mach-O/raw sections and the ELF segment fallback. ROPgadget's
+    /// `getDataSections` (elf.py:323-334) requires it.
+    pub allocated: bool,
 }
 
 /// A parsed ELF binary.
@@ -110,6 +114,7 @@ impl ElfBinary {
                 bytes: content,
                 executable: true,
                 writable: phdr.p_flags & PF_W != 0,
+                allocated: true,
             });
             n += 1;
         }
@@ -272,6 +277,7 @@ fn sections_from_headers(elf: &goblin::elf::Elf, bytes: &[u8]) -> Vec<Section> {
             bytes: content,
             executable: shdr.sh_flags & u64::from(SHF_EXECINSTR) != 0,
             writable: shdr.sh_flags & u64::from(SHF_WRITE) != 0,
+            allocated: shdr.sh_flags & u64::from(SHF_ALLOC) != 0,
         });
     }
     out
@@ -296,6 +302,7 @@ fn sections_from_segments(elf: &goblin::elf::Elf, bytes: &[u8]) -> Vec<Section> 
             bytes: content,
             executable: phdr.p_flags & PF_X != 0,
             writable: phdr.p_flags & PF_W != 0,
+            allocated: true,
         });
         n += 1;
     }

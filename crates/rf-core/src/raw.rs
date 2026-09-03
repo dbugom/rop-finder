@@ -33,6 +33,7 @@ impl RawBinary {
                 bytes: bytes.to_vec(),
                 executable: true,
                 writable: false,
+                allocated: true,
             },
         }
     }

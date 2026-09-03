@@ -1,0 +1,491 @@
+//! Phase 6: ROPgadget's non-gadget search modes (`--string`, `--opcode`,
+//! `--memstr`), the `--re` / `--callPreceded` gadget post-filters, and
+//! `--mipsrop`. Line formats mirror core.py:118-227 and
+//! options.py:64-120 byte-for-byte; section sets mirror the loaders'
+//! `getExecSections` / `getDataSections`.
+
+use std::io::Write;
+
+use regex::bytes::Regex as ByteRegex;
+use regex::Regex;
+use rf_core::{Arch, Section};
+use rf_scan::Gadget;
+
+use crate::Target;
+
+/// 60-column rule used by the Strings/Opcodes/Gadgets/MIPS headers.
+pub const RULE60: &str = "============================================================";
+/// 55-column rule used by the Memory-bytes header (core.py:212 — yes, 55).
+pub const RULE55: &str = "=======================================================";
+
+/// Search-mode address width (core.py:113: `8 if arch == CS_MODE_32 else
+/// 16`). For structured binaries the loaders return CS_MODE_32 exactly for
+/// 32-bit pointer size (elf.py:354-358, pe.py:228-232, macho.py:320-324),
+/// i.e. `addr_size == 4`. For RAW arm/thumb the oracle's mode is
+/// CS_MODE_ARM (0) / CS_MODE_THUMB (16) → 16 digits even though the
+/// pointer size is 4 (raw.py:54-67).
+pub fn search_width8(target: &Target, arch: Arch) -> bool {
+    if matches!(target, Target::Raw(_)) && matches!(arch, Arch::Arm | Arch::ArmThumb) {
+        return false;
+    }
+    arch.addr_size() == 4
+}
+
+pub fn fmt_search_addr(vaddr: u64, width8: bool) -> String {
+    if width8 {
+        format!("0x{vaddr:08x}")
+    } else {
+        format!("0x{vaddr:016x}")
+    }
+}
+
+/// ROPgadget getDataSections: ELF SHF_ALLOC && !SHF_EXECINSTR
+/// (elf.py:323-334), PE writable (pe.py:194-205), Mach-O
+/// !S_ATTR_SOME/PURE_INSTRUCTIONS (macho.py:293-304), Raw none
+/// (raw.py:35-36), Universal = concat of slices (universal.py:83-87).
+pub fn data_sections(target: &Target) -> Vec<Section> {
+    match target {
+        Target::Elf(b) => b
+            .sections()
+            .iter()
+            .filter(|s| s.allocated && !s.executable)
+            .cloned()
+            .collect(),
+        Target::Pe(b) => b
+            .sections()
+            .iter()
+            .filter(|s| s.writable)
+            .cloned()
+            .collect(),
+        Target::MachO(b) => b
+            .sections()
+            .iter()
+            .filter(|s| !s.executable)
+            .cloned()
+            .collect(),
+        Target::Raw(_) => Vec::new(),
+        Target::Universal(u) => u
+            .slices()
+            .iter()
+            .flat_map(|m| m.sections().iter().filter(|s| !s.executable).cloned())
+            .collect(),
+    }
+}
+
+/// ROPgadget getExecSections: ELF = PF_X program headers (elf.py:311-321 —
+/// our `exec_scan_regions`), PE/Mach-O/Raw = executable sections
+/// (pe.py:207-218, macho.py:280-291, raw.py:32-33), Universal = concat
+/// (universal.py:77-81).
+pub fn exec_search_sections(target: &Target) -> Vec<Section> {
+    match target {
+        Target::Elf(b) => b.exec_scan_regions().to_vec(),
+        Target::Pe(b) => b.exec_scan_regions().to_vec(),
+        Target::MachO(b) => b.exec_scan_regions().to_vec(),
+        Target::Raw(b) => vec![b.section().clone()],
+        Target::Universal(u) => u.all_exec_scan_regions().into_iter().cloned().collect(),
+    }
+}
+
+/// core.py:37-64 `_sectionInRange`: truncate a section's byte window to the
+/// `--range` interval (None = the "0x0-0x0" no-range case). Returns the
+/// truncated (vaddr, bytes) or None when the section falls outside.
+fn section_in_range(vaddr: u64, bytes: &[u8], range: Option<(u64, u64)>) -> Option<(u64, &[u8])> {
+    let Some((range_start, range_end)) = range else {
+        return Some((vaddr, bytes));
+    };
+    let mut size = bytes.len() as u64;
+    let section_end = vaddr + size;
+    if range_end < vaddr || range_start > section_end {
+        return None;
+    }
+    let mut start = vaddr;
+    let mut ops = bytes;
+    if range_start > start {
+        let diff = range_start - start;
+        ops = &ops[diff as usize..];
+        start += diff;
+        size -= diff;
+    }
+    if range_end < start + size {
+        let diff = (start + size) - range_end;
+        ops = &ops[..ops.len() - diff as usize];
+        size -= diff;
+    }
+    if size == 0 {
+        return None;
+    }
+    Some((start, ops))
+}
+
+/// core.py:172-174 — `string.printable` bytes (0x09-0x0d, 0x20-0x7e)
+/// survive, everything else becomes '.'.
+fn printable_mapped(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| match b {
+            0x09..=0x0d | 0x20..=0x7e => b as char,
+            _ => '.',
+        })
+        .collect()
+}
+
+pub struct StringHit {
+    pub vaddr: u64,
+    pub matched: String,
+}
+
+pub struct MemStrHit {
+    pub vaddr: u64,
+    pub ch: char,
+}
+
+/// core.py:159-180 `__lookingForAString`: the pattern is a BYTE regex over
+/// the data sections; each hit prints the `pattern.len()` bytes at the
+/// match start, printable-mapped. `delta` is the --base rebase slide;
+/// `offset` is --offset.
+pub fn find_string(
+    target: &Target,
+    delta: u64,
+    offset: u64,
+    range: Option<(u64, u64)>,
+    pattern: &str,
+) -> Result<Vec<StringHit>, String> {
+    let re = ByteRegex::new(pattern)
+        .map_err(|e| format!("invalid --string byte regex {pattern:?}: {e}"))?;
+    let mut hits = Vec::new();
+    for sec in data_sections(target) {
+        let vaddr = sec.vaddr.wrapping_add(delta);
+        let Some((start, ops)) = section_in_range(vaddr, &sec.bytes, range) else {
+            continue;
+        };
+        for m in re.find_iter(ops) {
+            let r = m.start();
+            // oracle: opcodes[ref:ref + len(s)] — len of the PATTERN.
+            let end = (r + pattern.len()).min(ops.len());
+            hits.push(StringHit {
+                vaddr: offset.wrapping_add(start).wrapping_add(r as u64),
+                matched: printable_mapped(&ops[r..end]),
+            });
+        }
+    }
+    Ok(hits)
+}
+
+/// core.py:182-200 `__lookingForOpcodes`: literal byte search
+/// (re.escape(unhexlify(s))) over the executable sections.
+pub fn find_opcode(
+    target: &Target,
+    delta: u64,
+    offset: u64,
+    range: Option<(u64, u64)>,
+    hexstr: &str,
+) -> Result<Vec<u64>, String> {
+    let raw = crate::hex_decode(hexstr)
+        .ok_or_else(|| format!("invalid --opcode {hexstr:?} (even-length hex expected)"))?;
+    let mut hits = Vec::new();
+    for sec in exec_search_sections(target) {
+        let vaddr = sec.vaddr.wrapping_add(delta);
+        let Some((start, ops)) = section_in_range(vaddr, &sec.bytes, range) else {
+            continue;
+        };
+        if raw.is_empty() {
+            // unhexlify("") == b"" — Python finditer(b"", data) matches at
+            // every position, including the end.
+            for r in 0..=ops.len() {
+                hits.push(offset.wrapping_add(start).wrapping_add(r as u64));
+            }
+            continue;
+        }
+        for (r, w) in ops.windows(raw.len()).enumerate() {
+            if w == raw.as_slice() {
+                hits.push(offset.wrapping_add(start).wrapping_add(r as u64));
+            }
+        }
+    }
+    Ok(hits)
+}
+
+/// core.py:202-227 `__lookingForMemStr`: for each CHAR of the string, the
+/// char's UTF-8 bytes are used AS A REGEX over exec-then-data sections and
+/// only the FIRST hit (first section, first match) prints — the bare
+/// `raise` quirk. A char whose bytes are an invalid regex (e.g. '[')
+/// raises inside the try and is silently skipped.
+pub fn find_memstr(
+    target: &Target,
+    delta: u64,
+    offset: u64,
+    range: Option<(u64, u64)>,
+    memstr: &str,
+) -> Vec<MemStrHit> {
+    let mut sections = exec_search_sections(target);
+    sections.extend(data_sections(target));
+    let mut hits = Vec::new();
+    for ch in memstr.chars() {
+        let mut buf = [0u8; 4];
+        let pat = ch.encode_utf8(&mut buf);
+        let Ok(re) = ByteRegex::new(pat) else {
+            continue; // oracle: re.error swallowed by `except: pass`
+        };
+        'sections: for sec in &sections {
+            let vaddr = sec.vaddr.wrapping_add(delta);
+            let Some((start, ops)) = section_in_range(vaddr, &sec.bytes, range) else {
+                continue;
+            };
+            if let Some(m) = re.find(ops) {
+                hits.push(MemStrHit {
+                    vaddr: offset.wrapping_add(start).wrapping_add(m.start() as u64),
+                    ch,
+                });
+                break 'sections; // the bare `raise`: first match only
+            }
+        }
+    }
+    hits
+}
+
+/// Human output for the three search modes (headers print even with zero
+/// hits; there is no count line). Called only when not --silent.
+pub fn print_string_hits(hits: &[StringHit], width8: bool, out: &mut dyn Write) {
+    let _ = writeln!(out, "Strings information\n{RULE60}");
+    for h in hits {
+        let _ = writeln!(out, "{} : {}", fmt_search_addr(h.vaddr, width8), h.matched);
+    }
+}
+
+pub fn print_opcode_hits(hits: &[u64], hexstr: &str, width8: bool, out: &mut dyn Write) {
+    let _ = writeln!(out, "Opcodes information\n{RULE60}");
+    for &v in hits {
+        let _ = writeln!(out, "{} : {}", fmt_search_addr(v, width8), hexstr);
+    }
+}
+
+pub fn print_memstr_hits(hits: &[MemStrHit], width8: bool, out: &mut dyn Write) {
+    let _ = writeln!(out, "Memory bytes information\n{RULE55}");
+    for h in hits {
+        let _ = writeln!(out, "{} : '{}'", fmt_search_addr(h.vaddr, width8), h.ch);
+    }
+}
+
+/// JSON output (rop-finder extension; the oracle has no --json). vaddr is
+/// the search-width-formatted hex string, matching the human output.
+pub fn search_json_string(hits: &[StringHit], width8: bool) -> serde_json::Value {
+    hits.iter()
+        .map(|h| {
+            serde_json::json!({
+                "vaddr": fmt_search_addr(h.vaddr, width8),
+                "match": h.matched,
+            })
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+pub fn search_json_opcode(hits: &[u64], hexstr: &str, width8: bool) -> serde_json::Value {
+    hits.iter()
+        .map(|&v| {
+            serde_json::json!({
+                "vaddr": fmt_search_addr(v, width8),
+                "opcode": hexstr,
+            })
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+pub fn search_json_memstr(hits: &[MemStrHit], width8: bool) -> serde_json::Value {
+    hits.iter()
+        .map(|h| {
+            serde_json::json!({
+                "vaddr": fmt_search_addr(h.vaddr, width8),
+                "char": h.ch.to_string(),
+            })
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+// ---------------------------------------------------------------------------
+// Gadget post-filters (options.py).
+// ---------------------------------------------------------------------------
+
+/// options.py:64-98 `__reOption`. Split rule: if the pattern contains '|',
+/// split on ' | ' (with spaces); when that yields one piece, split on '|'.
+/// A gadget is kept iff EVERY pattern matches at least one instruction.
+/// Invalid regex: the oracle dies with an uncaught re.error (exit 1); we
+/// return a usage error (exit 1) — same code, clean message.
+pub fn apply_re_filter(gadgets: &mut Vec<Gadget>, re: &str) -> Result<(), String> {
+    let pieces: Vec<&str> = if re.contains('|') {
+        let spaced: Vec<&str> = re.split(" | ").collect();
+        if spaced.len() == 1 {
+            re.split('|').collect()
+        } else {
+            spaced
+        }
+    } else {
+        vec![re]
+    };
+    let mut pats = Vec::with_capacity(pieces.len());
+    for p in pieces {
+        pats.push(
+            Regex::new(p).map_err(|e| format!("invalid --re pattern {p:?}: {e}"))?,
+        );
+    }
+    gadgets.retain(|g| {
+        let text = g.text();
+        let insns: Vec<&str> = text.split(" ; ").collect();
+        pats.iter().all(|p| insns.iter().any(|i| p.is_match(i)))
+    });
+    Ok(())
+}
+
+/// options.py:100-120 `__isGadgetCallPreceded`. The six suffix heuristics
+/// over the (up to 9) preceding bytes. Python's `$` matches at the end of
+/// the buffer AND immediately before a trailing 0x0a, so a trailing
+/// newline gives a second effective length.
+pub fn is_call_preceded(prev: &[u8]) -> bool {
+    let check = |eff: &[u8]| {
+        let ends_at = |len: usize, byte: u8| eff.len() >= len && eff[eff.len() - len] == byte;
+        ends_at(5, 0xe8)
+            || ends_at(9, 0xe8)
+            || ends_at(2, 0xff)
+            || ends_at(3, 0xff)
+            || ends_at(4, 0xff)
+            || ends_at(9, 0xff)
+    };
+    if check(prev) {
+        return true;
+    }
+    if prev.last() == Some(&0x0a) {
+        return check(&prev[..prev.len() - 1]);
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// --mipsrop (core.py:118-157).
+// ---------------------------------------------------------------------------
+
+/// core.py:125-136 — the per-mode instruction regexes. `tails` has two; a
+/// gadget matching both prints (and counts) twice.
+pub fn mips_regexes(mode: &str) -> Option<Vec<&'static str>> {
+    match mode {
+        "stackfinder" => Some(vec![r"addiu .*, \$sp"]),
+        "system" => Some(vec![r"addiu \$a0, \$sp"]),
+        "tails" => Some(vec![
+            r"lw \$t[0-9], 0x[0-9a-z]{0,4}\(\$s[0-9]",
+            r"move \$t9, \$(s|a|v)",
+        ]),
+        "lia0" => Some(vec![r"li \$a0"]),
+        "registers" => Some(vec![r"lw \$ra, 0x[0-9a-z]{0,4}\(\$sp"]),
+        _ => None,
+    }
+}
+
+pub fn compile_mips_regexes(mode: &str) -> Option<Vec<Regex>> {
+    mips_regexes(mode).map(|rs| {
+        rs.iter()
+            .map(|r| Regex::new(r).expect("static mips regex compiles"))
+            .collect()
+    })
+}
+
+/// core.py:138-156 — the gadget loop (header printed by the caller BEFORE
+/// the scan; count = matching prints, with tails double-counts).
+pub fn print_mips_gadgets(
+    gadgets: &[Gadget],
+    regexes: &[Regex],
+    dump: bool,
+    width8: bool,
+    out: &mut dyn Write,
+) {
+    let mut count = 0usize;
+    for g in gadgets {
+        let text = g.text();
+        let insts = if text.is_empty() {
+            String::new()
+        } else {
+            format!(" : {text}")
+        };
+        let bytes_str = if dump {
+            format!(" // {}", g.bytes_hex())
+        } else {
+            String::new()
+        };
+        for re in regexes {
+            if re.is_match(&text) {
+                let _ = writeln!(
+                    out,
+                    "{}{}{}",
+                    fmt_search_addr(g.vaddr, width8),
+                    insts,
+                    bytes_str
+                );
+                count += 1;
+            }
+        }
+    }
+    let _ = writeln!(out, "\nUnique gadgets found: {count}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn re_split_rule_mirrors_options_py() {
+        // ' | ' split when it produces pieces; bare '|' otherwise.
+        let mut gs = vec![];
+        // no |: single pattern
+        apply_re_filter(&mut gs, "pop").unwrap();
+        // These would panic on invalid-regex pieces if split wrongly.
+        apply_re_filter(&mut gs, "pop.*|mov.*").unwrap();
+        apply_re_filter(&mut gs, "pop.* | mov.*").unwrap();
+        assert!(apply_re_filter(&mut gs, "pop(").is_err());
+    }
+
+    #[test]
+    fn call_preceded_suffixes() {
+        // e8 at eff-5 and eff-9
+        assert!(is_call_preceded(&[0xe8, 1, 2, 3, 4]));
+        assert!(is_call_preceded(&[0xe8, 1, 2, 3, 4, 5, 6, 7, 8]));
+        // ...but e8 at eff-3 is not a call pattern
+        assert!(!is_call_preceded(&[1, 2, 3, 4, 5, 6, 0xe8, 8, 9]));
+        // ff at eff-2
+        assert!(is_call_preceded(&[9, 9, 0xff, 0x14]));
+        // ff at eff-3 / eff-4
+        assert!(is_call_preceded(&[0xff, 1, 2]));
+        assert!(is_call_preceded(&[0xff, 1, 2, 3]));
+        // ff at eff-9
+        assert!(is_call_preceded(&[0xff, 1, 2, 3, 4, 5, 6, 7, 8]));
+        // no match
+        assert!(!is_call_preceded(&[0x90, 0x90]));
+        assert!(!is_call_preceded(&[]));
+        // Python `$` also matches before a trailing 0x0a.
+        assert!(is_call_preceded(&[0xff, 0x14, 0x0a]));
+        // ...and the 0x0a itself still counts as a normal byte at the end.
+        assert!(is_call_preceded(&[0xff, 0x0a]));
+        assert!(!is_call_preceded(&[0x0a]));
+    }
+
+    #[test]
+    fn section_in_range_truncation() {
+        let bytes = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        // no range → untouched
+        assert_eq!(
+            section_in_range(0x1000, &bytes, None),
+            Some((0x1000, &bytes[..]))
+        );
+        // outside → None
+        assert_eq!(section_in_range(0x1000, &bytes, Some((0x2000, 0x3000))), None);
+        // start-truncation
+        let (v, b) = section_in_range(0x1000, &bytes, Some((0x1002, 0x2000))).unwrap();
+        assert_eq!(v, 0x1002);
+        assert_eq!(b, &[3, 4, 5, 6, 7, 8]);
+        // end-truncation (rangeEnd < sectionEnd cuts diff bytes)
+        let (v, b) = section_in_range(0x1000, &bytes, Some((0x0, 0x1005))).unwrap();
+        assert_eq!(v, 0x1000);
+        assert_eq!(b, &[1, 2, 3, 4, 5]);
+        // empty result → None
+        assert_eq!(section_in_range(0x1000, &bytes, Some((0x1008, 0x1008))), None);
+    }
+}

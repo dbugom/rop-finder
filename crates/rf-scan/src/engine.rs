@@ -72,6 +72,21 @@ pub struct ScanOptions {
     /// when a PE's DLL characteristics advertise GUARD_CF and the flag is
     /// absent). x86/x64 only; a no-op for other architectures.
     pub cfg_aware: bool,
+    /// ROPgadget --align: override every anchor's backward-stepping
+    /// alignment (gadgets.py:66-67). `Some(0)` means "no alignment
+    /// constraint" (oracle treats 0 as falsy → byte stepping without the
+    /// alignment filter); None keeps the anchor table's own align.
+    pub align: Option<usize>,
+    /// ROPgadget --callPreceded: capture up to 9 section bytes preceding
+    /// each gadget start into [`Gadget::prev`] (gadgets.py:57,120-124).
+    /// The filter itself runs at the CLI boundary (options.py:100-120).
+    pub call_preceded: bool,
+    /// ROPgadget --all: skip duplicate-gadget removal
+    /// (core.py:87-88); alphabetical sort still applies.
+    pub all: bool,
+    /// ROPgadget --noinstr: skip BOTH dedup and the alphabetical sort
+    /// (core.py:87-95); the CLI prints bare addresses.
+    pub noinstr: bool,
     /// Scan (region × anchor) work items with rayon. Output is identical
     /// either way; serial exists for tests and debugging.
     pub parallel: bool,
@@ -92,6 +107,10 @@ impl Default for ScanOptions {
             offset: 0,
             thumb: false,
             cfg_aware: false,
+            align: None,
+            call_preceded: false,
+            all: false,
+            noinstr: false,
             parallel: true,
         }
     }
@@ -110,6 +129,12 @@ pub struct Gadget {
     /// executed path. (ROPgadget includes the delay slot in the gadget text
     /// for MIPS — anchor size 8 — but not for SPARC — anchor size 4.)
     pub delay_slot: bool,
+    /// Up to 9 section bytes preceding the gadget start — captured only
+    /// when `ScanOptions::call_preceded` is set (gadgets.py:120-124,
+    /// PREV_BYTES=9). Note the oracle reads these with the --offset slide
+    /// mixed in (a latent oracle bug with --offset --callPreceded); we
+    /// always read the true preceding bytes.
+    pub prev: Option<Vec<u8>>,
 }
 
 impl Gadget {
@@ -245,9 +270,12 @@ pub fn post_process(mut all: Vec<Gadget>, opts: &ScanOptions, addr_size: usize) 
     let mut keyed: Vec<(String, Gadget)> = all.drain(..).map(|g| (g.text(), g)).collect();
 
     // Dedup by text, first-occurrence-wins in traversal order
-    // (rgutils.deleteDuplicateGadgets).
-    let mut seen: HashSet<String> = HashSet::new();
-    keyed.retain(|(text, _)| seen.insert(text.clone()));
+    // (rgutils.deleteDuplicateGadgets). --all and --noinstr both skip it
+    // (core.py:87-88).
+    if !opts.all && !opts.noinstr {
+        let mut seen: HashSet<String> = HashSet::new();
+        keyed.retain(|(text, _)| seen.insert(text.clone()));
+    }
 
     // Post-dedup filters (ropgadget/options.py).
     if let Some(only) = &opts.only {
@@ -270,8 +298,11 @@ pub fn post_process(mut all: Vec<Gadget>, opts: &ScanOptions, addr_size: usize) 
         keyed.retain(|(_, g)| is_endbr_entry(g));
     }
 
-    // Alphabetical sort by gadget text (rgutils.alphaSortgadgets).
-    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    // Alphabetical sort by gadget text (rgutils.alphaSortgadgets) —
+    // skipped with --noinstr (core.py:94-95).
+    if !opts.noinstr {
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    }
     keyed.into_iter().map(|(_, g)| g).collect()
 }
 
@@ -367,6 +398,15 @@ fn x86_scan_anchor(
                 continue; // start would be negative
             }
             let start = ref_pos - i;
+            // --align: keep only aligned starts (gadgets.py:78,87 — on x86
+            // the aligned stepping ref-i*align is a subset of the byte
+            // stepping, so a pure filter is faithful). Some(0) = no
+            // constraint (oracle treats 0 as falsy).
+            if let Some(a) = opts.align {
+                if a > 0 && sec_vaddr.wrapping_add(start as u64) % a as u64 != 0 {
+                    continue;
+                }
+            }
             let insns = cache
                 .entry(start)
                 .or_insert_with(|| {
@@ -422,6 +462,9 @@ fn try_candidate(
         bytes: code[start..end].to_vec(),
         insns: x86::format_gadget(code, start, end, sec_vaddr, bits, fmt),
         delay_slot: false, // x86/x64 have no delay slots
+        prev: opts
+            .call_preceded
+            .then(|| code[start.saturating_sub(9)..start].to_vec()),
     })
 }
 
@@ -599,6 +642,7 @@ mod tests {
             bytes: bytes.to_vec(),
             insns: insns.iter().map(|s| s.to_string()).collect(),
             delay_slot: false,
+            prev: None,
         }
     }
 
@@ -672,6 +716,7 @@ mod tests {
             bytes: vec![1, 2, 3, 4, 5, 6, 7, 8],
             executable: true,
             writable: false,
+            allocated: true,
         };
         let (bytes, vaddr) = apply_range(&sec, Some((0x1002, 0x1006))).unwrap();
         assert_eq!(vaddr, 0x1002);
