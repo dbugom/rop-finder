@@ -106,19 +106,53 @@ pub fn spec(arch: Arch, endian: Endianness, thumb: bool) -> Result<CsSpec, Error
     })
 }
 
-/// Construct a capstone handle for `spec`.
+/// Construct a capstone handle for `spec`, **without** detail mode.
+///
+/// The scan path wants exactly this: it decodes one window per candidate and
+/// keeps only instruction boundaries, ids and text, so paying for `cs_detail`
+/// on every candidate would be pure overhead. Measured over the scanner's own
+/// [`decode_window`] loop across each fixture's largest executable region,
+/// detail mode costs 1.09x-1.17x the decode time (PPC32 1.10x, MIPS32 1.17x,
+/// ARM64 1.09x), which is +14% to +27% on top of a full depth-10 scan.
+/// Semantics are decoded on demand from the accepted gadget's bytes instead —
+/// see [`crate::detail`], which pays that cost per *classified gadget* rather
+/// than per *candidate considered*.
 pub fn open(spec: &CsSpec) -> Result<Capstone, Error> {
+    open_detail(spec, false)
+}
+
+/// Construct a capstone handle for `spec`, optionally with detail mode
+/// (`cs_option(CS_OPT_DETAIL, CS_OPT_ON)`) enabled.
+///
+/// Detail mode populates `regs_read`/`regs_write`, instruction groups and
+/// per-architecture operands — the metadata `rf-classify` needs on the eight
+/// architectures that do not go through iced-x86 (ECO-05). It does not change
+/// the disassembly TEXT capstone produces, which is what the parity gate
+/// compares; [`crate::detail::Detailer::decode_checked`] asserts that
+/// invariant per gadget at runtime and `detail_mode_does_not_change_text`
+/// asserts it over the fixture corpus.
+pub fn open_detail(spec: &CsSpec, detail: bool) -> Result<Capstone, Error> {
     let extra: Vec<ExtraMode> = if spec.riscv_compressed {
         vec![ExtraMode::RiscVC]
     } else {
         Vec::new()
     };
-    Capstone::new_raw(spec.arch, spec.mode, extra.into_iter(), spec.endian).map_err(|e| {
-        Error::Unsupported(format!(
-            "capstone cannot open {:?}/{:?}: {e}",
-            spec.arch, spec.mode
-        ))
-    })
+    let mut cs =
+        Capstone::new_raw(spec.arch, spec.mode, extra.into_iter(), spec.endian).map_err(|e| {
+            Error::Unsupported(format!(
+                "capstone cannot open {:?}/{:?}: {e}",
+                spec.arch, spec.mode
+            ))
+        })?;
+    if detail {
+        cs.set_detail(true).map_err(|e| {
+            Error::Unsupported(format!(
+                "capstone cannot enable detail mode for {:?}/{:?}: {e}",
+                spec.arch, spec.mode
+            ))
+        })?;
+    }
+    Ok(cs)
 }
 
 /// Compact per-instruction record inside a decode window (string-free).
@@ -189,18 +223,18 @@ pub fn format_gadget(
         Ok(i) => i,
         Err(_) => return Vec::new(),
     };
-    insns
-        .iter()
-        .map(|i| {
-            let m = i.mnemonic().unwrap_or("");
-            let o = i.op_str().unwrap_or("");
-            squash_double_spaces(if o.is_empty() {
-                m.to_string()
-            } else {
-                format!("{m} {o}")
-            })
-        })
-        .collect()
+    insns.iter().map(insn_text).collect()
+}
+
+/// One instruction's ROPgadget-format text (`gadgets.py:118-119`).
+pub fn insn_text(i: &capstone::Insn) -> String {
+    let m = i.mnemonic().unwrap_or("");
+    let o = i.op_str().unwrap_or("");
+    squash_double_spaces(if o.is_empty() {
+        m.to_string()
+    } else {
+        format!("{m} {o}")
+    })
 }
 
 /// Python `"{}".replace("  ", " ")`: one left-to-right pass, non-overlapping

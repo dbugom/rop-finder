@@ -30,6 +30,17 @@ pub const MAX_PREV_BYTES: usize = 16;
 /// Cap on the small free-text fields (`arch`, `section`, `class`).
 pub const MAX_LABEL_BYTES: usize = 256;
 
+/// Fixed cost charged to every cached gadget by
+/// [`CachedGadget::heap_bytes`]: the struct itself plus the allocation
+/// headers for `vaddr`, `bytes` and `text`. MCP-DESIGN fix #5 part D
+/// specifies 48 bytes per gadget; keeping the constant named means the
+/// eviction weight can be re-derived rather than re-guessed.
+pub const GADGET_OVERHEAD_BYTES: usize = 48;
+
+/// Fixed cost charged to a whole entry (`Vec` header plus the `Arc` and
+/// map slot the cache holds it in).
+pub const SCAN_OVERHEAD_BYTES: usize = 128;
+
 /// The classifier's `Class::name()` values. `class: "../../etc"` in an
 /// entry is not a path — nothing joins it to anything — but an unknown
 /// class is still evidence the entry did not come from this program, so it
@@ -153,6 +164,34 @@ impl CachedGadget {
         })
     }
 
+    /// Retained heap size of this record, the eviction weight used by
+    /// [`crate::MemCache`] (MCP-05/ROB-07).
+    ///
+    /// It is an *estimate*, deliberately: the exact figure would need the
+    /// allocator's bucket sizes. What matters for a budget is that it is
+    /// proportional to what the process actually holds and never smaller
+    /// than the fixed per-record cost, so a million one-byte gadgets
+    /// cannot look free. `String`/`Vec` capacity is not tracked (these
+    /// records are built by `serde` and by `format!`, both of which land
+    /// close to length), so [`GADGET_OVERHEAD_BYTES`] carries the struct
+    /// itself plus the three unavoidable allocation headers.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        let opt = |s: &Option<String>| s.as_deref().map_or(0, str::len);
+        GADGET_OVERHEAD_BYTES
+            + self.vaddr.len()
+            + self.bytes.len()
+            + self.text.len()
+            + opt(&self.arch)
+            + opt(&self.section)
+            + opt(&self.class)
+            + opt(&self.prev)
+            + self
+                .insns
+                .as_ref()
+                .map_or(0, |v| v.iter().map(|i| i.len() + 24).sum::<usize>() + 24)
+    }
+
     fn validate(&self) -> Result<(), String> {
         if parse_hex_u64(&self.vaddr).is_none() {
             return Err(format!(
@@ -241,6 +280,19 @@ impl CachedScan {
             .iter()
             .map(CachedGadget::to_scan_gadget)
             .collect()
+    }
+
+    /// Retained heap size of the whole entry: the eviction weight for
+    /// [`crate::MemCache`]. Linear in the gadget count, which is exactly
+    /// the axis MCP-05's 2.57 GB grew along.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        SCAN_OVERHEAD_BYTES
+            + self
+                .gadgets
+                .iter()
+                .map(CachedGadget::heap_bytes)
+                .sum::<usize>()
     }
 
     /// ROB-04. Called on **every** deserialize, before any field is used.

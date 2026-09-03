@@ -595,6 +595,10 @@ mod tests {
             nojop: false,
             nosys: false,
             multibr: false,
+            // CLS-08's three semantic filters; None = unfiltered.
+            class: None,
+            label: None,
+            writes_reg: None,
             only: None,
             filter: None,
             range: None,

@@ -14,6 +14,9 @@ rf-cli = { path = "../rf-cli" }
 rf-core = { path = "../rf-core" }
 rf-scan = { path = "../rf-scan" }
 rf-classify = { path = "../rf-classify" }
+# The chain IR's word kinds and gadget table, for build_rop_chain's typed
+# response (CRIT-03). Already in the graph through rf-cli.
+rf-chain = { path = "../rf-chain" }
 # MCP-04/ROB-04/CLI-01: the same authenticated, bounded cache module the
 # CLI uses. One record, one hex decoder, one key schema.
 rf-cache = { path = "../rf-cache" }
@@ -24,7 +27,27 @@ rmcp = { version = "3", features = ["server", "transport-io"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-std", "time"] }
 schemars = "1"
 sha2 = "0.10"
+# MCP-DESIGN fix #8 part C: the stable gadget id is
+# blake3(binary_sha256 || vaddr_le || bytes)[..10].
+blake3 = { version = "1", default-features = false, features = ["std"] }
+# Cursor encoding (base64url, no padding). Already in the resolved graph
+# through rmcp, so this adds an edge rather than a package.
+base64 = "0.23"
 regex.workspace = true
+# MCP-03/PERF-06: every scan runs inside an explicit pool sized by
+# --scan-threads, so the server cannot take every core on the operator's
+# machine (the measured runaway held 398-400% CPU).
+rayon = "1"
+# MCP-09: structured logs on stderr — NEVER stdout, which is the JSON-RPC
+# transport — plus the JSONL audit log.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "env-filter",
+    "std",
+] }
+# The audit log's per-session identifier.
+uuid = { version = "1", features = ["v4"] }
 
 # Path confinement (MCP-01). Unix walks the allowlisted directory with
 # openat(O_NOFOLLOW) per component; Windows validates the opened HANDLE.
@@ -39,3 +62,8 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+
+# MCP-03's exit criterion is a MEASUREMENT — the server process's CPU time
+# and RSS, sampled after the client has been told the request timed out.
+# `tests/support/mod.rs` does that with `Get-Process` on Windows and
+# /proc/<pid>/stat elsewhere, so it needs no dependency at all.

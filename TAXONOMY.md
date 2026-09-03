@@ -5,21 +5,21 @@ exclusion decision rules, N >= 1,000 gadgets labeled from iced-x86 operand
 metadata and spot-verified by hand, per-class precision/recall, gate =
 macro-averaged precision >= 0.90 on the held-out half.
 
-> **The gate below is not satisfied as written, and the precision number it
-> produces should not be quoted** (`CLAIM-05` in `docs/AUDIT-FINDINGS.md`).
-> The rules in this document are real and are what `rf-classify` implements;
-> what is missing is an independent measurement of whether those rules are
-> right. The "independent" labeler in `crates/rf-classify/tests/eval.rs` is a
-> second hand-written transcription of these same rules, by the same author,
-> reading the same iced-x86 `InstructionInfoFactory` metadata the classifier
-> consumes — so it can catch a transcription slip and nothing else, and its
-> output measures self-agreement rather than accuracy. All three sampled
-> fixtures are x86-64, so the x86 and the ARM/ARM64/MIPS/PowerPC/SPARC/RISC-V
-> mnemonic heuristics are unevaluated entirely. README and MANUAL no longer
-> quote a precision figure. A genuine held-out labeled set, produced by a
-> procedure that does not read these rules, replaces the harness in v0.3
-> (`CLS-01`, `CLS-11`). Treat `rf-classify` as a documented heuristic until
-> then.
+> **Superseded in v0.3.0.** The circular gate described here is gone. The
+> "independent" labeler in `crates/rf-classify/tests/eval.rs` was a second
+> transcription of these same rules — its R6, R2 and R1 mnemonic sets were
+> byte-identical to `src/x86.rs`'s (22, 7 and 12 mnemonics; the comparison is
+> in `docs/classifier-eval.md` §1.1) — so its 1.0000 measured self-agreement,
+> not accuracy. It has been deleted along with the two data files it wrote
+> into the source tree on every run (`CLS-01`, `CLS-11`).
+>
+> The classifier is now measured against **438 hand-labeled gadgets** in
+> `tests/classify-corpus/`, frozen by SHA-256, covering x86-64, x86-32, ARM,
+> ARM64, MIPS, PowerPC, SPARC and RISC-V 64 (`CLS-10`), and the **primary
+> class** — the `class` field users actually see — is the headline metric
+> (`CLS-06`). Results, the labeling protocol, the confidence intervals and an
+> explicit list of what is *not* measured:
+> [`docs/classifier-eval.md`](docs/classifier-eval.md).
 
 ## Classes
 
@@ -116,35 +116,55 @@ R13. **Confidence.** x86/x64 classification decodes bytes with iced-x86
     Other architectures use capstone-mnemonic text heuristics (same
     rules applied to the mnemonic/operand text) → `low_confidence: true`.
 
+## Amendments (v0.3.0)
+
+R1-R13 above are the v0.2 spelling. Four audit findings changed them, and
+`rf-classify` and `tests/classify-corpus/` both follow the amended form:
+
+* **`CLS-02`** — R1's implicit-stack-pointer set gains the flags forms
+  (`pushf*`, `popf*`). R5 needs an rsp-*targeting* write, so `popfq ; ret` is
+  no longer a stack pivot.
+* **`CLS-03`** — R8 is redefined. A dispatcher is a register-indirect branch
+  whose target register an *earlier arithmetic instruction both read and
+  wrote* (`add rdx, 8 ; jmp [rdx]`). A bare `jmp [rax]` is an ordinary JOP
+  gadget, not a dispatcher; `call [reg]` now qualifies.
+* **`CLS-12`** — R6's set drops `cmp` and `test` (they compute nothing into a
+  register) and gains `div`, `idiv`, `xadd`, `xchg`, `bt`/`bts`/`btr`/`btc`,
+  `bswap`, `shld`/`shrd`, `rcl`/`rcr`.
+* **`CLS-13`** — a `push`'s stack *write* is payload and earns `mem-write`
+  (stack *reads* stay R1-exempt), and a terminating `ret imm16` / `retf imm16`
+  keeps its stack adjustment and earns `stack-pivot`.
+
 ## Labeling + evaluation protocol (the gate)
 
-1. Sample N >= 1,000 gadgets deterministically (every k-th in scan
-   order) from `tests/fixtures` x86/x64 binaries, split 50/50 into
-   dev (rule tuning) and held-out (reported) halves by index parity.
-2. Ground-truth labels come from a separate direct metadata mapping in the
-   eval harness: per instruction, iced register/memory effects mapped to
-   label sets with rules R1-R8 and no production normalizations beyond R1.
-   **This mapping is not independent of the classifier** — it encodes the
-   same rules from this document over the same metadata source, so
-   agreement between the two is not evidence that either is correct. The
-   protocol also calls for hand spot-verification of >= 30 entries; a
-   previous revision of this document recorded 35 as done, but no artifact
-   of that verification exists in the tree, so it cannot be relied on and
-   the claim is withdrawn. Both gaps are what v0.3 fixes.
-3. The committed file `tests/fixtures-labeled.jsonl` records
-   {vaddr, text, labels, primary} for the full sample.
-4. Eval reports per-class precision and recall on the held-out half,
-   plus the macro average over the 8 taxonomy classes. Gate:
-   macro-averaged precision >= 0.90. Because of the circularity in step 2,
-   what this actually measures is the agreement of two transcriptions of
-   the same rules; do not quote it as classifier accuracy.
+The v0.2 protocol is withdrawn. It sampled x86-64 only, its "ground truth" was
+a second transcription of these rules rather than an independent judgement, and
+it *wrote* `tests/fixtures-labeled.jsonl` and `tests/fixtures-eval.json` on
+every run so the labeled set could never disagree with the code. It also
+claimed hand spot-verification of 35 entries; **no artifact of that
+verification ever existed** — no vaddr list, no verifier, no per-entry outcome —
+and the claim is withdrawn rather than repaired.
 
-## Dev-half tuning log
+What replaces it:
 
-The first harness run (held-out macro-P 0.62) exposed spec ambiguities,
-resolved above: R5 has no delta exemption (`add rsp, 8` is a pivot);
-R6 is mnemonic-set-only (cmp/test qualify); R7's "GPR" excludes flags
-and xmm/ymm (a classifier bug — `cmp` had earned reg-write via its
-rflags write); R3+R4 dual-label read-modify-write; R10's anchor skip
-applies to the final instruction only with syscall gates exempt; R8
-examines the final jump only.
+1. **A frozen, hand-labeled corpus.** `tests/classify-corpus/` — 438 gadgets
+   sampled by a documented deterministic rule (every k-th gadget of a depth-10
+   scan, k prime, offset 0) from eleven fixtures across eight architectures,
+   plus enriched strata drawn by purely textual filters to reach the rare
+   classes. Each record carries its ground-truth primary class, its label set,
+   the rule ids applied, **a one-line written justification**, and who labeled
+   it and when — the artifact the withdrawn claim above lacked.
+2. **Read-only, hash-checked.** `crates/rf-classify/tests/eval.rs` verifies
+   every corpus file's SHA-256 against `MANIFEST.sha256` before *and* after
+   scoring, and asserts the two regenerated files are gone. `cargo test` writes
+   nothing into the source tree.
+3. **The primary class is scored**, per architecture, per class, alongside the
+   label set — plus the confusion pairs, so the mistakes are visible and not
+   just their count.
+4. **Gate:** x86-64 primary-class macro precision >= 0.90 and dispatcher
+   precision >= 0.80. Measured 2026-09-03: x86-64 macro-P **0.9959** (n=195,
+   95 % CP lower bound 0.9718); whole-corpus accuracy **0.9474** (n=437).
+   PowerPC is **0.6400** and SPARC **0.8000** — the corpus found twelve
+   classifier defects, listed in `docs/classifier-eval.md` §4, and the honest
+   caveats are in §5.
+

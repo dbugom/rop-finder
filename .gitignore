@@ -4,3 +4,8 @@ tests/spike-binaries/
 # Cargo.lock is deliberately NOT ignored: this workspace ships binaries
 # (rop-finder, rop-finder-mcp), so the exact resolved dependency set is part
 # of the release artifact and of the parity numbers in docs/measured-2026-09.md.
+
+# The tests/ harnesses (parity.py, doc_claims.py, chain_parity.py,
+# mcp_workability.py) all `import rf_paths`, so running any gate leaves a
+# tests/__pycache__ behind. It is build detritus, never an artifact.
+__pycache__/

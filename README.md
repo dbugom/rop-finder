@@ -314,26 +314,39 @@ operand metadata (x86/x64, high confidence) or mnemonic heuristics
   `%LOCALAPPDATA%\rop-finder\cache` (Windows) or `~/.cache/rop-finder`.
   Hits and misses are reported on stderr.
 
-**`rf-classify` is a heuristic, and it has not been independently
-evaluated.** No accuracy figure for it is published here, because none has
-been measured. `crates/rf-classify/tests/eval.rs` looks like an evaluation
-gate — it samples gadgets, computes a "ground truth" with
-`independent_labels()`, and asserts held-out macro-averaged precision
-≥ 0.90 — but `independent_labels()` is a second hand-written transcription
-of the same TAXONOMY.md rules R1–R13, by the same author, reading the same
-iced-x86 `InstructionInfoFactory` metadata the classifier itself consumes.
-Sharing no code is not independence when the rules and the evidence are
-identical: that experiment can detect a transcription slip and nothing
-else, so the number it produces measures self-agreement, not accuracy. It
-is also x86-64-only — all three sampled fixtures (`elf-x64-bash-v4.1.5.1`,
-`pe-x64-cmd-v6.1.7601`, `elf-Linux-x64`) are x64 — so the
-x86, ARM/ARM64/MIPS/PPC/SPARC/RISC-V heuristics have no
-evaluation of any kind beyond the `low_confidence` flag on each record.
-Earlier revisions of this README quoted that test's output as a measured
-precision; that claim is retracted. A genuine held-out labeled set replaces
-the circular harness in v0.3 (`CLS-01`/`CLS-11`). Until then, treat
-`--classify`, `--rank` and the MCP `sort_by: "quality"` ordering as a
-documented heuristic to triage a large dump, not as a measured judgement.
+**`rf-classify` is a heuristic, and as of v0.3.0 it has been measured
+against a hand-labeled corpus** — `tests/classify-corpus/`, 438 records over
+eight architectures, labeled by hand and hash-frozen, never regenerated from
+the classifier's own output. Method, per-record justifications and the full
+caveat list are in [`docs/classifier-eval.md`](docs/classifier-eval.md); the
+figures are pinned as constants in `crates/rf-classify/tests/eval.rs`, so the
+classifier cannot move in either direction without the numbers moving with it.
+
+| Architecture | n | Primary-class accuracy |
+|---|---:|---:|
+| arm | 25 | 1.0000 |
+| arm64 | 44 | 1.0000 |
+| i386 | 74 | 1.0000 |
+| mips | 25 | 0.8400 |
+| ppc | 25 | 0.6400 |
+| riscv64 | 24 | 0.8333 |
+| sparc | 25 | 0.8000 |
+| x86_64 | 195 | 0.9949 |
+| **all** | **437** | **0.9474** |
+
+x86-64 macro-averaged precision is 0.9959 and recall 0.9977. Read those
+numbers with their caveats attached, all of which are recorded in
+`docs/classifier-eval.md` §5: this was **not a blind study** (the labeler had
+already read `crates/rf-classify/src/x86.rs`); the dispatcher heuristic's
+precision of 1.0000 rests on a single predicted positive and its recall is
+0.2000; PowerPC and MIPS carry known defects listed in §4.1; six of the
+fourteen `Arch` variants have no corpus entries at all; the disassembly-text
+fallback path (`low_confidence`) has zero measured accuracy because no corpus
+record reaches it; and **the ranking — `quality`, `usability`, the default
+`rank` order — is not evaluated here at all**, because the corpus carries no
+ground truth for gadget usefulness. What replaced the old circular harness is
+described in `docs/classifier-eval.md` §1: the earlier retraction of that
+harness's self-agreement figure stands.
 
 **Chain DSL: deferred.** The stretch goal from PLAN §5 (a declarative
 chain-description DSL compiled to the Chain IR) is intentionally not
@@ -351,6 +364,10 @@ cargo build --release
 target/release/rop-finder-mcp --allow-dir /path/to/binaries --allow-dir /path/to/rop-finder/tests/fixtures
 # optional: --cache-dir <dir> --timeout-secs 60 --max-results 1000
 #           --max-depth 64 --max-concurrent 2 --allow-cwd --verbose-path-errors
+#           --max-gadgets 5000000 --scan-threads <n>
+#           --cache-mem-mb 512 --cache-ttl-secs 86400 --cursor-ttl-secs 300
+#           --audit-log <path> --audit-log-max-mb 64 --probe-threshold 20
+#           --workspace-dir <dir>
 ```
 
 `--allow-dir` takes **absolute** paths and is the only source of the
@@ -362,16 +379,19 @@ scraping.
 
 ### Tools
 
-All eight tools return structured JSON (`structuredContent` + text content);
-errors are `{error: {code, message}}` with the MCP `isError` flag.
+All ten tools return structured JSON (`structuredContent` + text content)
+and declare an `outputSchema`; errors are `{error: {code, message, retryable,
+details, suggestions}}` with the MCP `isError` flag.
 
 | Tool | Purpose |
 |---|---|
 | `find_gadgets` | ROP gadgets only (ret-terminated); `sort_by: "quality"` ranks by the Phase 5 quality score |
 | `find_jop_gadgets` | JOP gadgets only (jmp/call-terminated); also supports `sort_by` |
 | `find_syscall_gadgets` | SYS gadgets only (syscall/sysenter/int/iret); also supports `sort_by` |
+| `get_gadgets` | Resolve stable gadget `id`s (the `id` field of any gadget record) back to full records, without re-running a search |
 | `get_binary_info` | The `--info` payload (format/arch/sections/imports), no scan |
 | `get_server_config` | The effective allow roots and caps (`max_depth`, `max_file_bytes`, `max_results`, `max_concurrent`, `timeout_secs`, cache state), so an agent never has to probe for them |
+| `get_server_stats` | This session's counters: requests by tool, ok/denied/timeout/cancelled/error totals, cache hit/miss/eviction counts and `cache_bytes`, `inflight` |
 | `search_gadgets_by_pattern` | Regex over gadget text (invalid regex → literal substring), full scan |
 | `run_ropgadget_command` | Flag passthrough, restricted to the allowlist below |
 | `build_rop_chain` | ROP chains: `target: "linux-execve"` (ELF x86/x64) or `"windows-virtualprotect"` (PE x86/x64, with `api_addr`/`shellcode_addr`/`shellcode_size`/`cfg_aware`); returns chain IR + python script |
@@ -465,7 +485,27 @@ half that decides whether running this is safe for you.
   `--max-depth` (default 64) is *rejected* with a `usage_error` naming the
   limit and the value, not silently clamped; `--max-concurrent` (default 2)
   bounds simultaneous scans; `--max-file-bytes` (default 256 MiB) is
-  enforced against the fstat of the open handle, before any read.
+  enforced against the fstat of the open handle, before any read;
+  `--max-gadgets` (default 5,000,000, `0` disables) is an engine budget, so a
+  scan that would accept more stops with `resource_exhausted` instead of
+  filling memory; `--scan-threads` (default `num_cpus - 1`) keeps the server
+  off the operator's last core.
+- **Bounded caches, and a timeout that actually stops the work**: a timed-out
+  or cancelled request stops its scan rather than orphaning it — the engine
+  observes a cancellation token, and a worker that has not stopped within 5 s
+  is reported as `timeout_hard` and counted in `wedged_total` instead of being
+  silently abandoned. `--cache-mem-mb` (default 512) bounds the in-memory scan
+  cache by bytes with least-recently-used eviction, `--cache-ttl-secs`
+  (default 86400) bounds it by age, and `--cursor-ttl-secs` (default 300)
+  bounds how long a paged scan stays pinned for an outstanding cursor.
+- **Audit trail**: `--audit-log <path>` records one JSON line per call —
+  denials, timeouts and cancellations included — append/create, mode 0600 on
+  unix, rotated at `--audit-log-max-mb`. It carries the binary label, its
+  SHA-256, a parameter hash and the result counts, and never gadget text or
+  file bytes. The path may not fall inside an allow root.
+  `get_server_stats` exposes the live counters (requests by tool, ok/denied/
+  timeout/cancelled/wedged totals, cache hits/misses/evictions, `cache_bytes`,
+  `inflight`).
 - **Content-hash cache**: SHA-256 of the file plus the scan parameters
   (including `base` and `cfg_aware`) keys an in-memory cache (plus
   optional `--cache-dir` on-disk spill), so repeated queries on the same

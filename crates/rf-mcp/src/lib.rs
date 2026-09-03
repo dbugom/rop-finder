@@ -31,12 +31,19 @@
 //!   * Resource caps: `max_results` (default 1000, hard max 50000), a
 //!     per-request timeout (default 60 s), `--max-depth` (default 64,
 //!     over-large values are *rejected*, not clamped), `--max-file-bytes`
-//!     (default 256 MiB, enforced by fstat on the confined handle) and
-//!     `--max-concurrent` (default 2, a semaphore held for the lifetime of
-//!     the blocking worker). Together those bound the MCP-03 runaway; real
-//!     cancellation needs the v0.2 engine token and is NOT here.
-//!   * Content-hash cache (SHA-256 of file + parameters): in-memory, with
-//!     an optional on-disk spill via `--cache-dir`.
+//!     (default 256 MiB, enforced by fstat on the confined handle),
+//!     `--max-gadgets` (default 5 000 000, enforced in the engine) and
+//!     `--max-concurrent` (default 2). Every tool without exception runs
+//!     through [`guard::Guard::run`], which cancels the *work* on timeout
+//!     and JOINS it before releasing the permit (MCP-03/PERF-06), and
+//!     inside an explicit rayon pool sized by `--scan-threads`.
+//!   * Content-hash cache (SHA-256 of file + parameters): a byte-weighted
+//!     LRU with a TTL (`--cache-mem-mb`, `--cache-ttl-secs`), with an
+//!     optional authenticated on-disk spill via `--cache-dir`.
+//!   * Observability: `tracing` to **stderr only**, `--audit-log` (one
+//!     JSON object per line, mode 0600, rotated), the `get_server_stats`
+//!     tool, and the MCP `logging` capability so warnings reach an
+//!     operator who never sees stderr (MCP-09).
 //!   * Responses are sampled: up to `max_results` gadgets plus
 //!     `total_count` and `truncated`. (PLAN calls for "top-N by quality
 //!     rank"; ranking lands in Phase 5, so v1 returns the first N in the
@@ -56,22 +63,43 @@
 #[allow(clippy::indexing_slicing)]
 pub mod confine;
 
-use std::collections::HashMap;
+pub mod audit;
+pub mod cache;
+pub mod cursor;
+pub mod guard;
+pub mod logging;
+pub mod resources;
+pub mod scan;
+pub mod schema;
+pub mod semantics;
+pub mod stats;
+
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rf_cache::{CachedGadget, CachedScan};
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
-use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
+use rmcp::service::RequestContext;
+use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Digest;
 
+pub use audit::{AuditLog, AuditRecord};
+pub use cache::Cache;
 pub use confine::{AllowRoot, ConfinedFile};
+pub use cursor::Cursor;
+pub use guard::Guard;
+pub use logging::Notifier;
+pub use schema::{
+    ChainResponse, ErrorCode, GadgetRecord, InfoResponse, ScanResponse, ToolErrorBody, Warning,
+};
+pub use semantics::{GadgetFilter, Order, Semantics};
+pub use stats::{ServerStats, Verdict};
 
 pub const DEFAULT_MAX_RESULTS: usize = 1000;
 pub const HARD_MAX_RESULTS: usize = 50000;
@@ -86,6 +114,26 @@ pub const DEFAULT_MAX_DEPTH: usize = 64;
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
 /// Default `--max-concurrent`: how many scans may run at once.
 pub const DEFAULT_MAX_CONCURRENT: usize = 2;
+/// Default `--max-gadgets`, enforced in the engine (MCP-DESIGN fix #4 E).
+/// Cancellation alone does not bound a scan that is legitimately huge;
+/// this is what bounds RSS.
+pub const DEFAULT_MAX_GADGETS: usize = 5_000_000;
+/// Default `--cache-mem-mb`, in bytes.
+pub const DEFAULT_CACHE_MEM_BYTES: u64 = rf_cache::DEFAULT_MEM_MAX_BYTES;
+/// Default `--cache-ttl-secs`.
+pub const DEFAULT_CACHE_TTL: Duration = rf_cache::DEFAULT_MEM_TTL;
+/// Default `--cursor-ttl-secs`: how long a paged scan stays pinned against
+/// eviction so an outstanding cursor can walk it (MCP-DESIGN fix #8 B).
+pub const DEFAULT_CURSOR_TTL: Duration = cache::DEFAULT_CURSOR_TTL;
+/// Default `--probe-threshold`: consecutive `path_denied` results in one
+/// session before responses are delayed and `probing_suspected` is logged.
+pub const DEFAULT_PROBE_THRESHOLD: u64 = 20;
+/// How long a response is delayed once probing is suspected.
+pub const PROBE_DELAY: Duration = Duration::from_millis(250);
+/// Default cap on `get_binary_info`'s `sections` and `imports` arrays, so
+/// a hostile PE with a million import entries cannot produce a gigabyte of
+/// JSON (MCP-06).
+pub const DEFAULT_MAX_INFO_ITEMS: usize = 4096;
 
 /// PLAN §6.1 flag allowlist for `run_ropgadget_command`.
 const ALLOWED_FLAGS: &[&str] = &[
@@ -137,6 +185,30 @@ pub struct ServerConfig {
     pub max_file_bytes: u64,
     /// Concurrently running scans.
     pub max_concurrent: usize,
+    /// Threads in the scan pool (`--scan-threads`). Default
+    /// `num_cpus - 1`, so the server never takes every core.
+    pub scan_threads: usize,
+    /// Engine gadget budget (`--max-gadgets`). `None` = unbounded.
+    pub max_gadgets: Option<usize>,
+    /// In-memory cache budget (`--cache-mem-mb`) and entry lifetime
+    /// (`--cache-ttl-secs`) — MCP-05/ROB-07.
+    pub cache_mem_bytes: u64,
+    pub cache_ttl: Duration,
+    /// How long a scan stays pinned so an outstanding cursor can page it
+    /// (`--cursor-ttl-secs`).
+    pub cursor_ttl: Duration,
+    /// `--workspace-dir`: where a paged scan's NDJSON is materialized as a
+    /// real file. Must lie OUTSIDE every allow root, which `main.rs`
+    /// enforces at startup.
+    pub workspace_dir: Option<PathBuf>,
+    /// JSONL call/denial log (`--audit-log`), and its rotation size.
+    pub audit_log: Option<PathBuf>,
+    pub audit_log_max_mb: u64,
+    /// Consecutive `path_denied` results before the probing signal trips.
+    /// 0 disables it.
+    pub probe_threshold: u64,
+    /// Cap on `get_binary_info`'s `sections`/`imports` arrays.
+    pub max_info_items: usize,
     /// Restore per-reason path error detail INSIDE allowed roots only.
     pub verbose_path_errors: bool,
 }
@@ -151,43 +223,104 @@ impl Default for ServerConfig {
             max_depth: DEFAULT_MAX_DEPTH,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             max_concurrent: DEFAULT_MAX_CONCURRENT,
+            scan_threads: guard::default_scan_threads(),
+            max_gadgets: Some(DEFAULT_MAX_GADGETS),
+            cache_mem_bytes: DEFAULT_CACHE_MEM_BYTES,
+            cache_ttl: DEFAULT_CACHE_TTL,
+            cursor_ttl: DEFAULT_CURSOR_TTL,
+            workspace_dir: None,
+            audit_log: None,
+            audit_log_max_mb: audit::DEFAULT_AUDIT_MAX_MB,
+            probe_threshold: DEFAULT_PROBE_THRESHOLD,
+            max_info_items: DEFAULT_MAX_INFO_ITEMS,
             verbose_path_errors: false,
         }
     }
 }
 
-/// Structured tool error, rendered as `{error: {code, message, details?}}`.
+/// Structured tool error, rendered as
+/// `{error: {code, message, retryable, details, suggestion}}`.
+///
+/// CRIT-03: `code` is the CLOSED [`ErrorCode`] set, and every field of the
+/// rendered body is always present. `kind` is a FINER tag that never
+/// reaches the client: it is what the audit log records, so collapsing
+/// `file_too_large` and `busy` into one wire code loses the operator
+/// nothing. The two spellings the audit found — `usage` in one place and
+/// `usage_error` everywhere else — cannot recur, because there is no longer
+/// a place to write a code as a free string.
 #[derive(Debug)]
 pub struct ToolError {
-    pub code: &'static str,
+    pub code: ErrorCode,
+    /// Finer-grained internal reason, for the audit log and for the two
+    /// places the server branches on it. Defaults to `code.as_str()`.
+    pub kind: &'static str,
     pub message: String,
     /// Machine-readable specifics (allow roots, breached limits). Never
     /// carries an OS error string for a path outside the allowlist.
     pub details: Option<Value>,
+    /// Whether re-sending the same request could succeed.
+    pub retryable: bool,
+    /// An arguments patch that would make the call work.
+    pub suggestion: Option<Value>,
 }
 
 impl ToolError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         ToolError {
             code,
+            kind: code.as_str(),
             message: message.into(),
             details: None,
+            retryable: code.default_retryable(),
+            suggestion: None,
         }
     }
-    fn with_details(code: &'static str, message: impl Into<String>, details: Value) -> Self {
+
+    pub(crate) fn with_details(
+        code: ErrorCode,
+        message: impl Into<String>,
+        details: Value,
+    ) -> Self {
         ToolError {
-            code,
-            message: message.into(),
             details: Some(details),
+            ..ToolError::new(code, message)
         }
     }
+
+    /// Record a finer reason than the wire code carries.
+    #[must_use]
+    pub(crate) fn with_kind(mut self, kind: &'static str) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn retryable(mut self, yes: bool) -> Self {
+        self.retryable = yes;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_suggestion(mut self, suggestion: Value) -> Self {
+        self.suggestion = Some(suggestion);
+        self
+    }
+
+    /// The `timeout` a worker did not stop for. Distinguished here rather
+    /// than by a separate wire code, so the closed set stays closed.
+    #[must_use]
+    pub fn is_hard_timeout(&self) -> bool {
+        self.code == ErrorCode::Timeout && self.kind == "timeout_hard"
+    }
+
     fn to_json(&self) -> Value {
-        match &self.details {
-            Some(d) => {
-                json!({"error": {"code": self.code, "message": self.message, "details": d}})
-            }
-            None => json!({"error": {"code": self.code, "message": self.message}}),
-        }
+        json!({"error": {
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.retryable,
+            "details": self.details.clone().unwrap_or_else(|| json!({})),
+            "suggestion": self.suggestion.clone().unwrap_or(Value::Null),
+        }})
     }
 }
 
@@ -211,80 +344,15 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", h.finalize())
 }
 
-#[derive(Default)]
-pub struct Cache {
-    /// Per-process memory cache. Giving *this* half a byte budget and a
-    /// TTL is MCP-05/ROB-07 and lands in v0.3; what v0.2 fixes is the disk
-    /// half, which is the one an attacker can write to.
-    mem: Mutex<HashMap<String, Arc<CachedScan>>>,
-    /// `None` when `--cache-dir` was not given, and also when the
-    /// directory could not be trusted: MCP-04 means an untrustworthy cache
-    /// is *disabled*, never downgraded to unauthenticated reads.
-    disk: Option<rf_cache::DiskCache>,
-}
-
-impl Cache {
-    pub fn new(dir: Option<PathBuf>) -> Self {
-        let disk = dir.and_then(|dir| {
-            match rf_cache::DiskCache::open(&dir, rf_cache::CacheLimits::from_env()) {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    // stderr, never stdout: stdout is the JSON-RPC transport.
-                    eprintln!("[cache] on-disk cache disabled: {e}");
-                    None
-                }
-            }
-        });
-        Cache {
-            mem: Mutex::new(HashMap::new()),
-            disk,
-        }
-    }
-
-    /// A panic anywhere else must not disable the cache for the rest of
-    /// the session, and the map cannot be left half-updated by one: an
-    /// insert either happened or did not.
-    fn mem(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<CachedScan>>> {
-        self.mem.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn get(&self, key: &str) -> Option<Arc<CachedScan>> {
-        if let Some(hit) = self.mem().get(key) {
-            return Some(hit.clone());
-        }
-        // `load` authenticates the entry against the directory's key and
-        // validates every record before it returns: a tampered or corrupt
-        // entry is a warning plus a counter plus a miss (MCP-04, ROB-04).
-        let scan = Arc::new(self.disk.as_ref()?.load(key)?);
-        self.mem().insert(key.to_string(), scan.clone());
-        Some(scan)
-    }
-
-    fn put(&self, key: &str, scan: CachedScan) -> Arc<CachedScan> {
-        let scan = Arc::new(scan);
-        self.mem().insert(key.to_string(), scan.clone());
-        if let Some(disk) = &self.disk {
-            if let Err(e) = disk.store(key, &scan) {
-                eprintln!("[cache] entry not written: {e}");
-            }
-        }
-        scan
-    }
-
-    /// Integrity and eviction counters for the on-disk half; `None` when
-    /// there is no on-disk half. `get_server_stats` (MCP-09, v0.3) is
-    /// where these surface to an operator.
-    #[must_use]
-    pub fn stats(&self) -> Option<rf_cache::CacheStats> {
-        self.disk.as_ref().map(rf_cache::DiskCache::stats)
-    }
-}
+// [`Cache`] itself is [`cache::Cache`]: both halves bounded, the memory
+// half a byte-weighted LRU that lives in rf-cache so the CLI shares it
+// (MCP-05/ROB-07, CLI-08/PERF-12).
 
 // ---------------------------------------------------------------------------
 // Shared parameter structs
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GadgetQuery {
     /// Absolute path to the binary; must be inside one of the server's
     /// allow_roots (get_server_config lists them).
@@ -306,12 +374,51 @@ pub struct GadgetQuery {
     /// Reject gadgets whose final address contains these bytes
     /// (e.g. "0a|0d" or "00-1f").
     pub badbytes: Option<String>,
-    /// Maximum gadgets returned (default 1000, hard max 50000).
+    /// Maximum gadgets returned per page (default 1000, hard max 50000).
     pub max_results: Option<usize>,
-    /// Result ordering before sampling: "quality" sorts by the Phase 5
-    /// quality score (best gadgets first, ties by address). Anything
-    /// else is rejected.
+    /// Result ordering, applied BEFORE paging. "rank" (the default) is
+    /// usability tier, then quality, then fewest instructions, then fewest
+    /// side effects, then address — it is what puts `pop rdi ; ret` at the
+    /// top instead of `adc al, 0x89 ; retf 0xc281`. Also "address",
+    /// "quality" and "text" (the pre-0.3 default). Anything else is
+    /// rejected with the valid set in the error.
+    pub order: Option<String>,
+    /// Deprecated alias for `order`, kept because it used to be the only
+    /// way to ask for anything but traversal order. Ignored when `order`
+    /// is given.
     pub sort_by: Option<String>,
+    /// `next_cursor` from a previous page of THIS query. Re-send every
+    /// other parameter unchanged; `max_results` and `timeout_secs` may
+    /// change. A cursor from a different query returns `cursor_expired`.
+    pub cursor: Option<String>,
+    /// Keep only gadgets whose primary class is one of these
+    /// (comma-separated): reg-write, stack-pivot, mem-read, mem-write,
+    /// arithmetic, syscall, dispatcher, other.
+    pub class: Option<String>,
+    /// Keep only gadgets carrying at least one of these labels (same
+    /// vocabulary as `class`; a gadget can earn several).
+    pub label: Option<String>,
+    /// Keep only gadgets that write ALL of these registers
+    /// (comma-separated, e.g. "rdi"). Names are matched lowercase and
+    /// without a `$`/`%` sigil.
+    pub writes_reg: Option<String>,
+    /// Keep only gadgets that read ALL of these registers.
+    pub reads_reg: Option<String>,
+    /// Keep only gadgets that write NONE of these registers — "do not
+    /// clobber rsi or rdx".
+    pub preserves_regs: Option<String>,
+    /// Require the `writes_reg` registers to be loaded off the STACK (a
+    /// pop, or a stack-based load), which is what makes them controllable
+    /// from the chain payload. With no `writes_reg`, requires at least one
+    /// stack-loaded register.
+    pub from_stack: Option<bool>,
+    /// Keep only gadgets with this terminator kind: "ret" (every returning
+    /// form), "jmp", "call", "syscall", "none", or "any".
+    pub terminator: Option<String>,
+    /// Keep only gadgets with at most this many side effects.
+    pub max_side_effects: Option<u32>,
+    /// Keep only gadgets with at most this many instructions.
+    pub max_insns: Option<u32>,
     /// Architecture slice for a fat (Universal) Mach-O, e.g. "x86_64",
     /// "arm64", "i386". REQUIRED for a multi-slice container: without it
     /// the scan is refused rather than concatenating slices whose virtual
@@ -335,33 +442,14 @@ fn arch_from_bytes(bytes: &[u8]) -> Option<rf_core::Arch> {
     }
 }
 
-/// Order gadgets by Phase 5 quality (descending, vaddr-ascending ties,
-/// R12). Quality missing from a cache entry (old cache file) is computed
-/// on demand from the cached bytes; unclassifiable entries sort last.
-///
-/// ROB-04 lived on this path: the local `gadget_from_cached` sliced the
-/// `bytes` field by byte range and a poisoned entry containing `"€€"`
-/// aborted the server. Reconstruction is now
-/// [`rf_cache::CachedGadget::to_scan_gadget`] — one checked decoder,
-/// shared with the CLI.
-fn sort_by_quality(gadgets: Vec<&CachedGadget>, arch: Option<rf_core::Arch>) -> Vec<&CachedGadget> {
-    let mut keyed: Vec<(i32, &CachedGadget)> = gadgets
-        .into_iter()
-        .map(|g| {
-            let q = g.quality.or_else(|| {
-                arch.and_then(|a| {
-                    g.to_scan_gadget()
-                        .map(|rg| rf_classify::classify(&rg, a).quality)
-                })
-            });
-            (q.unwrap_or(0), g)
-        })
-        .collect();
-    keyed.sort_by(|(qa, ga), (qb, gb)| qb.cmp(qa).then(ga.vaddr.cmp(&gb.vaddr)));
-    keyed.into_iter().map(|(_, g)| g).collect()
-}
+// Ordering used to live here as `sort_by_quality`, which re-derived a
+// missing quality score from the cached bytes on every call. That path is
+// gone: [`semantics::classify_scan`] computes the whole classification once
+// per scan and the pinned-scan store keeps it, so nothing re-classifies
+// inside a response any more. ROB-04's char-boundary panic lived on exactly
+// that path.
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SearchQuery {
     /// Absolute path to the binary; must be inside one of the server's
     /// allow_roots (get_server_config lists them).
@@ -381,8 +469,28 @@ pub struct SearchQuery {
     pub range: Option<String>,
     /// Reject gadgets whose final address contains these bytes.
     pub badbytes: Option<String>,
-    /// Maximum gadgets returned (default 1000, hard max 50000).
+    /// Maximum gadgets returned per page (default 1000, hard max 50000).
     pub max_results: Option<usize>,
+    /// Result ordering; see find_gadgets. Default "rank".
+    pub order: Option<String>,
+    /// `next_cursor` from a previous page of THIS query.
+    pub cursor: Option<String>,
+    /// Keep only gadgets whose primary class is one of these.
+    pub class: Option<String>,
+    /// Keep only gadgets carrying at least one of these labels.
+    pub label: Option<String>,
+    /// Keep only gadgets that write ALL of these registers.
+    pub writes_reg: Option<String>,
+    /// Keep only gadgets that read ALL of these registers.
+    pub reads_reg: Option<String>,
+    /// Keep only gadgets that write NONE of these registers.
+    pub preserves_regs: Option<String>,
+    /// Require the `writes_reg` registers to come off the stack.
+    pub from_stack: Option<bool>,
+    /// Terminator kind: "ret", "jmp", "call", "syscall", "none", "any".
+    pub terminator: Option<String>,
+    pub max_side_effects: Option<u32>,
+    pub max_insns: Option<u32>,
     /// Architecture slice for a fat (Universal) Mach-O, e.g. "x86_64",
     /// "arm64", "i386". REQUIRED for a multi-slice container: without it
     /// the scan is refused rather than concatenating slices whose virtual
@@ -392,7 +500,7 @@ pub struct SearchQuery {
     pub timeout_secs: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct RawCommandQuery {
     /// Absolute path to the binary; must be inside one of the server's
     /// allow_roots (get_server_config lists them).
@@ -402,22 +510,81 @@ pub struct RawCommandQuery {
     /// --filter --re --range --section --base --offset --badbytes --align
     /// --multibr --json. Anything else is rejected.
     pub args: Vec<String>,
-    /// Maximum gadgets returned (default 1000, hard max 50000).
+    /// Maximum gadgets returned per page (default 1000, hard max 50000).
     pub max_results: Option<usize>,
+    /// Result ordering; see find_gadgets. Default "rank".
+    pub order: Option<String>,
+    /// `next_cursor` from a previous page of THIS query.
+    pub cursor: Option<String>,
+    /// Keep only gadgets whose primary class is one of these.
+    pub class: Option<String>,
+    /// Keep only gadgets carrying at least one of these labels.
+    pub label: Option<String>,
+    /// Keep only gadgets that write ALL of these registers.
+    pub writes_reg: Option<String>,
+    /// Keep only gadgets that read ALL of these registers.
+    pub reads_reg: Option<String>,
+    /// Keep only gadgets that write NONE of these registers.
+    pub preserves_regs: Option<String>,
+    /// Require the `writes_reg` registers to come off the stack.
+    pub from_stack: Option<bool>,
+    /// Terminator kind: "ret", "jmp", "call", "syscall", "none", "any".
+    pub terminator: Option<String>,
+    pub max_side_effects: Option<u32>,
+    pub max_insns: Option<u32>,
     /// Per-request timeout in seconds (default 60, max 300).
     pub timeout_secs: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+/// `get_gadgets` — resolve stable ids back to full records.
+///
+/// This is what lets an agent say "build a chain from g_ab12 and g_cd34"
+/// rather than re-sending gadget text and hoping the server parses it the
+/// same way.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct IdsQuery {
+    /// Absolute path to the binary; must be inside one of the server's
+    /// allow_roots (get_server_config lists them).
+    pub binary_path: String,
+    /// Stable gadget ids, as returned in `gadgets[].id` (e.g.
+    /// "g_ab12cd34ef56gh78"). Ids that do not resolve are reported in
+    /// `warnings` rather than failing the call.
+    pub ids: Vec<String>,
+    /// Search depth the ids were found at (default 10). An id from a
+    /// depth-10 scan will not resolve in a depth-4 one.
+    pub depth: Option<usize>,
+    /// Rebase the image base at load time (hex string). Must match the
+    /// scan the ids came from: an id is independent of every scan
+    /// parameter EXCEPT `base`, which relabels the whole address space.
+    pub base: Option<String>,
+    /// Offset added to gadget addresses after any rebase (hex string).
+    pub offset: Option<String>,
+    /// Executable section name(s); comma-separated, `*` globbing.
+    pub section: Option<String>,
+    /// Architecture slice for a fat (Universal) Mach-O.
+    pub arch: Option<String>,
+    /// Per-request timeout in seconds (default 60, max 300).
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct InfoQuery {
     /// Absolute path to the binary; must be inside one of the server's
     /// allow_roots (get_server_config lists them).
     pub binary_path: String,
     /// Rebase the image base before reporting addresses (hex string).
     pub base: Option<String>,
+    /// Maximum sections reported (default 4096). A larger array is
+    /// truncated and `warnings` carries `sections_truncated`.
+    pub max_sections: Option<usize>,
+    /// Maximum imports reported (default 4096). A larger array is
+    /// truncated and `warnings` carries `imports_truncated`.
+    pub max_imports: Option<usize>,
+    /// Per-request timeout in seconds (default 60, max 300).
+    pub timeout_secs: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ChainQuery {
     /// Absolute path to the binary; must be inside one of the server's
     /// allow_roots (get_server_config lists them).
@@ -505,27 +672,23 @@ pub fn parse_ropgadget_args(args: &[String]) -> Result<ParsedArgs, ToolError> {
     while i < args.len() {
         let Some(arg) = args.get(i) else { break };
         let Some(stripped) = arg.strip_prefix("--") else {
-            return Err(ToolError::new(
-                "invalid_flag",
-                format!("unexpected positional argument {arg:?}; only --flags are accepted"),
-            ));
+            return Err(usage_flag(format!(
+                "unexpected positional argument {arg:?}; only --flags are accepted"
+            )));
         };
         let (name, inline_val) = match stripped.split_once('=') {
             Some((n, v)) => (n, Some(v.to_string())),
             None => (stripped, None),
         };
         if !ALLOWED_FLAGS.contains(&name) {
-            return Err(ToolError::new(
-                "invalid_flag",
-                format!(
-                    "flag --{name} is not allowed; allowlist: {}",
-                    ALLOWED_FLAGS
-                        .iter()
-                        .map(|f| format!("--{f}"))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                ),
-            ));
+            return Err(usage_flag(format!(
+                "flag --{name} is not allowed; allowlist: {}",
+                ALLOWED_FLAGS
+                    .iter()
+                    .map(|f| format!("--{f}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )));
         }
         let takes_value = VALUE_FLAGS.contains(&name);
         let value = if takes_value {
@@ -534,33 +697,26 @@ pub fn parse_ropgadget_args(args: &[String]) -> Result<ParsedArgs, ToolError> {
                 None => {
                     i += 1;
                     let Some(v) = args.get(i) else {
-                        return Err(ToolError::new(
-                            "invalid_flag",
-                            format!("flag --{name} requires a value"),
-                        ));
+                        return Err(usage_flag(format!("flag --{name} requires a value")));
                     };
                     if v.starts_with("--") {
-                        return Err(ToolError::new(
-                            "invalid_flag",
-                            format!("flag --{name} requires a value (got {v:?})"),
-                        ));
+                        return Err(usage_flag(format!(
+                            "flag --{name} requires a value (got {v:?})"
+                        )));
                     }
                     Some(v.clone())
                 }
             }
         } else {
             if inline_val.is_some() {
-                return Err(ToolError::new(
-                    "invalid_flag",
-                    format!("flag --{name} does not take a value"),
-                ));
+                return Err(usage_flag(format!("flag --{name} does not take a value")));
             }
             None
         };
         match name {
             "depth" => {
                 req.depth = value.unwrap().parse().map_err(|_| {
-                    ToolError::new("usage_error", "invalid --depth value".to_string())
+                    ToolError::new(ErrorCode::UsageError, "invalid --depth value".to_string())
                 })?;
             }
             "norop" => req.rop = false,
@@ -582,13 +738,35 @@ pub fn parse_ropgadget_args(args: &[String]) -> Result<ParsedArgs, ToolError> {
             "align" => {
                 // ANCH-02: a real engine option, not an address post-filter.
                 let v = value.unwrap();
-                req.align = Some(parse_align(&v).map_err(|e| ToolError::new("usage_error", e))?);
+                req.align =
+                    Some(parse_align(&v).map_err(|e| ToolError::new(ErrorCode::UsageError, e))?);
             }
             _ => unreachable!("allowlist checked above"),
         }
         i += 1;
     }
     Ok(ParsedArgs { request: req, re })
+}
+
+/// Collect the nine CLS-08 filter parameters out of a query.
+///
+/// `GadgetQuery`, `SearchQuery` and `RawCommandQuery` carry the same nine
+/// fields under the same names; a macro is how one spelling covers all
+/// three without a trait whose only job is to re-export nine getters.
+macro_rules! raw_filter {
+    ($q:expr) => {
+        semantics::RawFilter {
+            class: $q.class.as_deref(),
+            label: $q.label.as_deref(),
+            writes_reg: $q.writes_reg.as_deref(),
+            reads_reg: $q.reads_reg.as_deref(),
+            preserves_regs: $q.preserves_regs.as_deref(),
+            from_stack: $q.from_stack,
+            terminator: $q.terminator.as_deref(),
+            max_side_effects: $q.max_side_effects,
+            max_insns: $q.max_insns,
+        }
+    };
 }
 
 fn split_sections(section: Option<&str>) -> Vec<String> {
@@ -637,7 +815,6 @@ fn query_to_request(q: &GadgetQuery, rop: bool, jop: bool, sys: bool) -> rf_cli:
 // ---------------------------------------------------------------------------
 
 /// Post-scan options applied over the cached gadget set.
-#[derive(Default)]
 struct PostOpts {
     /// Regex/substring filter over gadget text (`--re`).
     ///
@@ -649,8 +826,36 @@ struct PostOpts {
     /// bytes back. `--align` is now `ScanRequest::align`, which reaches
     /// `rf_scan::ScanOptions::align` and steps the scan itself.
     re: Option<String>,
-    /// Ordering before sampling; only "quality" is supported.
-    sort_by: Option<String>,
+    /// Ordering applied before paging. Default [`Order::Rank`].
+    order: Order,
+    /// The semantic predicate (CLS-08).
+    filter: GadgetFilter,
+    /// `cursor` as the client sent it, still to be validated.
+    cursor: Option<String>,
+    /// Fingerprint of the parameters that decide the result set, so a
+    /// cursor from another query is refused rather than spliced in.
+    params_hash: String,
+    /// Response page size (`max_results`), clamped to the server cap.
+    max_results: Option<usize>,
+    /// Per-request timeout, clamped to the server cap.
+    timeout_secs: Option<u64>,
+    /// `get_gadgets` only: resolve exactly these stable ids, in this order.
+    ids: Option<Vec<String>>,
+}
+
+impl Default for PostOpts {
+    fn default() -> Self {
+        PostOpts {
+            re: None,
+            order: Order::Rank,
+            filter: GadgetFilter::default(),
+            cursor: None,
+            params_hash: String::new(),
+            max_results: None,
+            timeout_secs: None,
+            ids: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -660,17 +865,24 @@ pub struct RopFinderMcp {
     /// Allow roots with their directory handles pinned for the lifetime of
     /// the process (MCP-01).
     roots: Arc<Vec<AllowRoot>>,
-    /// MCP-03 interim bound: at most `max_concurrent` scans run at once.
-    /// The permit is moved INTO the blocking closure, so it is released
-    /// when the work actually stops rather than when the await returns —
-    /// otherwise a timed-out request would free a slot while its orphaned
-    /// worker kept burning CPU, which is the measured 398% runaway.
-    inflight: Arc<tokio::sync::Semaphore>,
+    /// MCP-03/PERF-06: the concurrency bound, the cancellation bridge and
+    /// the scan thread pool. Every tool goes through it.
+    guard: Arc<Guard>,
+    stats: Arc<ServerStats>,
+    /// MCP-09: the JSONL call/denial log, when `--audit-log` was given.
+    audit: Option<Arc<AuditLog>>,
+    /// MCP-09: warn/error forwarded as `notifications/message`, because
+    /// MCP hosts discard the server's stderr.
+    notifier: Arc<Notifier>,
+    /// One uuid per process, stamped on every audit line.
+    session: Arc<str>,
 }
 
 impl RopFinderMcp {
     /// Build the server, opening and pinning every `config.allow_dirs`
-    /// entry. Fails if a root cannot be opened.
+    /// entry. Fails if a root cannot be opened, if the scan pool cannot be
+    /// built, or if `--audit-log` cannot be written — an audit log the
+    /// operator asked for and did not get is worse than none.
     pub fn new(config: ServerConfig) -> std::io::Result<Self> {
         let mut roots = Vec::with_capacity(config.allow_dirs.len());
         for d in &config.allow_dirs {
@@ -680,14 +892,53 @@ impl RopFinderMcp {
             }
             roots.push(root);
         }
-        let cache = Cache::new(config.cache_dir.clone());
-        let permits = config.max_concurrent.max(1);
+        let session: Arc<str> = Arc::from(uuid::Uuid::new_v4().to_string().as_str());
+        let audit = match &config.audit_log {
+            None => None,
+            Some(p) => Some(Arc::new(AuditLog::open(
+                p,
+                config.audit_log_max_mb,
+                session.to_string(),
+            )?)),
+        };
+        let cache = Cache::new(
+            config.cache_dir.clone(),
+            rf_cache::MemLimits {
+                max_bytes: config.cache_mem_bytes,
+                ttl: config.cache_ttl,
+            },
+            config.cursor_ttl,
+        );
+        let stats = Arc::new(ServerStats::default());
+        let guard = Guard::new(config.max_concurrent, config.scan_threads, stats.clone())
+            .map_err(std::io::Error::other)?;
         Ok(RopFinderMcp {
             config: Arc::new(config),
             cache: Arc::new(cache),
             roots: Arc::new(roots),
-            inflight: Arc::new(tokio::sync::Semaphore::new(permits)),
+            guard: Arc::new(guard),
+            stats,
+            audit,
+            notifier: Arc::new(Notifier::new()),
+            session,
         })
+    }
+
+    /// The session uuid stamped on every audit line.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session
+    }
+
+    /// Counters, for tests and for `get_server_stats`.
+    #[must_use]
+    pub fn stats(&self) -> &ServerStats {
+        &self.stats
+    }
+
+    #[must_use]
+    pub fn notifier(&self) -> &Notifier {
+        &self.notifier
     }
 
     /// Open `binary_path` confined to the pinned allow roots.
@@ -705,7 +956,7 @@ impl RopFinderMcp {
         let d = depth.unwrap_or(10);
         if d > self.config.max_depth {
             return Err(ToolError::with_details(
-                "usage_error",
+                ErrorCode::UsageError,
                 format!(
                     "depth {d} exceeds the server's max_depth of {}; \
                      re-send with depth <= {}",
@@ -722,17 +973,44 @@ impl RopFinderMcp {
     /// The effective configuration an agent is entitled to know, so it
     /// never has to guess a path (which is what made the error taxonomy
     /// worth probing in the first place — MCP-07).
-    fn config_json(&self) -> Value {
-        json!({
-            "allow_roots": self.root_paths(),
-            "max_depth": self.config.max_depth,
-            "max_file_bytes": self.config.max_file_bytes,
-            "max_results": self.config.max_results,
-            "max_concurrent": self.config.max_concurrent,
-            "timeout_secs": self.config.timeout.as_secs(),
-            "cache": self.config.cache_dir.is_some(),
-            "version": env!("CARGO_PKG_VERSION"),
-        })
+    ///
+    /// It also publishes the two enumerations CRIT-03 closed: every `order`
+    /// and every `ErrorCode`. An agent that can read the taxonomy does not
+    /// have to discover it by provoking failures.
+    fn config_response(&self) -> schema::ConfigResponse {
+        schema::ConfigResponse {
+            allow_roots: self.root_paths(),
+            max_depth: self.config.max_depth as u64,
+            max_file_bytes: self.config.max_file_bytes,
+            max_results: self.config.max_results as u64,
+            hard_max_results: HARD_MAX_RESULTS as u64,
+            max_concurrent: self.config.max_concurrent as u64,
+            scan_threads: self.guard.scan_threads() as u64,
+            max_gadgets: self.config.max_gadgets.map(|g| g as u64),
+            max_sections: self.config.max_info_items as u64,
+            max_imports: self.config.max_info_items as u64,
+            timeout_secs: self.config.timeout.as_secs(),
+            cache: self.config.cache_dir.is_some(),
+            cache_mem_max_bytes: self.config.cache_mem_bytes,
+            cache_ttl_secs: self.config.cache_ttl.as_secs(),
+            cursor_ttl_secs: self.config.cursor_ttl.as_secs(),
+            workspace_dir: self
+                .config
+                .workspace_dir
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            audit_log: self.audit.is_some(),
+            probe_threshold: self.config.probe_threshold,
+            orders: semantics::ORDER_NAMES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            error_codes: ErrorCode::all()
+                .iter()
+                .map(|c| c.as_str().to_string())
+                .collect(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }
     }
 
     /// The effective allow roots, in operator-facing form.
@@ -757,203 +1035,512 @@ impl RopFinderMcp {
         Ok(req)
     }
 
-    /// Acquire an inflight permit, waiting at most `timeout`.
+    /// A future that resolves when the client sends
+    /// `notifications/cancelled` for this request.
     ///
-    /// The permit is then held until the worker stops, not until the await
-    /// returns — that is what makes `--max-concurrent` a real bound on work
-    /// in flight rather than on outstanding awaits. The wait is capped so a
-    /// queued request fails fast with `busy` instead of hanging: until real
-    /// cancellation lands (v0.2 engine token, MCP-03), a worker abandoned by
-    /// its own timeout keeps its permit until it finishes on its own.
-    async fn permit(
+    /// rmcp cancels `RequestContext::ct`; [`guard::Guard::run`] bridges that
+    /// to the engine's [`rf_scan::CancelToken`]. Before this the server
+    /// accepted the notification and did nothing with it, and the
+    /// depth-100000 request that had already been cancelled was at
+    /// 54,873 MB RSS thirteen seconds later.
+    fn cancel_signal(ctx: &RequestContext<RoleServer>) -> guard::CancelSignal {
+        let ct = ctx.ct.clone();
+        Box::pin(async move {
+            ct.cancelled().await;
+        })
+    }
+
+    /// Start a tool call: register the peer for operator notifications,
+    /// count the request, and open the audit record that will be written
+    /// exactly once whatever happens next.
+    fn begin(
         &self,
-        timeout: Duration,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, ToolError> {
-        match tokio::time::timeout(timeout, self.inflight.clone().acquire_owned()).await {
-            Ok(Ok(p)) => Ok(p),
-            Ok(Err(_)) => Err(ToolError::new("internal", "server is shutting down")),
-            Err(_) => Err(ToolError::with_details(
-                "busy",
-                format!(
-                    "all {} concurrent scan slots are in use; retry, or start the server \
-                     with a larger --max-concurrent",
-                    self.config.max_concurrent
-                ),
-                json!({"limit": "max_concurrent", "limit_value": self.config.max_concurrent}),
-            )),
+        ctx: &RequestContext<RoleServer>,
+        tool: &'static str,
+        params_hash: String,
+    ) -> (AuditRecord, Instant) {
+        self.notifier.register(&ctx.peer);
+        self.stats.record_request(tool);
+        let req_id = ctx.id.to_string();
+        tracing::debug!(tool, req_id = %req_id, "tool call");
+        (AuditRecord::new(req_id, tool, params_hash), Instant::now())
+    }
+
+    /// Finish a tool call: classify the outcome, maintain the probing
+    /// signal, write the ONE audit line, and render the response.
+    async fn finish<T: Serialize>(
+        &self,
+        mut rec: AuditRecord,
+        started: Instant,
+        out: Result<T, ToolError>,
+    ) -> Result<CallToolResult, McpError> {
+        let verdict = match &out {
+            Ok(_) => Verdict::Ok,
+            Err(e) => {
+                // The audit records the FINE reason (`file_too_large`,
+                // `timeout_hard`, `busy`), not the closed wire code, so
+                // collapsing the taxonomy for the agent costs the operator
+                // nothing.
+                rec.code = Some(e.kind.to_string());
+                Verdict::for_code(e.kind)
+            }
+        };
+        rec.verdict = verdict.as_str();
+        let suspected = self
+            .stats
+            .record_verdict(verdict, self.config.probe_threshold);
+        rec.probing_suspected = suspected;
+        rec.duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+
+        // The operator, who never sees stderr, is told about the two
+        // conditions that mean something is wrong with the server or with
+        // the client driving it.
+        if let Err(e) = &out {
+            if e.is_hard_timeout() {
+                self.notifier.error(
+                    "worker_wedged",
+                    "a cancelled scan did not stop within the hard-join window",
+                    json!({"tool": rec.tool, "wedged_total": self.stats.wedged_now()}),
+                );
+            }
+        }
+        if suspected {
+            self.notifier.warn(
+                "path_probing",
+                "consecutive path_denied results suggest an agent is enumerating the filesystem",
+                json!({"denied_consecutive": self.stats.denied_consecutive_now(),
+                       "threshold": self.config.probe_threshold,
+                       "requested": rec.binary}),
+            );
+        }
+
+        if let Some(log) = &self.audit {
+            log.write(&rec);
+        }
+
+        // MCP-09: once probing is suspected every response is delayed, so
+        // a filesystem walk costs the caller wall-clock time. A legitimate
+        // agent has read get_server_config and generates no denials, so it
+        // never pays this.
+        if suspected {
+            tokio::time::sleep(PROBE_DELAY).await;
+        }
+
+        match out {
+            Ok(v) => tool_ok(&v),
+            Err(e) => tool_error(e),
         }
     }
 
-    /// Run a scan with confinement + caps + cache + timeout. Everything
-    /// blocking happens on a worker thread so a timeout can abandon it.
+    /// Run a scan with confinement + caps + cache, on the shared guard,
+    /// then filter, order and page the result (CLS-08, CRIT-03,
+    /// MCP-DESIGN fix #8).
+    ///
+    /// MCP-03/PERF-06: `guard.run` cancels the WORK on timeout and joins
+    /// it before releasing the permit. The three ad-hoc
+    /// `tokio::time::timeout(_, spawn_blocking(_))` blocks this replaces
+    /// abandoned the await and left the scan running.
     async fn run_scan(
         &self,
+        ctx: &RequestContext<RoleServer>,
+        rec: &mut AuditRecord,
         req: rf_cli::ScanRequest,
         binary_path: &str,
         post: PostOpts,
-        max_results: Option<usize>,
-        timeout_secs: Option<u64>,
-    ) -> Result<Value, ToolError> {
+    ) -> Result<ScanResponse, ToolError> {
         let PostOpts {
             re: post_re,
-            sort_by,
+            order,
+            filter,
+            cursor: cursor_in,
+            params_hash,
+            max_results,
+            timeout_secs,
+            ids,
         } = post;
-        if let Some(sb) = &sort_by {
-            if sb != "quality" {
-                return Err(ToolError::new(
-                    "usage",
-                    format!("unsupported sort_by {sb:?}; only \"quality\" is available"),
-                ));
-            }
-        }
-        // MCP-01: an open HANDLE, not a name, crosses into spawn_blocking.
+        // MCP-01: an open HANDLE, not a name, crosses into the worker.
+        rec.binary = Some(binary_path.to_string());
         let confined = self.open_confined(binary_path)?;
+        // Inside a root: log the root-relative label, not the caller's
+        // spelling of the path.
+        rec.binary = Some(confined.label.clone());
+        let binary_label = confined.label.clone();
+        let declared_len = confined.len;
         let max = clamp_max_results(max_results, self.config.max_results);
         let timeout = clamp_timeout(timeout_secs, self.config.timeout);
         let cache = self.cache.clone();
         let max_file_bytes = self.config.max_file_bytes;
-        let permit = self.permit(timeout).await?;
+        let max_gadgets = self.config.max_gadgets;
+        let workspace = self.config.workspace_dir.clone();
 
-        let work = move || -> Result<Value, ToolError> {
-            let _permit = permit;
-            let bytes = confined.read_all(max_file_bytes)?;
-            let file_hash = sha256_hex(&bytes);
-            // CLI-01/ENG-05, the MCP half: every parameter that can change
-            // the output is in the key, or two different requests share an
-            // entry and one of them is served the other's answer. `align`
-            // and `arch` change WHAT IS SCANNED (ANCH-02, CORE-03);
-            // `max_gadgets`/`max_memory` TRUNCATE a result, so a bounded
-            // scan must never be served for an unbounded query; `compat`
-            // decides whether a multi-slice container is scanned at all.
-            // `rf_cache::make_key` folds in the key-schema version, so the
-            // next addition to this list makes old entries MISS.
-            let key = rf_cache::make_key(
-                &file_hash,
-                &format!(
-                    "depth={}|rop={}|jop={}|sys={}|multibr={}|only={}|filter={}|range={}|\
+        let work =
+            move |cancel: rf_scan::CancelToken| -> Result<(ScanResponse, ScanFacts), ToolError> {
+                let bytes = confined.read_all(max_file_bytes)?;
+                let file_hash = sha256_hex(&bytes);
+                // CLI-01/ENG-05, the MCP half: every parameter that can change
+                // the output is in the key, or two different requests share an
+                // entry and one of them is served the other's answer. `align`
+                // and `arch` change WHAT IS SCANNED (ANCH-02, CORE-03);
+                // `max_gadgets`/`max_memory` TRUNCATE a result, so a bounded
+                // scan must never be served for an unbounded query; `compat`
+                // decides whether a multi-slice container is scanned at all.
+                // `rf_cache::make_key` folds in the key-schema version, so the
+                // next addition to this list makes old entries MISS.
+                //
+                // `rec=3` is this crate's own record version, and it is here
+                // because v0.3 started storing `delay_slot` in the MCP cache
+                // record. A v0.2 entry has the field absent, which deserializes
+                // to `false` — and `false` is a MEANINGFUL value on MIPS. The
+                // discriminator makes every pre-0.3 entry miss rather than
+                // report a wrong delay slot.
+                let key = rf_cache::make_key(
+                    &file_hash,
+                    &format!(
+                        "depth={}|rop={}|jop={}|sys={}|multibr={}|only={}|filter={}|range={}|\
                      badbytes={}|offset={}|section={:?}|thumb={}|base={}|cfg_aware={}|\
                      align={:?}|arch={}|all={}|noinstr={}|call_preceded={}|\
-                     max_gadgets={:?}|max_memory={:?}|compat={}",
-                    req.depth,
-                    req.rop,
-                    req.jop,
-                    req.sys,
-                    req.multibr,
-                    req.only.as_deref().unwrap_or(""),
-                    req.filter.as_deref().unwrap_or(""),
-                    req.range.as_deref().unwrap_or(""),
-                    req.badbytes.as_deref().unwrap_or(""),
-                    req.offset.as_deref().unwrap_or(""),
-                    req.section,
-                    req.thumb,
-                    req.base.as_deref().unwrap_or(""),
-                    req.cfg_aware,
-                    req.align,
-                    req.arch.as_deref().unwrap_or(""),
-                    req.all,
-                    req.noinstr,
-                    req.call_preceded,
-                    req.max_gadgets,
-                    req.max_memory,
-                    req.compat,
-                ),
-            );
-            let (scan, cache_status) = match cache.get(&key) {
-                Some(hit) => (hit, "hit"),
-                None => {
-                    let outcome =
-                        rf_cli::scan_bytes(&bytes, None, &req).map_err(scan_err_to_tool)?;
-                    let res = &outcome.result;
-                    let offset = outcome.opts.offset;
-                    let arch = res.universal_arch.map(rf_cli::arch_name);
-                    // Phase 5: classify once at scan time so quality/class
-                    // ride in the cache (sort_by quality needs no rescan).
-                    let class_arch = arch_from_bytes(&bytes);
-                    let gadgets = res
-                        .gadgets
-                        .iter()
-                        .map(|g| {
-                            let cls = class_arch.map(|a| rf_classify::classify(g, a));
-                            CachedGadget {
-                                vaddr: rf_cli::fmt_addr(g.vaddr, res.addr_size),
-                                bytes: g.bytes_hex(),
-                                text: g.text(),
-                                arch: arch.map(str::to_string),
-                                section: res.selected_sections.as_deref().and_then(|s| {
-                                    rf_cli::section_of(s, g.vaddr.wrapping_sub(offset))
-                                }),
-                                quality: cls.as_ref().map(|c| c.quality),
-                                class: cls.as_ref().map(|c| c.primary.name().to_string()),
-                                // insns/delay_slot/prev are rf-cli's half of
-                                // the shared record; skipped when empty, so
-                                // the response shape is unchanged.
-                                ..CachedGadget::default()
+                     max_gadgets={:?}|max_memory={:?}|compat={}|rec=3",
+                        req.depth,
+                        req.rop,
+                        req.jop,
+                        req.sys,
+                        req.multibr,
+                        req.only.as_deref().unwrap_or(""),
+                        req.filter.as_deref().unwrap_or(""),
+                        req.range.as_deref().unwrap_or(""),
+                        req.badbytes.as_deref().unwrap_or(""),
+                        req.offset.as_deref().unwrap_or(""),
+                        req.section,
+                        req.thumb,
+                        req.base.as_deref().unwrap_or(""),
+                        req.cfg_aware,
+                        req.align,
+                        req.arch.as_deref().unwrap_or(""),
+                        req.all,
+                        req.noinstr,
+                        req.call_preceded,
+                        req.max_gadgets.or(max_gadgets),
+                        req.max_memory,
+                        req.compat,
+                    ),
+                );
+                // The id is computed over the address with `--offset` undone,
+                // so it does not change when the caller shifts the reported
+                // addresses.
+                let offset = match &req.offset {
+                    Some(o) => rf_cli::parse_hex(o, "--offset")
+                        .map_err(|e| ToolError::new(ErrorCode::UsageError, e))?,
+                    None => 0,
+                };
+                let class_arch = arch_from_bytes(&bytes);
+                let mut warnings: Vec<Warning> = Vec::new();
+
+                // Three ways to get the gadget set, cheapest first. The pinned
+                // store is what a cursor's next page hits: it holds the scan
+                // AND its semantics, so paging a 40,872-gadget walk does not
+                // reclassify the set once per page.
+                let (scan, sems, cache_status) = if let Some(p) = cache.pinned(&key) {
+                    // A pinned entry is a cache hit that also kept its semantics; the
+                    // difference is invisible to the caller and observable to an
+                    // operator as `cache.pinned_entries`.
+                    (p.scan, p.sems, "hit")
+                } else if let Some(hit) = cache.get(&key) {
+                    let sems = Arc::new(semantics::classify_scan(
+                        &hit, &file_hash, offset, class_arch,
+                    ));
+                    cache.pin(&key, hit.clone(), sems.clone());
+                    (hit, sems, "hit")
+                } else {
+                    let product =
+                        scan::scan_bytes_cancellable(&bytes, &req, &cancel, max_gadgets, None)
+                            .map_err(scan::ScanFail::to_tool_error)?;
+                    let arch = product.universal_arch.map(rf_cli::arch_name);
+                    let addr_size = product.addr_size;
+                    let selected = product.selected_sections;
+                    let id_ctx = semantics::IdContext {
+                        binary_sha256: &file_hash,
+                        offset,
+                    };
+                    // CLS-08: classify ONCE, here, and keep all of it. The old
+                    // code classified in exactly this loop and then stored two
+                    // fields of the result.
+                    let classifier = class_arch.map(rf_classify::Classifier::new);
+                    let mut gadgets = Vec::with_capacity(product.gadgets.len());
+                    let mut built = Vec::with_capacity(product.gadgets.len());
+                    for g in &product.gadgets {
+                        let cls = classifier.as_ref().map(|c| c.classify(g));
+                        gadgets.push(CachedGadget {
+                            vaddr: rf_cli::fmt_addr(g.vaddr, addr_size),
+                            bytes: g.bytes_hex(),
+                            text: g.text(),
+                            arch: arch.map(str::to_string),
+                            section: selected
+                                .as_deref()
+                                .and_then(|s| rf_cli::section_of(s, g.vaddr.wrapping_sub(offset))),
+                            quality: cls.as_ref().map(|c| c.quality),
+                            class: cls.as_ref().map(|c| c.primary.name().to_string()),
+                            // CRIT-03: `delay_slot` is computed by the engine
+                            // and was dropped at every output boundary, so a
+                            // MIPS gadget reached the agent with no sign that
+                            // its last instruction runs BEFORE the branch.
+                            delay_slot: g.delay_slot,
+                            ..CachedGadget::default()
+                        });
+                        built.push(semantics::from_scan_gadget(g, cls, &id_ctx));
+                    }
+                    let arc = cache.put(
+                        &key,
+                        CachedScan {
+                            gadgets,
+                            fallback_names: product.fallback_names,
+                            ..CachedScan::default()
+                        },
+                    );
+                    let sems = Arc::new(built);
+                    cache.pin(&key, arc.clone(), sems.clone());
+                    (arc, sems, "miss")
+                };
+
+                // ---- select -------------------------------------------------
+                let mut idx: Vec<usize> = match &ids {
+                    Some(want) => {
+                        let mut by_id: std::collections::HashMap<&str, usize> =
+                            std::collections::HashMap::with_capacity(sems.len());
+                        for (i, s) in sems.iter().enumerate() {
+                            by_id.entry(s.id.as_str()).or_insert(i);
+                        }
+                        let mut out = Vec::with_capacity(want.len());
+                        let mut missing: Vec<&str> = Vec::new();
+                        for id in want {
+                            match by_id.get(id.as_str()) {
+                                Some(&i) => out.push(i),
+                                None => missing.push(id.as_str()),
                             }
-                        })
-                        .collect();
-                    (
-                        cache.put(
-                            &key,
-                            CachedScan {
-                                gadgets,
-                                fallback_names: outcome.fallback_names,
-                                ..CachedScan::default()
-                            },
-                        ),
-                        "miss",
-                    )
+                        }
+                        if !missing.is_empty() {
+                            warnings.push(
+                                Warning::truncation(
+                                    "ids_not_found",
+                                    "gadgets",
+                                    out.len(),
+                                    want.len(),
+                                )
+                                .with_detail(missing.join(",")),
+                            );
+                        }
+                        out
+                    }
+                    None => (0..scan.gadgets.len()).collect(),
+                };
+                // The only surviving text post-filter is --re, which is a
+                // post-filter in ROPgadget too. --align is an engine option
+                // (ANCH-02) and has already been applied by the scan above.
+                if let Some(re) = &post_re {
+                    match regex::Regex::new(re) {
+                        Ok(re) => idx
+                            .retain(|&i| scan.gadgets.get(i).is_some_and(|g| re.is_match(&g.text))),
+                        Err(_) => idx.retain(|&i| {
+                            scan.gadgets
+                                .get(i)
+                                .is_some_and(|g| g.text.contains(re.as_str()))
+                        }),
+                    }
                 }
+                if !filter.is_empty() {
+                    idx.retain(|&i| sems.get(i).is_some_and(|s| filter.matches(s)));
+                }
+                semantics::sort_indices(&mut idx, order, &scan, &sems);
+
+                // ---- page ---------------------------------------------------
+                let total = idx.len() as u64;
+                let start = match &cursor_in {
+                    Some(raw) => Cursor::decode(raw, &key, order.as_str(), &params_hash)?.offset,
+                    None => 0,
+                };
+                let page: Vec<usize> = idx
+                    .iter()
+                    .skip(usize::try_from(start).unwrap_or(usize::MAX))
+                    .take(max)
+                    .copied()
+                    .collect();
+                let gadgets: Vec<GadgetRecord> = page
+                    .iter()
+                    .filter_map(|&i| Some(GadgetRecord::build(scan.gadgets.get(i)?, sems.get(i)?)))
+                    .collect();
+                let returned = gadgets.len() as u64;
+                let truncated = start.saturating_add(returned) < total;
+
+                // ---- warnings ------------------------------------------------
+                if scan.fallback_names {
+                    warnings.push(Warning::new(
+                        "fallback_section_names",
+                        "the binary has no section names; synthetic PT_LOAD#n names were matched \
+                     instead, so `section` values are positional rather than real",
+                    ));
+                }
+                if let Some(slice) = scan.gadgets.first().and_then(|g| g.arch.clone()) {
+                    warnings.push(
+                        Warning::new(
+                            "universal_slice_selected",
+                            "this is one slice of a fat (Universal) Mach-O; addresses are that \
+                         slice's",
+                        )
+                        .with_detail(slice),
+                    );
+                }
+                if gadgets.iter().any(|g| g.low_confidence) {
+                    warnings.push(Warning::new(
+                        "low_confidence_classification",
+                        "some gadgets were classified from disassembly text rather than decoder \
+                     metadata; treat class/labels/regs on those as advisory",
+                    ));
+                }
+                if truncated {
+                    warnings.push(Warning::truncation(
+                        "truncated",
+                        "gadgets",
+                        usize::try_from(returned).unwrap_or(usize::MAX),
+                        usize::try_from(total).unwrap_or(usize::MAX),
+                    ));
+                }
+
+                // ---- resources -----------------------------------------------
+                let paged = total > returned;
+                let resource_uri = paged.then(|| resources::scan_uri(&key));
+                let workspace_file = match (&workspace, paged) {
+                    (Some(dir), true) => {
+                        resources::ensure_file(dir, &key, || resources::render_ndjson(&scan, &sems))
+                            .map(|p| p.display().to_string())
+                    }
+                    _ => None,
+                };
+
+                let facts = ScanFacts {
+                    sha256: file_hash.clone(),
+                    bytes_read: bytes.len() as u64,
+                    cache: cache_status,
+                    total_count: total,
+                    returned,
+                };
+                Ok((
+                    ScanResponse {
+                        gadgets,
+                        total_count: total,
+                        returned,
+                        offset: start,
+                        truncated,
+                        next_cursor: Cursor::next(
+                            &key,
+                            order.as_str(),
+                            &params_hash,
+                            start,
+                            returned,
+                            total,
+                        ),
+                        order: order.as_str().to_string(),
+                        binary_sha256: file_hash,
+                        binary_label,
+                        cache: cache_status.to_string(),
+                        cache_key: key,
+                        fallback_section_names: scan.fallback_names,
+                        warnings,
+                        resource_uri,
+                        workspace_file,
+                    },
+                    facts,
+                ))
             };
 
-            // The only surviving post-filter is --re, which is a post-filter
-            // in ROPgadget too. --align is an engine option (ANCH-02) and has
-            // already been applied by the scan above.
-            let mut gadgets: Vec<&CachedGadget> = scan.gadgets.iter().collect();
-            if let Some(re) = &post_re {
-                match regex::Regex::new(re) {
-                    Ok(re) => gadgets.retain(|g| re.is_match(&g.text)),
-                    Err(_) => gadgets.retain(|g| g.text.contains(re.as_str())),
-                }
+        let out = self
+            .guard
+            .run(Some(Self::cancel_signal(ctx)), timeout, work)
+            .await;
+        match out {
+            Ok((v, facts)) => {
+                facts.apply(rec);
+                self.stats.add_bytes_read(facts.bytes_read);
+                Ok(v)
             }
-            // Phase 5: quality ordering before sampling (top-N by quality).
-            if sort_by.is_some() {
-                gadgets = sort_by_quality(gadgets, arch_from_bytes(&bytes));
+            Err(e) => {
+                // The read never completed, so nothing was read; the
+                // declared size is still worth recording for a timeout.
+                rec.bytes_read = 0;
+                tracing::debug!(code = e.kind, declared_len, "tool call failed");
+                Err(e)
             }
-
-            let total_count = gadgets.len();
-            let truncated = total_count > max;
-            let sampled: Vec<&CachedGadget> = gadgets.into_iter().take(max).collect();
-            Ok(json!({
-                "gadgets": sampled,
-                "total_count": total_count,
-                "returned": sampled.len(),
-                "truncated": truncated,
-                "binary_sha256": file_hash,
-                "cache": cache_status,
-                "fallback_section_names": scan.fallback_names,
-            }))
-        };
-
-        match tokio::time::timeout(timeout, tokio::task::spawn_blocking(work)).await {
-            Ok(Ok(v)) => v,
-            Ok(Err(join_err)) => Err(ToolError::new(
-                "internal",
-                format!("scan worker failed: {join_err}"),
-            )),
-            Err(_) => Err(ToolError::new(
-                "timeout",
-                format!("scan exceeded the {} s timeout", timeout.as_secs()),
-            )),
         }
     }
 
-    /// Build a ROP chain with confinement + timeout. Unlike scans, chain
-    /// builds are not cache-backed (a chain is a single compact artifact,
-    /// and its inputs — the scan — would have to be re-validated anyway).
-    async fn run_chain(&self, q: ChainQuery) -> Result<Value, ToolError> {
+    /// `get_binary_info` (MCP-06): the one tool that used to have neither a
+    /// timeout nor a cap, and that did its whole-file read plus goblin
+    /// parse INLINE on the async runtime, occupying a tokio worker.
+    async fn run_info(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        rec: &mut AuditRecord,
+        q: &InfoQuery,
+    ) -> Result<InfoResponse, ToolError> {
+        rec.binary = Some(q.binary_path.clone());
+        let confined = self.open_confined(&q.binary_path)?;
+        rec.binary = Some(confined.label.clone());
+        let base = q
+            .base
+            .as_deref()
+            .map(|b| rf_cli::parse_hex(b, "--base"))
+            .transpose()
+            .map_err(|e| ToolError::new(ErrorCode::UsageError, e))?;
+        let timeout = clamp_timeout(q.timeout_secs, self.config.timeout);
+        let max_file_bytes = self.config.max_file_bytes;
+        let cap = self.config.max_info_items;
+        let max_sections = q.max_sections.unwrap_or(cap).clamp(1, cap);
+        let max_imports = q.max_imports.unwrap_or(cap).clamp(1, cap);
+
+        let work =
+            move |_cancel: rf_scan::CancelToken| -> Result<(InfoResponse, ScanFacts), ToolError> {
+                let bytes = confined.read_all(max_file_bytes)?;
+                let file_hash = sha256_hex(&bytes);
+                let mut v = rf_cli::info_bytes(&bytes, None, base).map_err(scan_err_to_tool)?;
+                let warnings = truncate_info(&mut v, max_sections, max_imports);
+                let out = InfoResponse::from_value(v, file_hash.clone(), warnings);
+                let facts = ScanFacts {
+                    sha256: file_hash,
+                    bytes_read: bytes.len() as u64,
+                    cache: "none",
+                    total_count: 0,
+                    returned: 0,
+                };
+                Ok((out, facts))
+            };
+
+        match self
+            .guard
+            .run(Some(Self::cancel_signal(ctx)), timeout, work)
+            .await
+        {
+            Ok((v, facts)) => {
+                rec.binary_sha256 = Some(facts.sha256.clone());
+                rec.bytes_read = facts.bytes_read;
+                rec.cache = Some("none");
+                self.stats.add_bytes_read(facts.bytes_read);
+                Ok(v)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Build a ROP chain with confinement + the shared guard. Unlike scans,
+    /// chain builds are not cache-backed (a chain is a single compact
+    /// artifact, and its inputs — the scan — would have to be re-validated
+    /// anyway).
+    async fn run_chain(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        rec: &mut AuditRecord,
+        q: ChainQuery,
+    ) -> Result<ChainResponse, ToolError> {
         if !matches!(q.target.as_str(), "linux-execve" | "windows-virtualprotect") {
             return Err(ToolError::new(
-                "usage_error",
+                ErrorCode::UsageError,
                 format!(
                     "unknown chain target {:?}; supported: linux-execve, windows-virtualprotect",
                     q.target
@@ -961,7 +1548,10 @@ impl RopFinderMcp {
             ));
         }
         let depth = self.check_depth(q.depth)?;
+        rec.binary = Some(q.binary_path.clone());
         let confined = self.open_confined(&q.binary_path)?;
+        rec.binary = Some(confined.label.clone());
+        let label = confined.label.clone();
         let timeout = clamp_timeout(q.timeout_secs, self.config.timeout);
         let max_file_bytes = self.config.max_file_bytes;
         let req = rf_cli::ScanRequest {
@@ -984,7 +1574,7 @@ impl RopFinderMcp {
             all: false,
             noinstr: false,
             arch: q.arch.clone(),
-            max_gadgets: None,
+            max_gadgets: self.config.max_gadgets,
             max_memory: None,
             compat: false,
         };
@@ -995,43 +1585,204 @@ impl RopFinderMcp {
             shellcode_size: q.shellcode_size.clone(),
         };
 
-        let permit = self.permit(timeout).await?;
-        let work = move || -> Result<Value, ToolError> {
-            let _permit = permit;
-            let bytes = confined.read_all(max_file_bytes)?;
-            let outcome =
-                rf_cli::chain_bytes(&bytes, None, &req, &spec).map_err(scan_err_to_tool)?;
-            let chain = &outcome.chain;
-            Ok(json!({
-                "chain": chain.to_json(),
-                "python": chain.to_python(),
-                "arch": chain.arch,
-                "description": chain.description,
-                "word_count": chain.words.len(),
-                "binary_sha256": sha256_hex(&bytes),
-            }))
-        };
+        // NOTE (MCP-03, residual): `rf_cli::chain_bytes` runs its own scan
+        // and has no token seam, so a chain build is bounded by the
+        // timeout and the join rather than interrupted mid-scan. `depth`
+        // is already capped at `--max-depth`, and a worker that does not
+        // stop within the hard-join window is reported as `timeout_hard`
+        // and counted in `wedged_total` rather than silently orphaned.
+        // The seam closes when rf-cli grows `chain_bytes_cancellable`
+        // (MCP-DESIGN fix #4 part C).
+        let binary_label = label.clone();
+        let offset_hex = q.offset.clone();
+        let work =
+            move |_cancel: rf_scan::CancelToken| -> Result<(ChainResponse, ScanFacts), ToolError> {
+                let bytes = confined.read_all(max_file_bytes)?;
+                let file_hash = sha256_hex(&bytes);
+                let outcome =
+                    rf_cli::chain_bytes(&bytes, None, &req, &spec).map_err(scan_err_to_tool)?;
+                let offset = match &offset_hex {
+                    Some(o) => rf_cli::parse_hex(o, "--offset")
+                        .map_err(|e| ToolError::new(ErrorCode::UsageError, e))?,
+                    None => 0,
+                };
+                let facts = ScanFacts {
+                    sha256: file_hash.clone(),
+                    bytes_read: bytes.len() as u64,
+                    cache: "bypass",
+                    total_count: outcome.chain.words.len() as u64,
+                    returned: outcome.chain.words.len() as u64,
+                };
+                let out = chain_response(&outcome, file_hash, binary_label, offset);
+                Ok((out, facts))
+            };
 
-        match tokio::time::timeout(timeout, tokio::task::spawn_blocking(work)).await {
-            Ok(Ok(v)) => v,
-            Ok(Err(join_err)) => Err(ToolError::new(
-                "internal",
-                format!("chain worker failed: {join_err}"),
-            )),
-            Err(_) => Err(ToolError::new(
-                "timeout",
-                format!("chain build exceeded the {} s timeout", timeout.as_secs()),
-            )),
+        match self
+            .guard
+            .run(Some(Self::cancel_signal(ctx)), timeout, work)
+            .await
+        {
+            Ok((v, facts)) => {
+                facts.apply(rec);
+                self.stats.add_bytes_read(facts.bytes_read);
+                Ok(v)
+            }
+            Err(e) => Err(e),
         }
     }
 }
 
+/// What a worker learned that the audit line needs and the response body
+/// does not carry in a fixed place.
+struct ScanFacts {
+    sha256: String,
+    bytes_read: u64,
+    cache: &'static str,
+    total_count: u64,
+    returned: u64,
+}
+
+impl ScanFacts {
+    fn apply(&self, rec: &mut AuditRecord) {
+        rec.binary_sha256 = Some(self.sha256.clone());
+        rec.bytes_read = self.bytes_read;
+        rec.cache = Some(self.cache);
+        rec.total_count = Some(self.total_count);
+        rec.returned = Some(self.returned);
+    }
+}
+
+/// MCP-06: cap `sections` and `imports`, returning the `warnings` entries.
+///
+/// A hostile PE with a million import entries must not be able to make the
+/// server serialize a gigabyte of JSON into an agent's context. Truncation
+/// is announced rather than silent: an agent that sees
+/// `imports_truncated` knows the list is partial, where a silently short
+/// list would be indistinguishable from a binary with few imports.
+fn truncate_info(v: &mut Value, max_sections: usize, max_imports: usize) -> Vec<Warning> {
+    let mut warnings = Vec::new();
+    let Some(obj) = v.as_object_mut() else {
+        return warnings;
+    };
+    for (field, cap, code) in [
+        ("sections", max_sections, "sections_truncated"),
+        ("imports", max_imports, "imports_truncated"),
+    ] {
+        let Some(Value::Array(a)) = obj.get_mut(field) else {
+            continue;
+        };
+        let total = a.len();
+        if total > cap {
+            a.truncate(cap);
+            warnings.push(Warning::truncation(code, field, cap, total));
+        }
+    }
+    warnings
+}
+
+/// Build the chain response, giving every referenced gadget the same stable
+/// id `find_gadgets` would.
+///
+/// The chain IR carries only `{vaddr, text}` per gadget, and an id needs the
+/// gadget's BYTES — so they are recovered from the scan the chain was built
+/// from, which `rf_cli::chain_bytes` hands back. Where a gadget cannot be
+/// matched the id is `null` rather than fabricated.
+fn chain_response(
+    outcome: &rf_cli::ChainOutcome,
+    binary_sha256: String,
+    binary_label: String,
+    offset: u64,
+) -> ChainResponse {
+    let chain = &outcome.chain;
+    let by_vaddr: std::collections::HashMap<u64, &[u8]> = outcome
+        .outcome
+        .result
+        .gadgets
+        .iter()
+        .map(|g| (g.vaddr, g.bytes.as_slice()))
+        .collect();
+    let gadgets = chain
+        .gadgets
+        .iter()
+        .map(|g| schema::ChainGadgetRef {
+            vaddr: format!("0x{:x}", g.vaddr),
+            vaddr_u64: g.vaddr,
+            text: g.text.clone(),
+            id: by_vaddr
+                .get(&g.vaddr)
+                .map(|b| schema::gadget_id(&binary_sha256, g.vaddr.wrapping_sub(offset), b)),
+        })
+        .collect();
+    let words = chain
+        .words
+        .iter()
+        .map(|w| schema::ChainWordRecord {
+            value: format!("0x{:x}", w.value),
+            kind: match w.kind {
+                rf_chain::WordKind::GadgetAddr => "gadget_addr",
+                rf_chain::WordKind::Immediate => "immediate",
+                rf_chain::WordKind::DataAddr => "data_addr",
+                rf_chain::WordKind::CodeAddr => "code_addr",
+                rf_chain::WordKind::Padding => "padding",
+            }
+            .to_string(),
+            comment: w.comment.clone(),
+            source_gadget: w.source_gadget.map(|i| i as u64),
+        })
+        .collect();
+    ChainResponse {
+        chain: schema::ChainIr {
+            arch: chain.arch.clone(),
+            description: chain.description.clone(),
+            script_comment: chain.script_comment.clone(),
+            word_size: chain.word_size as u64,
+            words,
+            gadgets,
+        },
+        python: chain.to_python(),
+        arch: chain.arch.clone(),
+        description: chain.description.clone(),
+        word_count: chain.words.len() as u64,
+        binary_sha256,
+        binary_label,
+        warnings: Vec::new(),
+    }
+}
+
+/// SHA-256 of a tool's parameters, minus `binary_path` (which is logged in
+/// its own field). Two identical queries against different binaries share
+/// a `params_hash`, which is what makes the audit log greppable.
+fn params_hash<T: serde::Serialize>(q: &T) -> String {
+    let mut v = serde_json::to_value(q).unwrap_or(Value::Null);
+    if let Some(o) = v.as_object_mut() {
+        o.remove("binary_path");
+    }
+    sha256_hex(v.to_string().as_bytes())
+}
+
+/// CRIT-03: map rf-cli's three failure kinds onto the closed wire set.
+///
+/// `binary_error` becomes `unsupported_binary`; `chain_error` becomes
+/// `not_found`, because every chain failure the builders produce is "this
+/// binary does not contain a gadget I need". The precise reason survives in
+/// the message and in the audit line's `kind`.
 fn scan_err_to_tool(e: rf_cli::ScanError) -> ToolError {
     match e {
-        rf_cli::ScanError::Usage(m) => ToolError::new("usage_error", m),
-        rf_cli::ScanError::Binary(m) => ToolError::new("binary_error", m),
-        rf_cli::ScanError::Chain(m) => ToolError::new("chain_error", m),
+        rf_cli::ScanError::Usage(m) => ToolError::new(ErrorCode::UsageError, m),
+        rf_cli::ScanError::Binary(m) => {
+            ToolError::new(ErrorCode::UnsupportedBinary, m).with_kind("binary_error")
+        }
+        rf_cli::ScanError::Chain(m) => {
+            ToolError::with_details(ErrorCode::NotFound, m, json!({"what": "chain_gadget"}))
+                .with_kind("chain_error")
+        }
     }
+}
+
+/// A `usage_error` for a flag the allowlist refused, tagged `invalid_flag`
+/// in the audit log so the operator still sees which kind it was.
+fn usage_flag(message: String) -> ToolError {
+    ToolError::new(ErrorCode::UsageError, message).with_kind("invalid_flag")
 }
 
 fn tool_error(err: ToolError) -> Result<CallToolResult, McpError> {
@@ -1041,9 +1792,19 @@ fn tool_error(err: ToolError) -> Result<CallToolResult, McpError> {
     Ok(r)
 }
 
-fn tool_ok(value: Value) -> Result<CallToolResult, McpError> {
-    let mut r = CallToolResult::success(vec![ContentBlock::text(value.to_string())]);
-    r.structured_content = Some(value);
+/// Render a typed response. Serialization of these structs cannot fail —
+/// they are owned scalars, strings and vectors with no map keys that are
+/// not strings — but a `Null` body would still be a valid JSON document, so
+/// the fallback is an `internal` error rather than a silent empty result.
+fn tool_ok<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
+    let Ok(v) = serde_json::to_value(value) else {
+        return tool_error(ToolError::new(
+            ErrorCode::Internal,
+            "the response could not be serialized",
+        ));
+    };
+    let mut r = CallToolResult::success(vec![ContentBlock::text(v.to_string())]);
+    r.structured_content = Some(v);
     Ok(r)
 }
 
@@ -1051,215 +1812,281 @@ fn tool_ok(value: Value) -> Result<CallToolResult, McpError> {
 impl RopFinderMcp {
     /// Find ROP gadgets (return-oriented; ends in ret-like control flow).
     #[tool(
-        description = "Find ROP gadgets in a binary (ret-terminated). Returns up to \
-        max_results gadgets (default 1000) plus total_count and a truncated flag. Set \
-        sort_by=\"quality\" to rank gadgets by the Phase 5 quality score (cleanest first) \
-        before sampling. binary_path must be an absolute path inside one of the server's \
-        allow_roots (call get_server_config to list them); anything else returns \
-        path_denied. depth above max_depth is rejected, not clamped."
+        description = "Find ROP gadgets in a binary (ret-terminated). Results are RANKED by \
+        default (order=\"rank\": usability tier, then quality, then fewest instructions, then \
+        fewest side effects, then address), so the first page is the useful gadgets rather \
+        than the alphabetical head; order=\"address\"|\"quality\"|\"text\" are also accepted. \
+        Every record carries a stable id, the classification (class, labels, regs_written, \
+        regs_read, regs_from_stack, side_effects, terminator, usability) and delay_slot. \
+        Filter server-side with class/label/writes_reg/reads_reg/preserves_regs/from_stack/\
+        terminator/max_side_effects/max_insns instead of pulling gadgets into context. Page \
+        with next_cursor. binary_path must be an absolute path inside one of the server's \
+        allow_roots (call get_server_config to list them); anything else returns path_denied. \
+        depth above max_depth is rejected, not clamped. A request that exceeds timeout_secs is \
+        STOPPED, not orphaned, and notifications/cancelled stops it too.",
+        output_schema = crate::schema::scan_output_schema()
     )]
     async fn find_gadgets(
         &self,
         Parameters(q): Parameters<GadgetQuery>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let req = match self.gadget_request(&q, true, false, false) {
-            Ok(r) => r,
-            Err(e) => return tool_error(e),
-        };
-        match self
-            .run_scan(
-                req,
-                &q.binary_path,
-                PostOpts {
-                    sort_by: q.sort_by.clone(),
-                    ..Default::default()
-                },
-                q.max_results,
-                q.timeout_secs,
-            )
-            .await
-        {
-            Ok(v) => tool_ok(v),
-            Err(e) => tool_error(e),
-        }
+        let (mut rec, t0) = self.begin(&ctx, "find_gadgets", params_hash(&q));
+        let out = self
+            .gadget_scan(&ctx, &mut rec, &q, true, false, false)
+            .await;
+        self.finish(rec, t0, out).await
     }
 
     /// Find JOP gadgets (jump-oriented; ends in jmp/call).
     #[tool(
-        description = "Find JOP gadgets in a binary (jmp/call-terminated). Same parameters \
-        and caps as find_gadgets."
+        description = "Find JOP gadgets in a binary (jmp/call-terminated). Same parameters, \
+        ranking, filters, cursor and caps as find_gadgets.",
+        output_schema = crate::schema::scan_output_schema()
     )]
     async fn find_jop_gadgets(
         &self,
         Parameters(q): Parameters<GadgetQuery>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let req = match self.gadget_request(&q, false, true, false) {
-            Ok(r) => r,
-            Err(e) => return tool_error(e),
-        };
-        match self
-            .run_scan(
-                req,
-                &q.binary_path,
-                PostOpts {
-                    sort_by: q.sort_by.clone(),
-                    ..Default::default()
-                },
-                q.max_results,
-                q.timeout_secs,
-            )
-            .await
-        {
-            Ok(v) => tool_ok(v),
-            Err(e) => tool_error(e),
-        }
+        let (mut rec, t0) = self.begin(&ctx, "find_jop_gadgets", params_hash(&q));
+        let out = self
+            .gadget_scan(&ctx, &mut rec, &q, false, true, false)
+            .await;
+        self.finish(rec, t0, out).await
     }
 
     /// Find SYS gadgets (syscall/int/sysenter entry points).
     #[tool(
-        description = "Find SYS gadgets in a binary (syscall/sysenter/int). Same parameters \
-        and caps as find_gadgets."
+        description = "Find SYS gadgets in a binary (syscall/sysenter/int). Same parameters, \
+        ranking, filters, cursor and caps as find_gadgets.",
+        output_schema = crate::schema::scan_output_schema()
     )]
     async fn find_syscall_gadgets(
         &self,
         Parameters(q): Parameters<GadgetQuery>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let req = match self.gadget_request(&q, false, false, true) {
-            Ok(r) => r,
-            Err(e) => return tool_error(e),
-        };
-        match self
-            .run_scan(
+        let (mut rec, t0) = self.begin(&ctx, "find_syscall_gadgets", params_hash(&q));
+        let out = self
+            .gadget_scan(&ctx, &mut rec, &q, false, false, true)
+            .await;
+        self.finish(rec, t0, out).await
+    }
+
+    /// Resolve stable gadget ids back to full records.
+    #[tool(
+        description = "Resolve stable gadget ids (the `id` field of any gadget record, e.g. \
+        \"g_ab12cd34ef56gh78\") back to full records, so a plan can name gadgets instead of \
+        re-sending their text. Rescans the binary at `depth` (default 10) and matches by id; \
+        an id is independent of every scan parameter except `base`, so pass the same `base` \
+        the ids came from. Ids that do not resolve are reported in warnings.ids_not_found \
+        rather than failing the call. Results are returned in the order the ids were given.",
+        output_schema = crate::schema::scan_output_schema()
+    )]
+    async fn get_gadgets(
+        &self,
+        Parameters(q): Parameters<IdsQuery>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let (mut rec, t0) = self.begin(&ctx, "get_gadgets", params_hash(&q));
+        let out = async {
+            if q.ids.is_empty() {
+                return Err(ToolError::new(
+                    ErrorCode::UsageError,
+                    "ids must not be empty; pass the `id` field of gadgets you already have",
+                ));
+            }
+            let depth = self.check_depth(q.depth)?;
+            let req = rf_cli::ScanRequest {
+                depth,
+                rop: true,
+                jop: true,
+                sys: true,
+                multibr: false,
+                only: None,
+                filter: None,
+                range: None,
+                badbytes: None,
+                offset: q.offset.clone(),
+                base: q.base.clone(),
+                section: split_sections(q.section.as_deref()),
+                thumb: false,
+                cfg_aware: false,
+                align: None,
+                call_preceded: false,
+                all: false,
+                noinstr: false,
+                arch: q.arch.clone(),
+                max_gadgets: None,
+                max_memory: None,
+                compat: false,
+            };
+            self.run_scan(
+                &ctx,
+                &mut rec,
                 req,
                 &q.binary_path,
                 PostOpts {
-                    sort_by: q.sort_by.clone(),
+                    order: Order::Ids,
+                    ids: Some(q.ids.clone()),
+                    params_hash: cursor::params_fingerprint(&q),
+                    max_results: Some(q.ids.len().clamp(1, HARD_MAX_RESULTS)),
+                    timeout_secs: q.timeout_secs,
                     ..Default::default()
                 },
-                q.max_results,
-                q.timeout_secs,
             )
             .await
-        {
-            Ok(v) => tool_ok(v),
-            Err(e) => tool_error(e),
         }
+        .await;
+        self.finish(rec, t0, out).await
     }
 
     /// Binary metadata without scanning (the CLI's --info payload).
     #[tool(
         description = "Get binary metadata as JSON: format, arch, endianness, addr_size, \
-        image_base, entry, sections (name/vaddr/size/executable/writable) and PE imports. No \
-        scan is performed."
+        image_base, entry, sections (name/vaddr/size/executable/writable), PE imports \
+        (iat_vaddr is the IAT slot the loader patches; hint_name_vaddr is the \
+        IMAGE_IMPORT_BY_NAME record), fat Mach-O slices, binary_sha256 and warnings. The \
+        shape is fixed: an ELF reports slices: [] and a fat Mach-O reports sections: []. No \
+        scan is performed. Bounded like every other tool: timeout_secs (default 60), \
+        --max-file-bytes, and max_sections/max_imports (default 4096 each) — a truncated \
+        array is announced in warnings, never silently short.",
+        output_schema = crate::schema::info_output_schema()
     )]
     async fn get_binary_info(
         &self,
         Parameters(q): Parameters<InfoQuery>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let result = async {
-            let confined = self.open_confined(&q.binary_path)?;
-            let base = q
-                .base
-                .as_deref()
-                .map(|b| rf_cli::parse_hex(b, "--base"))
-                .transpose()
-                .map_err(|e| ToolError::new("usage_error", e))?;
-            let _permit = self.permit(self.config.timeout).await?;
-            let bytes = confined.read_all(self.config.max_file_bytes)?;
-            rf_cli::info_bytes(&bytes, None, base).map_err(scan_err_to_tool)
-        }
-        .await;
-        match result {
-            Ok(v) => tool_ok(v),
-            Err(e) => tool_error(e),
-        }
+        let (mut rec, t0) = self.begin(&ctx, "get_binary_info", params_hash(&q));
+        let out = self.run_info(&ctx, &mut rec, &q).await;
+        self.finish(rec, t0, out).await
     }
 
     /// The effective allowlist and caps, so an agent never has to guess.
     #[tool(
         description = "Report the server's effective configuration: allow_roots (the only \
         directories binary_path may name), max_depth, max_file_bytes, max_results, \
-        max_concurrent, timeout_secs, whether an on-disk cache is enabled, and the server \
-        version. Call this first: paths outside allow_roots are refused with a single \
-        path_denied code that deliberately reveals nothing about the target."
+        max_concurrent, scan_threads, max_gadgets, timeout_secs, cursor_ttl_secs, whether an \
+        on-disk cache and a workspace directory are enabled, the complete list of `order` \
+        values, the complete list of error codes, and the server version. Call this first: \
+        paths outside allow_roots are refused with a single path_denied code that \
+        deliberately reveals nothing about the target, and a run of refusals is treated as \
+        filesystem probing.",
+        output_schema = crate::schema::config_output_schema()
     )]
-    async fn get_server_config(&self) -> Result<CallToolResult, McpError> {
-        tool_ok(self.config_json())
+    async fn get_server_config(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let (rec, t0) = self.begin(&ctx, "get_server_config", String::new());
+        let out = Ok(self.config_response());
+        self.finish(rec, t0, out).await
+    }
+
+    /// MCP-09: the counters an operator needs to see the server's health.
+    #[tool(
+        description = "Report this session's counters: requests_total and requests_by_tool, \
+        ok/denied/timeout/cancelled/error totals, denied_consecutive and probing_suspected \
+        (a run of path_denied results is the signal that an agent is enumerating the \
+        filesystem), wedged_total (workers that did not stop within 5 s of being \
+        cancelled), busy_total, inflight, bytes_read_total, and the cache's \
+        hit/miss/eviction/tamper counters with its live cache_bytes against \
+        cache_mem_max_bytes.",
+        output_schema = crate::schema::stats_output_schema()
+    )]
+    async fn get_server_stats(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let (rec, t0) = self.begin(&ctx, "get_server_stats", String::new());
+        let out = self.stats_response();
+        self.finish(rec, t0, out).await
     }
 
     /// Regex/substring search over the gadget text of a full scan.
     #[tool(
         description = "Search gadgets by pattern: regex matched against gadget text \
         (e.g. \"pop r.*; ret\"); invalid regexes fall back to literal substring match. Runs a \
-        full ROP+JOP+SYS scan, then filters. Same caps as find_gadgets."
+        full ROP+JOP+SYS scan, then filters. Same ranking, semantic filters, cursor and caps \
+        as find_gadgets.",
+        output_schema = crate::schema::scan_output_schema()
     )]
     async fn search_gadgets_by_pattern(
         &self,
         Parameters(q): Parameters<SearchQuery>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let depth = match self.check_depth(q.depth) {
-            Ok(d) => d,
-            Err(e) => return tool_error(e),
-        };
-        let req = rf_cli::ScanRequest {
-            depth,
-            rop: true,
-            jop: true,
-            sys: true,
-            multibr: false,
-            only: None,
-            filter: None,
-            range: q.range.clone(),
-            badbytes: q.badbytes.clone(),
-            offset: q.offset.clone(),
-            base: q.base.clone(),
-            section: split_sections(q.section.as_deref()),
-            thumb: false,
-            cfg_aware: false,
-            align: None,
-            call_preceded: false,
-            all: false,
-            noinstr: false,
-            arch: q.arch.clone(),
-            max_gadgets: None,
-            max_memory: None,
-            compat: false,
-        };
-        match self
-            .run_scan(
+        let (mut rec, t0) = self.begin(&ctx, "search_gadgets_by_pattern", params_hash(&q));
+        let out = async {
+            let depth = self.check_depth(q.depth)?;
+            let req = rf_cli::ScanRequest {
+                depth,
+                rop: true,
+                jop: true,
+                sys: true,
+                multibr: false,
+                only: None,
+                filter: None,
+                range: q.range.clone(),
+                badbytes: q.badbytes.clone(),
+                offset: q.offset.clone(),
+                base: q.base.clone(),
+                section: split_sections(q.section.as_deref()),
+                thumb: false,
+                cfg_aware: false,
+                align: None,
+                call_preceded: false,
+                all: false,
+                noinstr: false,
+                arch: q.arch.clone(),
+                max_gadgets: None,
+                max_memory: None,
+                compat: false,
+            };
+            self.run_scan(
+                &ctx,
+                &mut rec,
                 req,
                 &q.binary_path,
                 PostOpts {
                     re: Some(q.pattern.clone()),
-                    ..Default::default()
+                    order: Order::parse(q.order.as_deref().unwrap_or("rank"))?,
+                    filter: GadgetFilter::parse(&raw_filter!(q))?,
+                    cursor: q.cursor.clone(),
+                    params_hash: cursor::params_fingerprint(&q),
+                    max_results: q.max_results,
+                    timeout_secs: q.timeout_secs,
+                    ids: None,
                 },
-                q.max_results,
-                q.timeout_secs,
             )
             .await
-        {
-            Ok(v) => tool_ok(v),
-            Err(e) => tool_error(e),
         }
+        .await;
+        self.finish(rec, t0, out).await
     }
 
     /// Build a Linux execve("/bin/sh") ROP chain (ELF x86/x64 only).
     #[tool(
         description = "Build a ROP chain. target must be \"linux-execve\" (ELF x86/x64 only, \
         ported from ROPgadget's ropmaker: x86 int 0x80 / x64 syscall, \"/bin//sh\" written \
-        to a writable section). Returns the chain IR as JSON (words with kinds gadget / \
-        immediate / data / padding plus the referenced gadget table), the equivalent python \
-        exploit script, arch, description and word_count. Fails with a structured chain_error \
-        when the binary lacks the required gadgets. Chain builds bypass the gadget cache."
+        to a writable section) or \"windows-virtualprotect\". Returns the chain IR as JSON \
+        (words with kinds gadget_addr / immediate / data_addr / code_addr / padding plus the \
+        referenced gadget table, each entry carrying the same stable id find_gadgets \
+        returns), the equivalent python exploit script, arch, description and word_count. A \
+        binary that lacks a required gadget fails with not_found. Chain builds bypass the \
+        gadget cache.",
+        output_schema = crate::schema::chain_output_schema()
     )]
     async fn build_rop_chain(
         &self,
         Parameters(q): Parameters<ChainQuery>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        match self.run_chain(q).await {
-            Ok(v) => tool_ok(v),
-            Err(e) => tool_error(e),
-        }
+        let (mut rec, t0) = self.begin(&ctx, "build_rop_chain", params_hash(&q));
+        let out = self.run_chain(&ctx, &mut rec, q).await;
+        self.finish(rec, t0, out).await
     }
 
     /// Flag passthrough restricted to the PLAN §6.1 allowlist.
@@ -1271,40 +2098,103 @@ impl RopFinderMcp {
         --console, ...) is rejected. --align is ROPgadget's real scan-time alignment \
         (decimal, as in ROPgadget's argparse; write 0x.. only if you mean hex), not an \
         address post-filter. --arch names a fat Mach-O slice and is REQUIRED for a \
-        multi-slice binary. Output is always structured JSON."
+        multi-slice binary. The result is ordered, filtered and paged exactly like \
+        find_gadgets.",
+        output_schema = crate::schema::scan_output_schema()
     )]
     async fn run_ropgadget_command(
         &self,
         Parameters(q): Parameters<RawCommandQuery>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let parsed = match parse_ropgadget_args(&q.args) {
-            Ok(p) => p,
-            Err(e) => return tool_error(e),
-        };
-        // MCP-03 interim: --depth is unbounded in ROPgadget's own CLI, so
-        // the passthrough is exactly where `--depth 100000` arrived.
-        if let Err(e) = self.check_depth(Some(parsed.request.depth)) {
-            return tool_error(e);
-        }
-        match self
-            .run_scan(
+        let (mut rec, t0) = self.begin(&ctx, "run_ropgadget_command", params_hash(&q));
+        let out = async {
+            let parsed = parse_ropgadget_args(&q.args)?;
+            // --depth is unbounded in ROPgadget's own CLI, so the
+            // passthrough is exactly where `--depth 100000` arrived.
+            self.check_depth(Some(parsed.request.depth))?;
+            self.run_scan(
+                &ctx,
+                &mut rec,
                 parsed.request,
                 &q.binary_path,
                 PostOpts {
                     re: parsed.re,
-                    sort_by: None,
+                    order: Order::parse(q.order.as_deref().unwrap_or("rank"))?,
+                    filter: GadgetFilter::parse(&raw_filter!(q))?,
+                    cursor: q.cursor.clone(),
+                    params_hash: cursor::params_fingerprint(&q),
+                    max_results: q.max_results,
+                    timeout_secs: q.timeout_secs,
+                    ids: None,
                 },
-                q.max_results,
-                q.timeout_secs,
             )
             .await
-        {
-            Ok(v) => tool_ok(v),
-            Err(e) => tool_error(e),
         }
+        .await;
+        self.finish(rec, t0, out).await
     }
 }
 
+impl RopFinderMcp {
+    /// The body shared by `find_gadgets` / `find_jop_gadgets` /
+    /// `find_syscall_gadgets`, which differ only in the anchor family.
+    async fn gadget_scan(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        rec: &mut AuditRecord,
+        q: &GadgetQuery,
+        rop: bool,
+        jop: bool,
+        sys: bool,
+    ) -> Result<ScanResponse, ToolError> {
+        let req = self.gadget_request(q, rop, jop, sys)?;
+        // `sort_by` is the pre-0.3 spelling and accepted only as a fallback
+        // for `order`, so an agent written against the old surface keeps
+        // working and one written against the new one is never surprised by
+        // a stale parameter it did not send.
+        let order = Order::parse(
+            q.order
+                .as_deref()
+                .or(q.sort_by.as_deref())
+                .unwrap_or("rank"),
+        )?;
+        let filter = GadgetFilter::parse(&raw_filter!(q))?;
+        self.run_scan(
+            ctx,
+            rec,
+            req,
+            &q.binary_path,
+            PostOpts {
+                order,
+                filter,
+                cursor: q.cursor.clone(),
+                params_hash: cursor::params_fingerprint(q),
+                max_results: q.max_results,
+                timeout_secs: q.timeout_secs,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// `get_server_stats`, as the declared type.
+    fn stats_response(&self) -> Result<schema::StatsResponse, ToolError> {
+        let v = self.stats.snapshot(self.cache.stats_json());
+        serde_json::from_value(v).map_err(|e| {
+            ToolError::new(
+                ErrorCode::Internal,
+                format!("the counters do not match the declared schema: {e}"),
+            )
+        })
+    }
+}
+
+// rmcp deprecated the `logging` capability in 2.0 (SEP-2577) while still
+// implementing it, and it is the only channel that reaches an MCP
+// operator — stderr, the alternative, is what hosts discard, which is
+// MCP-09 itself. Scoped to this impl.
+#[allow(deprecated)]
 #[tool_handler(name = "rop-finder-mcp", version = "0.1.0")]
 impl ServerHandler for RopFinderMcp {
     /// `instructions` is built at runtime rather than baked into the macro
@@ -1315,10 +2205,95 @@ impl ServerHandler for RopFinderMcp {
         rmcp::model::ServerInfo::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
+                // MCP-09: the operator never sees this process's stderr, so
+                // warnings that matter to them — a tampered cache entry, a
+                // wedged worker, suspected path probing — are forwarded as
+                // notifications/message. Declaring the capability is what
+                // makes a host deliver them.
+                .enable_logging()
+                // A paged scan also names an NDJSON resource holding the
+                // WHOLE ordered set. An agent with its own tools greps one
+                // file instead of making 41 tool calls.
+                .enable_resources()
                 .build(),
         )
         .with_server_info(rmcp::model::Implementation::new("rop-finder-mcp", "0.1.0"))
         .with_instructions(self.instructions())
+    }
+
+    /// `logging/setLevel`. Declaring the capability without honouring the
+    /// level would leave a host unable to turn the stream down.
+    async fn set_level(
+        &self,
+        request: rmcp::model::SetLevelRequestParams,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.notifier.set_level(request.level);
+        Ok(())
+    }
+
+    /// The scans currently pinned, each as one NDJSON resource.
+    ///
+    /// The list is the pinned-scan store, so it names exactly the results a
+    /// `resources/read` can still serve. It carries no path and no file
+    /// content — only the cache key, which the client was already told.
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListResourcesResult, McpError> {
+        let resources = self
+            .cache
+            .pinned_keys()
+            .into_iter()
+            .map(|(key, gadgets)| {
+                rmcp::model::Resource::new(resources::scan_uri(&key), format!("scan {key}"))
+                    .with_mime_type(resources::NDJSON_MIME)
+                    .with_description(format!(
+                        "{gadgets} gadget records, one JSON object per line, in rank order"
+                    ))
+            })
+            .collect();
+        Ok(rmcp::model::ListResourcesResult::with_all_items(resources))
+    }
+
+    /// Serve `ropfinder://scan/<cache_key>/gadgets.ndjson`.
+    ///
+    /// The URI is parsed into a cache key by [`resources::cache_key_of`],
+    /// which accepts only `[A-Za-z0-9-]`, and the key is looked up in the
+    /// pinned store — it is never joined to a path here, and there is no
+    /// path in a URI to begin with. A key that is not pinned is
+    /// `resource_not_found`, never a rescan: reading a resource must not be
+    /// a way to make the server do unbounded work outside the guard.
+    async fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResponse, McpError> {
+        let uri = request.uri.clone();
+        let Some(key) = resources::cache_key_of(&uri) else {
+            return Err(McpError::resource_not_found(
+                "not a rop-finder scan resource; the form is \
+                 ropfinder://scan/<cache_key>/gadgets.ndjson",
+                Some(json!({"uri": uri})),
+            ));
+        };
+        let Some(p) = self.cache.pinned(key) else {
+            return Err(McpError::resource_not_found(
+                "that scan is no longer held; re-run the scan to get a fresh resource_uri",
+                Some(json!({"uri": uri, "cursor_ttl_secs": self.config.cursor_ttl.as_secs()})),
+            ));
+        };
+        let text = resources::render_ndjson(&p.scan, &p.sems);
+        Ok(rmcp::model::ReadResourceResult::new(vec![
+            rmcp::model::ResourceContents::TextResourceContents {
+                uri,
+                mime_type: Some(resources::NDJSON_MIME.to_string()),
+                text,
+                meta: None,
+            },
+        ])
+        .into())
     }
 }
 
@@ -1342,14 +2317,25 @@ impl RopFinderMcp {
              pointless. Call get_server_config for the machine-readable allowlist and caps.\n\
              Caps: depth <= {} (larger values are REJECTED, not clamped), binaries <= {} bytes, \
              max_results default {} (hard max {}), {} scan(s) at a time, default timeout {} s.\n\
-             All tools return structured JSON with gadgets sampled to max_results plus \
-             total_count/truncated; errors are {{error: {{code, message, details?}}}}.",
+             Gadget results are RANKED by default (order=\"rank\"), carry a stable `id` you can \
+             pass back to get_gadgets, and are paged with `next_cursor`. Prefer the server-side \
+             filters — class, label, writes_reg, reads_reg, preserves_regs, from_stack, \
+             terminator, max_side_effects, max_insns — over reading gadgets to filter them \
+             yourself. A paged scan also names an NDJSON resource holding the whole set.\n\
+             Every tool declares an outputSchema; every response has a FIXED field set, with \
+             null rather than a missing key. Errors are {{error: {{code, message, retryable, \
+             details, suggestion}}}} and `code` is one of: {}.",
             self.config.max_depth,
             self.config.max_file_bytes,
             self.config.max_results,
             HARD_MAX_RESULTS,
             self.config.max_concurrent,
             self.config.timeout.as_secs(),
+            ErrorCode::all()
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
         )
     }
 }
@@ -1423,7 +2409,7 @@ mod tests {
         assert_eq!(p.request.align, Some(4));
         // A bad value is a usage error, not a silent 0.
         let e = parse_ropgadget_args(&args(&["--align", "nope"])).unwrap_err();
-        assert_eq!(e.code, "usage_error");
+        assert_eq!(e.code, ErrorCode::UsageError);
     }
 
     /// CORE-03 mirrored onto the MCP surface: `--arch` selects a fat
@@ -1456,7 +2442,7 @@ mod tests {
         assert!(server.root_paths().is_empty());
         // Every path is refused, with the one code and no OS text.
         let err = server.open_confined("/etc/shadow").unwrap_err();
-        assert_eq!(err.code, "path_denied");
+        assert_eq!(err.code, ErrorCode::PathDenied);
         assert!(!err.message.contains("os error"), "{err:?}");
     }
 
@@ -1468,7 +2454,7 @@ mod tests {
         assert_eq!(server.check_depth(None).unwrap(), 10);
         assert_eq!(server.check_depth(Some(64)).unwrap(), 64);
         let err = server.check_depth(Some(100_000)).unwrap_err();
-        assert_eq!(err.code, "usage_error");
+        assert_eq!(err.code, ErrorCode::UsageError);
         let d = err.details.expect("structured details");
         assert_eq!(d["limit"], "max_depth");
         assert_eq!(d["limit_value"], 64);
@@ -1476,7 +2462,7 @@ mod tests {
         // usize::MAX, the value the audit actually sent, is rejected too.
         assert_eq!(
             server.check_depth(Some(usize::MAX)).unwrap_err().code,
-            "usage_error"
+            ErrorCode::UsageError
         );
     }
 
@@ -1503,7 +2489,7 @@ mod tests {
             ..Default::default()
         };
         let server = RopFinderMcp::new(c).unwrap();
-        let cfg = server.config_json();
+        let cfg = serde_json::to_value(server.config_response()).unwrap();
         for key in [
             "allow_roots",
             "max_depth",
@@ -1511,15 +2497,23 @@ mod tests {
             "max_results",
             "max_concurrent",
             "cache",
+            "cursor_ttl_secs",
+            "orders",
+            "error_codes",
             "version",
         ] {
             assert!(cfg.get(key).is_some(), "missing {key} in {cfg}");
         }
         assert_eq!(cfg["allow_roots"].as_array().unwrap().len(), 1);
         assert_eq!(cfg["cache"], false);
+        // CRIT-03: the two taxonomies are PUBLISHED, so an agent never has
+        // to discover them by provoking failures.
+        assert_eq!(cfg["orders"], json!(["rank", "address", "quality", "text"]));
+        assert_eq!(cfg["error_codes"].as_array().unwrap().len(), 9);
         let root = server.root_paths()[0].clone();
         assert!(server.instructions().contains(&root));
         assert!(server.instructions().contains("get_server_config"));
+        assert!(server.instructions().contains("cursor_expired"));
     }
 
     #[test]
@@ -1574,24 +2568,25 @@ mod tests {
     fn allowlist_rejects_side_channel_and_unknown_flags() {
         for bad in ["--string", "--dump", "--console", "--memstr", "--unknown"] {
             let err = parse_ropgadget_args(&args(&[bad])).unwrap_err();
-            assert_eq!(err.code, "invalid_flag", "{bad}");
+            assert_eq!(err.code, ErrorCode::UsageError, "{bad}");
+            assert_eq!(err.kind, "invalid_flag", "{bad}");
             assert!(err.message.contains("--depth"), "lists allowlist: {err:?}");
         }
         // even with a value
         let err = parse_ropgadget_args(&args(&["--string", "password"])).unwrap_err();
-        assert_eq!(err.code, "invalid_flag");
+        assert_eq!(err.kind, "invalid_flag");
         // positional argument
         let err = parse_ropgadget_args(&args(&["/etc/passwd"])).unwrap_err();
-        assert_eq!(err.code, "invalid_flag");
+        assert_eq!(err.kind, "invalid_flag");
         // missing value
         let err = parse_ropgadget_args(&args(&["--depth"])).unwrap_err();
-        assert_eq!(err.code, "invalid_flag");
+        assert_eq!(err.kind, "invalid_flag");
         // boolean flag with value
         let err = parse_ropgadget_args(&args(&["--norop=1"])).unwrap_err();
-        assert_eq!(err.code, "invalid_flag");
+        assert_eq!(err.kind, "invalid_flag");
         // bad depth value
         let err = parse_ropgadget_args(&args(&["--depth", "x"])).unwrap_err();
-        assert_eq!(err.code, "usage_error");
+        assert_eq!(err.code, ErrorCode::UsageError);
     }
 
     #[test]
@@ -1610,39 +2605,64 @@ mod tests {
         );
     }
 
+    /// The default order is `rank`, and it is the tier — not R12's quality
+    /// score — that puts a usable gadget first. `sort_by: "quality"` used to
+    /// be the only ordering, and its top of the list was `ret`,
+    /// `add esp, 0x8 ; ret`, `retf 0x2bbc`.
     #[test]
-    fn sort_by_quality_orders_desc_with_vaddr_ties() {
-        let mk = |vaddr: &str, bytes: &str, text: &str, quality: Option<i32>| CachedGadget {
+    fn rank_beats_quality_at_putting_a_usable_gadget_first() {
+        let mk = |vaddr: &str, bytes: &str, text: &str| CachedGadget {
             vaddr: vaddr.into(),
             bytes: bytes.into(),
             text: text.into(),
-            quality,
             ..CachedGadget::default()
         };
-        let cached = vec![
-            // messy multi-effect gadget: quality 79
-            mk(
-                "0x1000",
-                "504801d859c3",
-                "push rax ; add rax, rbx ; pop rcx ; ret",
-                None,
-            ),
-            // clean: quality 100
-            mk("0x2000", "58c3", "pop rax ; ret", None),
-            // pre-cached quality rides along without reclassification
-            mk("0x3000", "c3", "ret", Some(85)),
-            // tie on quality 100: lower vaddr first
-            mk("0x0500", "5fc3", "pop rdi ; ret", None),
-        ];
-        let refs: Vec<&CachedGadget> = cached.iter().collect();
-        let sorted = sort_by_quality(refs, Some(rf_core::Arch::X64));
-        let order: Vec<&str> = sorted.iter().map(|g| g.vaddr.as_str()).collect();
-        assert_eq!(order, ["0x0500", "0x2000", "0x3000", "0x1000"]);
-        // None arch + missing quality -> q=0 entries sort last by vaddr
-        let refs: Vec<&CachedGadget> = cached.iter().collect();
-        let sorted = sort_by_quality(refs, None);
-        let order: Vec<&str> = sorted.iter().map(|g| g.vaddr.as_str()).collect();
-        assert_eq!(order, ["0x3000", "0x0500", "0x1000", "0x2000"]);
+        let scan = CachedScan {
+            gadgets: vec![
+                mk(
+                    "0x1000",
+                    "504801d859c3",
+                    "push rax ; add rax, rbx ; pop rcx ; ret",
+                ),
+                mk("0x2000", "58c3", "pop rax ; ret"),
+                mk("0x3000", "c3", "ret"),
+                mk("0x0500", "5fc3", "pop rdi ; ret"),
+                mk("0x4000", "cabc2b", "retf 0x2bbc"),
+            ],
+            ..CachedScan::default()
+        };
+        let sems = semantics::classify_scan(&scan, "00", 0, Some(rf_core::Arch::X64));
+        let order_of = |o: Order| {
+            let mut idx: Vec<usize> = (0..scan.gadgets.len()).collect();
+            semantics::sort_indices(&mut idx, o, &scan, &sems);
+            idx.iter()
+                .map(|&i| scan.gadgets[i].vaddr.as_str())
+                .collect::<Vec<_>>()
+        };
+        // Rank: the two stack loads first (tier 3, lower vaddr wins the
+        // tie), then the multi-effect gadget (tier 2), then `retf 0x2bbc`
+        // — CLS-13 makes its immediate a stack adjustment, so it has one
+        // side effect and a non-bare terminator: tier 1 — and last the
+        // bare `ret`, which does nothing at all (tier 0).
+        assert_eq!(
+            order_of(Order::Rank),
+            ["0x0500", "0x2000", "0x1000", "0x4000", "0x3000"]
+        );
+        // Address and text are total and independent of it.
+        assert_eq!(
+            order_of(Order::Address),
+            ["0x0500", "0x1000", "0x2000", "0x3000", "0x4000"]
+        );
+        // Quality alone cannot separate `ret` from `pop rdi ; ret` well
+        // enough to be a default: a bare `ret` outranks the multi-effect
+        // gadget on it, which is why the tier exists.
+        let q = order_of(Order::Quality);
+        assert_eq!(q[0], "0x0500", "{q:?}");
+        assert!(
+            q.iter().position(|v| *v == "0x3000").unwrap()
+                < q.iter().position(|v| *v == "0x1000").unwrap(),
+            "{q:?}"
+        );
     }
 
     fn one_ret() -> CachedScan {
@@ -1660,16 +2680,24 @@ mod tests {
     #[test]
     fn cache_roundtrip_mem_and_disk() {
         let t = TempDir::new("cache");
-        let cache = Cache::new(Some(t.canon().clone()));
+        let cache = Cache::new(
+            Some(t.canon().clone()),
+            rf_cache::MemLimits::default(),
+            DEFAULT_CURSOR_TTL,
+        );
         cache.put("k1", one_ret());
         assert_eq!(cache.get("k1").unwrap().gadgets.len(), 1);
         // persisted to disk, authenticated
         assert!(t.canon().join("k1.rfc").is_file());
         // a fresh cache over the same dir reads the disk entry
-        let cold = Cache::new(Some(t.canon().clone()));
+        let cold = Cache::new(
+            Some(t.canon().clone()),
+            rf_cache::MemLimits::default(),
+            DEFAULT_CURSOR_TTL,
+        );
         assert!(cold.get("k1").is_some());
         assert!(cold.get("absent").is_none());
-        assert_eq!(cold.stats().unwrap().tampered, 0);
+        assert_eq!(cold.disk_stats().unwrap().tampered, 0);
     }
 
     /// MCP-04. The audit served a fabricated
@@ -1679,24 +2707,36 @@ mod tests {
     fn a_poisoned_disk_entry_is_a_miss_not_a_result() {
         let t = TempDir::new("poison");
         {
-            let cache = Cache::new(Some(t.canon().clone()));
+            let cache = Cache::new(
+                Some(t.canon().clone()),
+                rf_cache::MemLimits::default(),
+                DEFAULT_CURSOR_TTL,
+            );
             cache.put("k1", one_ret());
         }
         let fabricated = br#"{"version":2,"gadgets":[{"vaddr":"0xdeadbeefcafe0000","bytes":"5fc3","text":"pop rdi ; ret"}],"fallback_names":false}"#;
         // Bare JSON, the shape the pre-v0.2 cache accepted...
         std::fs::write(t.canon().join("k1.rfc"), fabricated).unwrap();
-        let cache = Cache::new(Some(t.canon().clone()));
+        let cache = Cache::new(
+            Some(t.canon().clone()),
+            rf_cache::MemLimits::default(),
+            DEFAULT_CURSOR_TTL,
+        );
         assert!(cache.get("k1").is_none());
-        assert_eq!(cache.stats().unwrap().tampered, 1);
+        assert_eq!(cache.disk_stats().unwrap().tampered, 1);
 
         // ...and framed with a wrong tag, so only the HMAC rejects it.
         let mut framed = Vec::from(b"RFCACHE\x02".as_slice());
         framed.extend_from_slice(&[0u8; 32]);
         framed.extend_from_slice(fabricated);
         std::fs::write(t.canon().join("k1.rfc"), &framed).unwrap();
-        let cache = Cache::new(Some(t.canon().clone()));
+        let cache = Cache::new(
+            Some(t.canon().clone()),
+            rf_cache::MemLimits::default(),
+            DEFAULT_CURSOR_TTL,
+        );
         assert!(cache.get("k1").is_none());
-        assert_eq!(cache.stats().unwrap().tampered, 1);
+        assert_eq!(cache.disk_stats().unwrap().tampered, 1);
     }
 
     /// ROB-04 as it reached this crate: `"€€"` in a cached `bytes` field
@@ -1706,7 +2746,11 @@ mod tests {
     fn a_non_ascii_bytes_field_never_panics() {
         let t = TempDir::new("charboundary");
         {
-            let cache = Cache::new(Some(t.canon().clone()));
+            let cache = Cache::new(
+                Some(t.canon().clone()),
+                rf_cache::MemLimits::default(),
+                DEFAULT_CURSOR_TTL,
+            );
             cache.put("k1", one_ret());
         }
         let key = std::fs::read(t.canon().join(".cachekey")).unwrap();
@@ -1718,10 +2762,14 @@ mod tests {
         framed.extend_from_slice(body.as_bytes());
         std::fs::write(t.canon().join("k1.rfc"), &framed).unwrap();
 
-        let cache = Cache::new(Some(t.canon().clone()));
+        let cache = Cache::new(
+            Some(t.canon().clone()),
+            rf_cache::MemLimits::default(),
+            DEFAULT_CURSOR_TTL,
+        );
         assert!(cache.get("k1").is_none(), "authenticated but unusable");
-        assert_eq!(cache.stats().unwrap().malformed, 1);
-        assert_eq!(cache.stats().unwrap().tampered, 0);
+        assert_eq!(cache.disk_stats().unwrap().malformed, 1);
+        assert_eq!(cache.disk_stats().unwrap().tampered, 0);
 
         // The same value straight through the reclassification path.
         let g = CachedGadget {
@@ -1731,7 +2779,15 @@ mod tests {
             ..CachedGadget::default()
         };
         assert!(g.to_scan_gadget().is_none());
-        let sorted = sort_by_quality(vec![&g], Some(rf_core::Arch::X64));
-        assert_eq!(sorted.len(), 1);
+        // ...and straight through the classification path, which is where
+        // the reconstruction now happens: an id, no class, sorts last.
+        let poisoned = CachedScan {
+            gadgets: vec![g],
+            ..CachedScan::default()
+        };
+        let sems = semantics::classify_scan(&poisoned, "00", 0, Some(rf_core::Arch::X64));
+        assert_eq!(sems.len(), 1);
+        assert!(sems[0].class.is_none());
+        assert!(sems[0].id.starts_with("g_"));
     }
 }

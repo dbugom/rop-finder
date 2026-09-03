@@ -1,182 +1,34 @@
 //! End-to-end MCP-over-stdio integration tests: spawn the real
 //! `rop-finder-mcp` binary and speak JSON-RPC 2.0 (newline-delimited) over
 //! its stdio pipes, exactly like an MCP host would.
+//!
+//! The harness itself lives in `tests/support/mod.rs`, because four test
+//! binaries now need it (MCP-03's cancellation measurements, MCP-05's
+//! cache bound, MCP-09's audit log) and one copy per file is how the
+//! duplication findings in this project started.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+mod support;
+
+use std::path::Path;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
+
+use support::{fixtures_dir, plain, structured, McpChild, TempTree};
 
 const SCHEMA_FILE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/expected_tools_schema.json"
 );
 
-/// Strip a Windows verbatim (`\\?\`) prefix.
-///
-/// `canonicalize` yields verbatim paths on Windows, and the server refuses
-/// those outright (they bypass Win32 path normalization). An agent sends the
-/// ordinary absolute paths the server publishes in `allow_roots`, so the
-/// harness must too.
-fn plain(p: &Path) -> PathBuf {
-    let s = p.as_os_str().to_string_lossy().into_owned();
-    match s.strip_prefix(r"\\?\") {
-        Some(rest) => PathBuf::from(rest),
-        None => p.to_path_buf(),
-    }
-}
-
-fn fixtures_dir() -> PathBuf {
-    plain(
-        &Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures"))
-            .canonicalize()
-            .unwrap(),
-    )
-}
-
-/// Unique temp directory, removed on drop.
-struct TempTree(PathBuf);
-
-impl TempTree {
-    fn new(tag: &str) -> Self {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let p =
-            std::env::temp_dir().join(format!("rf-mcp-it-{}-{}-{}", tag, std::process::id(), n));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        TempTree(plain(&p.canonicalize().unwrap()))
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempTree {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-struct McpChild {
-    /// Held for kill-on-drop.
-    #[allow(dead_code)]
-    child: Child,
-    stdin: ChildStdin,
-    lines: Lines<BufReader<ChildStdout>>,
-    /// The server's working directory, deliberately chosen and deliberately
-    /// NOT in the allowlist. It holds `probe.bin`, a byte-for-byte copy of a
-    /// real ELF fixture: before MCP-02 was fixed the cwd was always allowed,
-    /// so `get_binary_info` on it succeeded.
-    cwd: TempTree,
-}
-
-impl McpChild {
-    async fn spawn() -> Self {
-        Self::spawn_with(&[]).await
-    }
-
-    async fn spawn_with(extra: &[&str]) -> Self {
-        let cwd = TempTree::new("cwd");
-        std::fs::copy(
-            fixtures_dir().join("elf-Linux-x64"),
-            cwd.path().join("probe.bin"),
-        )
-        .expect("stage probe.bin in the server cwd");
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rop-finder-mcp"));
-        cmd.arg("--allow-dir")
-            .arg(fixtures_dir())
-            .args(extra)
-            .current_dir(cwd.path())
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        let mut child = cmd.spawn().expect("spawn rop-finder-mcp");
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let mut mcp = McpChild {
-            child,
-            stdin,
-            lines: BufReader::new(stdout).lines(),
-            cwd,
-        };
-        mcp.rpc(
-            1,
-            "initialize",
-            json!({
-                "protocolVersion": "2025-03-26",
-                "capabilities": {},
-                "clientInfo": {"name": "rf-mcp-test", "version": "0.1.0"},
-            }),
-        )
-        .await;
-        mcp.notify("notifications/initialized", json!({})).await;
-        mcp
-    }
-
-    async fn notify(&mut self, method: &str, params: Value) {
-        let msg = json!({"jsonrpc": "2.0", "method": method, "params": params});
-        self.stdin
-            .write_all(msg.to_string().as_bytes())
-            .await
-            .unwrap();
-        self.stdin.write_all(b"\n").await.unwrap();
-        self.stdin.flush().await.unwrap();
-    }
-
-    /// Send a request and read lines until the matching response arrives.
-    async fn rpc(&mut self, id: u64, method: &str, params: Value) -> Value {
-        let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        self.stdin
-            .write_all(msg.to_string().as_bytes())
-            .await
-            .unwrap();
-        self.stdin.write_all(b"\n").await.unwrap();
-        self.stdin.flush().await.unwrap();
-        let read = async {
-            while let Some(line) = self.lines.next_line().await.unwrap() {
-                let v: Value = serde_json::from_str(&line).unwrap();
-                if v.get("id").and_then(Value::as_u64) == Some(id) {
-                    return v;
-                }
-            }
-            panic!("server closed stdout before answering id {id}");
-        };
-        tokio::time::timeout(Duration::from_secs(120), read)
-            .await
-            .unwrap_or_else(|_| panic!("timeout waiting for response to {method} (id {id})"))
-    }
-
-    async fn call_tool(&mut self, id: u64, name: &str, arguments: Value) -> Value {
-        self.rpc(
-            id,
-            "tools/call",
-            json!({"name": name, "arguments": arguments}),
-        )
-        .await
-    }
-}
-
-/// Extract the tool result's structured content, asserting the envelope.
-fn structured(resp: &Value) -> &Value {
-    let result = resp
-        .get("result")
-        .unwrap_or_else(|| panic!("no result: {resp}"));
-    result
-        .get("structuredContent")
-        .unwrap_or_else(|| panic!("no structuredContent: {resp}"))
-}
-
 #[tokio::test]
 async fn mcp_stdio_end_to_end() {
     let mut mcp = McpChild::spawn().await;
 
-    // tools/list: the six PLAN §6.1 scan tools, build_rop_chain (§6.2) and
-    // get_server_config (MCP-02 fix #2 item 6)
+    // tools/list: the six PLAN §6.1 scan tools, build_rop_chain (§6.2),
+    // get_server_config (MCP-02 fix #2 item 6) and get_server_stats
+    // (MCP-09).
     let resp = mcp.rpc(2, "tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -189,13 +41,44 @@ async fn mcp_stdio_end_to_end() {
         "run_ropgadget_command",
         "build_rop_chain",
         "get_server_config",
+        "get_server_stats",
+        // MCP-DESIGN fix #8 part C: stable ids are only useful if they can
+        // be resolved back.
+        "get_gadgets",
     ] {
         assert!(names.contains(&want), "missing tool {want}: {names:?}");
     }
-    assert_eq!(tools.len(), 8, "unexpected extra tools: {names:?}");
+    assert_eq!(tools.len(), 10, "unexpected extra tools: {names:?}");
     for t in tools {
         assert!(t["description"].is_string());
         assert_eq!(t["inputSchema"]["type"], "object");
+        // CRIT-03: EVERY tool declares an outputSchema. Not one did.
+        assert_eq!(
+            t["outputSchema"]["type"], "object",
+            "{} has no outputSchema",
+            t["name"]
+        );
+        assert_eq!(
+            t["outputSchema"]["additionalProperties"],
+            Value::Bool(false),
+            "{} does not forbid extra fields",
+            t["name"]
+        );
+    }
+    // MCP-06: EVERY tool that reads a binary now takes timeout_secs. The
+    // committed snapshot recorded get_binary_info's properties as only
+    // ['base','binary_path'] and did not fail; this assertion is what
+    // makes the omission an error rather than a recorded fact.
+    for t in tools {
+        let name = t["name"].as_str().unwrap();
+        let props = &t["inputSchema"]["properties"];
+        if props.get("binary_path").is_none() {
+            continue; // get_server_config / get_server_stats take nothing
+        }
+        assert!(
+            props.get("timeout_secs").is_some(),
+            "{name} has no timeout_secs: {props}"
+        );
     }
 
     let elf = fixtures_dir().join("elf-x64-bash-v4.1.5.1");
@@ -244,7 +127,8 @@ async fn mcp_stdio_end_to_end() {
         assert_eq!(g["section"], ".plt");
     }
 
-    // sort_by quality: quality/class fields present, descending order
+    // sort_by is the pre-0.3 spelling of `order` and still works: quality
+    // and class are present, and the list is quality-descending.
     let resp = mcp
         .call_tool(
             50,
@@ -267,19 +151,28 @@ async fn mcp_stdio_end_to_end() {
     // the top of a quality-sorted list is a clean 100-score gadget
     assert_eq!(gadgets[0]["quality"], 100);
 
-    // unsupported sort_by is rejected as a usage error
-    let resp = mcp
-        .call_tool(
-            51,
-            "find_gadgets",
-            json!({"binary_path": elf, "depth": 6, "sort_by": "vaddr"}),
-        )
-        .await;
-    assert_eq!(resp["result"]["isError"], Value::Bool(true));
-    assert!(resp["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("sort_by"));
+    // An unknown ordering is rejected AND the error lists the valid set,
+    // in both spellings. The old error named neither.
+    for param in ["sort_by", "order"] {
+        let resp = mcp
+            .call_tool(
+                51,
+                "find_gadgets",
+                json!({"binary_path": elf, "depth": 6, param: "sideways"}),
+            )
+            .await;
+        assert_eq!(resp["result"]["isError"], Value::Bool(true), "{param}");
+        let err = &resp["result"]["structuredContent"]["error"];
+        assert_eq!(err["code"], "usage_error", "{param}: {err}");
+        let msg = err["message"].as_str().unwrap();
+        for valid in ["rank", "address", "quality", "text"] {
+            assert!(msg.contains(valid), "{param}: {msg} omits {valid}");
+        }
+        assert_eq!(
+            err["details"]["valid"],
+            json!(["rank", "address", "quality", "text"])
+        );
+    }
 
     // get_binary_info on a PE fixture
     let resp = mcp
@@ -392,7 +285,10 @@ async fn mcp_stdio_end_to_end() {
         );
     }
 
-    // bash lacks the write-what-where gadget → structured chain_error
+    // bash lacks the write-what-where gadget → structured not_found
+    // (CRIT-03 collapsed `chain_error` into the closed set; the message
+    // still says which gadget was missing, and details.what is
+    // "chain_gadget")
     let resp = mcp
         .call_tool(
             13,
@@ -402,7 +298,8 @@ async fn mcp_stdio_end_to_end() {
         .await;
     assert_eq!(resp["result"]["isError"], true);
     let err = &resp["result"]["structuredContent"]["error"];
-    assert_eq!(err["code"], "chain_error");
+    assert_eq!(err["code"], "not_found");
+    assert_eq!(err["details"]["what"], "chain_gadget");
     assert!(err["message"].as_str().unwrap().contains("mov qword ptr"));
 
     // windows-virtualprotect: pe-x86-cmd stdcall chain via api_addr
@@ -425,7 +322,7 @@ async fn mcp_stdio_end_to_end() {
     let words = body["chain"]["words"].as_array().unwrap();
     assert_eq!(words[0]["kind"], "code_addr");
 
-    // pe-x64-cmd cannot populate rdx/r8/r9 (spike finding) → chain_error
+    // pe-x64-cmd cannot populate rdx/r8/r9 (spike finding) → not_found
     let resp = mcp
         .call_tool(
             15,
@@ -436,14 +333,15 @@ async fn mcp_stdio_end_to_end() {
         .await;
     assert_eq!(resp["result"]["isError"], true);
     let err = &resp["result"]["structuredContent"]["error"];
-    assert_eq!(err["code"], "chain_error");
+    assert_eq!(err["code"], "not_found");
+    assert_eq!(err["details"]["what"], "chain_gadget");
     assert!(err["message"]
         .as_str()
         .unwrap()
         .contains("cannot populate rdx"));
 
     // pe-x86-cmd without api_addr imports VirtualAlloc but not
-    // VirtualProtect → clean chain_error naming the resolution failure
+    // VirtualProtect → clean not_found naming the resolution failure
     let resp = mcp
         .call_tool(
             16,
@@ -454,7 +352,7 @@ async fn mcp_stdio_end_to_end() {
     assert_eq!(resp["result"]["isError"], true);
     assert_eq!(
         resp["result"]["structuredContent"]["error"]["code"],
-        "chain_error"
+        "not_found"
     );
 }
 
@@ -518,7 +416,9 @@ async fn mcp_rejects_traversal_and_disallowed_flags() {
             )
             .await;
         let err = &resp["result"]["structuredContent"]["error"];
-        assert_eq!(err["code"], "invalid_flag", "{flag}: {err}");
+        // CRIT-03 collapsed `invalid_flag` into the closed `usage_error`.
+        assert_eq!(err["code"], "usage_error", "{flag}: {err}");
+        assert_eq!(err["retryable"], false, "{flag}: {err}");
     }
 
     // malformed binary inside the allowlist → clean tool error, no panic
@@ -532,7 +432,7 @@ async fn mcp_rejects_traversal_and_disallowed_flags() {
     assert_eq!(resp["result"]["isError"], true);
     assert_eq!(
         resp["result"]["structuredContent"]["error"]["code"],
-        "binary_error"
+        "unsupported_binary"
     );
 
     // server is still alive and working after all the errors
@@ -633,6 +533,7 @@ async fn initialize_instructions_name_the_allowlist() {
         stdin,
         lines: BufReader::new(stdout).lines(),
         cwd: TempTree::new("instr"),
+        raw: Vec::new(),
     };
     let resp = mcp
         .rpc(
@@ -645,6 +546,18 @@ async fn initialize_instructions_name_the_allowlist() {
             }),
         )
         .await;
+    // MCP-09: the `logging` capability is declared, which is what makes a
+    // host deliver `notifications/message` to the operator — the only
+    // channel that reaches them, since hosts discard the server's stderr.
+    assert!(
+        resp["result"]["capabilities"]["logging"].is_object(),
+        "the logging capability must be declared: {resp}"
+    );
+    assert!(
+        resp["result"]["capabilities"]["tools"].is_object(),
+        "{resp}"
+    );
+
     let instructions = resp["result"]["instructions"].as_str().unwrap_or_default();
     assert!(
         instructions.contains(&fixtures_dir().display().to_string())
@@ -871,7 +784,7 @@ async fn allow_cwd_is_an_explicit_opt_in() {
     )
     .unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rop-finder-mcp"))
+    let child = Command::new(env!("CARGO_BIN_EXE_rop-finder-mcp"))
         .arg("--allow-cwd")
         .current_dir(cwd.path())
         .stdin(std::process::Stdio::piped())
@@ -880,25 +793,7 @@ async fn allow_cwd_is_an_explicit_opt_in() {
         .kill_on_drop(true)
         .spawn()
         .expect("spawn rop-finder-mcp");
-    let stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let mut mcp = McpChild {
-        child,
-        stdin,
-        lines: BufReader::new(stdout).lines(),
-        cwd: TempTree::new("allow-cwd-unused"),
-    };
-    mcp.rpc(
-        1,
-        "initialize",
-        json!({
-            "protocolVersion": "2025-03-26",
-            "capabilities": {},
-            "clientInfo": {"name": "rf-mcp-test", "version": "0.1.0"},
-        }),
-    )
-    .await;
-    mcp.notify("notifications/initialized", json!({})).await;
+    let mut mcp = McpChild::adopt(child, TempTree::new("allow-cwd-unused")).await;
 
     let resp = mcp
         .call_tool(
@@ -911,11 +806,14 @@ async fn allow_cwd_is_an_explicit_opt_in() {
     assert_eq!(structured(&resp)["format"], "elf");
 }
 
-/// `--audit-log` is validated for containment but refuses to start rather
-/// than accepting a flag that would silently record nothing.
+/// `--audit-log` is still validated for containment: a log the agent can
+/// read (and, through rotation, influence) muddles the trust boundary.
+///
+/// The other half of this test used to assert that the flag was REFUSED as
+/// unimplemented. MCP-09 implements it, so the assertion is now that the
+/// server starts and says where it is auditing to.
 #[tokio::test]
-async fn audit_log_is_validated_and_refused_as_unimplemented() {
-    // Inside an allow root: the containment refusal wins and names the flag.
+async fn audit_log_inside_an_allow_root_is_refused() {
     let out = Command::new(env!("CARGO_BIN_EXE_rop-finder-mcp"))
         .arg("--allow-dir")
         .arg(fixtures_dir())
@@ -930,22 +828,6 @@ async fn audit_log_is_validated_and_refused_as_unimplemented() {
     assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
     assert!(stderr.contains("--audit-log"), "{stderr}");
     assert!(stderr.contains("inside the allow root"), "{stderr}");
-
-    // Outside every root: still refused, but for being unimplemented.
-    let elsewhere = TempTree::new("audit");
-    let out = Command::new(env!("CARGO_BIN_EXE_rop-finder-mcp"))
-        .arg("--allow-dir")
-        .arg(fixtures_dir())
-        .arg("--audit-log")
-        .arg(elsewhere.path().join("calls.jsonl"))
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .expect("run rop-finder-mcp");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
-    assert!(stderr.contains("not implemented"), "{stderr}");
 }
 // ---------------------------------------------------------------------------
 // ANCH-02 - --align is the engine's alignment, decimal, not an address

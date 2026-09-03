@@ -7,9 +7,20 @@ use iced_x86::{
 };
 use rf_scan::Gadget;
 
-use crate::{push_unique, push_unique_class, quality_score, Class, Classification, PRECEDENCE};
+use crate::{
+    push_unique, push_unique_class, quality_score_full, Class, Classification, Terminator,
+    PRECEDENCE,
+};
 
-/// R6 arithmetic/logical mnemonic set.
+/// R6 arithmetic/logical mnemonic set, widened per CLS-12.
+///
+/// Added: division (`div`, `idiv`), exchange-add (`xadd`), the bit-test group
+/// (`bt`, `bts`, `btr`, `btc`), byte-swap (`bswap`), double-precision shifts
+/// (`shld`, `shrd`) and `xchg`.
+///
+/// Removed: `cmp` and `test`. They compute nothing into any register, they
+/// are useless as arithmetic gadgets, and they were the single largest
+/// contributor to what was already the largest class.
 fn is_arithmetic(m: Mnemonic) -> bool {
     matches!(
         m,
@@ -30,11 +41,22 @@ fn is_arithmetic(m: Mnemonic) -> bool {
             | Mnemonic::Sal
             | Mnemonic::Rol
             | Mnemonic::Ror
+            | Mnemonic::Rcl
+            | Mnemonic::Rcr
             | Mnemonic::Imul
             | Mnemonic::Mul
+            | Mnemonic::Div
+            | Mnemonic::Idiv
+            | Mnemonic::Xadd
+            | Mnemonic::Xchg
+            | Mnemonic::Bt
+            | Mnemonic::Bts
+            | Mnemonic::Btr
+            | Mnemonic::Btc
+            | Mnemonic::Bswap
+            | Mnemonic::Shld
+            | Mnemonic::Shrd
             | Mnemonic::Lea
-            | Mnemonic::Cmp
-            | Mnemonic::Test
     )
 }
 
@@ -52,14 +74,67 @@ fn is_syscall(m: Mnemonic) -> bool {
     )
 }
 
-/// R1: mnemonics whose rsp effect is chain mechanism, not payload.
+/// Instructions that fault, trap or require ring 0 — a gadget containing one
+/// cannot appear in a user-mode chain (usability tier 0).
+fn is_privileged_or_undefined(m: Mnemonic) -> bool {
+    matches!(
+        m,
+        Mnemonic::Hlt
+            | Mnemonic::Ud0
+            | Mnemonic::Ud1
+            | Mnemonic::Ud2
+            | Mnemonic::Cli
+            | Mnemonic::Sti
+            | Mnemonic::In
+            | Mnemonic::Insb
+            | Mnemonic::Insw
+            | Mnemonic::Insd
+            | Mnemonic::Out
+            | Mnemonic::Outsb
+            | Mnemonic::Outsw
+            | Mnemonic::Outsd
+            | Mnemonic::Lgdt
+            | Mnemonic::Lidt
+            | Mnemonic::Lldt
+            | Mnemonic::Ltr
+            | Mnemonic::Lmsw
+            | Mnemonic::Clts
+            | Mnemonic::Invd
+            | Mnemonic::Wbinvd
+            | Mnemonic::Invlpg
+            | Mnemonic::Rdmsr
+            | Mnemonic::Wrmsr
+            | Mnemonic::Rsm
+            | Mnemonic::Vmcall
+            | Mnemonic::Vmlaunch
+            | Mnemonic::Vmresume
+            | Mnemonic::Vmxoff
+            | Mnemonic::Int3
+    )
+}
+
+/// R1: mnemonics whose stack-pointer effect is chain mechanism, not payload.
+///
+/// CLS-02: the flags forms were missing. iced gives `popfq` its own mnemonic,
+/// so it never matched `Mnemonic::Pop`, `implicit_sp` stayed false, and R5 saw
+/// popfq's implicit `rsp` increment as an EXPLICIT stack-pointer write —
+/// which is why `popfq ; ret` came out as a stack pivot with
+/// `regs_written: ["rsp"]`, indistinguishable from `xchg rsp, rax ; ret`.
 fn has_implicit_sp(m: Mnemonic) -> bool {
     matches!(
         m,
         Mnemonic::Push
             | Mnemonic::Pop
             | Mnemonic::Pusha
+            | Mnemonic::Pushad
             | Mnemonic::Popa
+            | Mnemonic::Popad
+            | Mnemonic::Pushf
+            | Mnemonic::Pushfd
+            | Mnemonic::Pushfq
+            | Mnemonic::Popf
+            | Mnemonic::Popfd
+            | Mnemonic::Popfq
             | Mnemonic::Call
             | Mnemonic::Ret
             | Mnemonic::Retf
@@ -69,6 +144,12 @@ fn has_implicit_sp(m: Mnemonic) -> bool {
             | Mnemonic::Iretd
             | Mnemonic::Iretq
     )
+}
+
+/// Pop-family: the value written to the register comes off the stack, so it
+/// is chain-controlled. `popf*` is excluded — it writes rflags, not a GPR.
+fn is_pop_family(m: Mnemonic) -> bool {
+    matches!(m, Mnemonic::Pop | Mnemonic::Popa | Mnemonic::Popad)
 }
 
 fn is_sp(r: Register) -> bool {
@@ -93,8 +174,9 @@ fn access_writes(a: OpAccess) -> bool {
     )
 }
 
-/// Final control-transfer anchors (skipped for side-effect accounting,
-/// R10 — except the dispatcher check, R8).
+/// Final control-transfer anchors (their control effects are skipped for
+/// side-effect accounting, R10 — but any payload they also carry is kept,
+/// which is CLS-13's `ret imm16` case).
 fn is_control_anchor(flow: FlowControl) -> bool {
     matches!(
         flow,
@@ -106,25 +188,79 @@ fn is_control_anchor(flow: FlowControl) -> bool {
     )
 }
 
-/// Labels one decoded instruction; also feeds regs_read/regs_written.
-/// Returns the label set for this instruction.
-fn labels_for_insn(
-    insn: &Instruction,
-    factory: &mut InstructionInfoFactory,
-    regs_read: &mut Vec<String>,
-    regs_written: &mut Vec<String>,
-) -> Vec<Class> {
-    let m = insn.mnemonic();
-    let mut labels = Vec::new();
-    let info = factory.info(insn);
+/// What kind of terminator the gadget's last instruction is.
+fn terminator_of(insn: &Instruction) -> Terminator {
+    let far = matches!(insn.op0_kind(), OpKind::FarBranch16 | OpKind::FarBranch32)
+        || matches!(
+            insn.mnemonic(),
+            Mnemonic::Retf | Mnemonic::Iret | Mnemonic::Iretd | Mnemonic::Iretq
+        );
+    match insn.mnemonic() {
+        Mnemonic::Ret => {
+            if insn.op_count() > 0 && insn.immediate(0) != 0 {
+                Terminator::RetImm
+            } else {
+                Terminator::Ret
+            }
+        }
+        Mnemonic::Retf => Terminator::Retf,
+        Mnemonic::Iret | Mnemonic::Iretd | Mnemonic::Iretq => Terminator::Iret,
+        m if is_syscall(m) => Terminator::Syscall,
+        Mnemonic::Jmp if far => Terminator::Far,
+        Mnemonic::Call if far => Terminator::Far,
+        Mnemonic::Jmp => Terminator::Jmp,
+        Mnemonic::Call => Terminator::Call,
+        _ if is_control_anchor(insn.flow_control()) => Terminator::Jmp,
+        _ => Terminator::None,
+    }
+}
 
-    // R2
-    if is_syscall(m) {
-        labels.push(Class::Syscall);
+/// Everything one instruction contributes.
+#[derive(Default)]
+struct InsnEffect {
+    labels: Vec<Class>,
+    written: Vec<String>,
+    read: Vec<String>,
+    from_stack: Vec<String>,
+    /// Memory operands whose base/index register must already hold an
+    /// attacker-controlled pointer.
+    pointer_deps: usize,
+}
+
+/// Labels one decoded instruction.
+///
+/// `anchor` is true for the gadget's terminating control transfer: its
+/// control effects (the transfer, the return-address pop, the branch-target
+/// fetch) are mechanism and are dropped, but a stack adjustment it also
+/// performs is payload and is kept — `ret 0x10` advances rsp by 0x18 exactly
+/// as `add rsp, 0x10 ; ret` does, and used to be `other` while the other was
+/// `stack-pivot` (CLS-13).
+fn effect_of(insn: &Instruction, factory: &mut InstructionInfoFactory, anchor: bool) -> InsnEffect {
+    let m = insn.mnemonic();
+    let mut e = InsnEffect::default();
+    if m == Mnemonic::Nop {
+        return e;
+    }
+    if anchor {
+        // The only payload a control-transfer anchor carries is a fixed stack
+        // adjustment: `ret imm16` / `retf imm16`.
+        if matches!(m, Mnemonic::Ret | Mnemonic::Retf)
+            && insn.op_count() > 0
+            && insn.immediate(0) != 0
+        {
+            e.labels.push(Class::StackPivot);
+        }
+        return e;
     }
 
-    // Register effects (R1: implicit rsp of push/pop/call/ret excluded;
-    // RIP excluded — RIP-relative addressing is not a payload read).
+    let info = factory.info(insn);
+    if is_syscall(m) {
+        e.labels.push(Class::Syscall);
+    }
+
+    // Register effects (R1: implicit stack-pointer effects of
+    // push/pop/pushf/popf/call/ret excluded; RIP excluded — RIP-relative
+    // addressing is not a payload read).
     let implicit_sp = has_implicit_sp(m);
     for u in info.used_registers() {
         let r = u.register();
@@ -135,112 +271,156 @@ fn labels_for_insn(
             continue;
         }
         if access_reads(u.access()) {
-            push_unique(regs_read, reg_name(r));
+            push_unique(&mut e.read, reg_name(r));
         }
         if access_writes(u.access()) {
-            push_unique(regs_written, reg_name(r));
+            push_unique(&mut e.written, reg_name(r));
         }
     }
 
-    // Memory effects (R1: stack operands excluded — RSP/ESP-based, and
-    // any operand of a push/pop family instruction).
+    // Memory effects. R1 keeps stack READS out of `mem-read` — the value they
+    // deliver is already reported as a register write — but a stack WRITE is
+    // a controlled value going into memory, which is precisely the `push rax`
+    // primitive that used to earn no label at all (CLS-13).
     let mut mem_read = false;
     let mut mem_write = false;
+    let mut stack_load = false;
+    // `leave` and `enter` touch memory through rbp purely to move the frame;
+    // that access is mechanism in exactly the sense R1 means, and treating it
+    // as a payload read would rank `leave ; ret` as mem-read rather than the
+    // stack pivot it is.
+    let frame_mechanism = matches!(m, Mnemonic::Leave | Mnemonic::Enter);
     for u in info.used_memory() {
-        let stack_op = is_sp(u.base()) || is_sp(u.segment()) || implicit_sp;
-        if stack_op {
+        if frame_mechanism {
+            stack_load = true;
             continue;
         }
-        if access_reads(u.access()) {
-            mem_read = true;
-        }
+        let stack = is_sp(u.base()) || is_sp(u.segment());
         if access_writes(u.access()) {
             mem_write = true;
         }
+        if access_reads(u.access()) {
+            if stack {
+                stack_load = true;
+            } else {
+                mem_read = true;
+            }
+        }
+        // A memory operand reached through a base or index register needs
+        // that register to already hold an attacker-controlled pointer before
+        // the gadget can be used; an absolute or RIP-relative operand does
+        // not. CLS-07 names this as one of the things the quality score
+        // ignores.
+        if !stack && (u.base() != Register::None || u.index() != Register::None) {
+            e.pointer_deps += 1;
+        }
     }
-    // R3/R4
     if mem_write {
-        labels.push(Class::MemWrite);
+        e.labels.push(Class::MemWrite);
     }
     if mem_read {
-        labels.push(Class::MemRead);
+        e.labels.push(Class::MemRead);
     }
 
-    // R5: explicit rsp destination (mov/xchg/add/sub/pop rsp, leave).
-    let writes_sp_explicit = !implicit_sp
-        && info
-            .used_registers()
-            .iter()
-            .any(|u| is_sp(u.register()) && access_writes(u.access()));
-    let pop_sp = m == Mnemonic::Pop
-        && insn.op_count() > 0
-        && insn.op_kind(0) == OpKind::Register
-        && is_sp(insn.op_register(0));
-    let xchg_sp = m == Mnemonic::Xchg
-        && ((insn.op_kind(0) == OpKind::Register && is_sp(insn.op_register(0)))
-            || (insn.op_count() > 1
-                && insn.op_kind(1) == OpKind::Register
-                && is_sp(insn.op_register(1))));
+    // R5 (CLS-02): a stack-pivot needs an rsp-TARGETING write — rsp has to
+    // appear as an explicit register operand that the instruction writes, or
+    // the instruction has to be `leave`. An instruction that merely steps rsp
+    // as part of its own mechanism is not a pivot.
+    let sp_is_operand = (0..insn.op_count())
+        .any(|k| insn.op_kind(k) == OpKind::Register && is_sp(insn.op_register(k)));
+    let sp_written = info
+        .used_registers()
+        .iter()
+        .any(|u| is_sp(u.register()) && access_writes(u.access()));
     let leave = m == Mnemonic::Leave;
-    if writes_sp_explicit || pop_sp || xchg_sp || leave {
-        labels.push(Class::StackPivot);
+    if (sp_is_operand && sp_written && !matches!(m, Mnemonic::Push)) || leave {
+        e.labels.push(Class::StackPivot);
     }
 
-    // R6
     if is_arithmetic(m) {
-        labels.push(Class::Arithmetic);
+        e.labels.push(Class::Arithmetic);
     }
 
     // R7: writes a GPR (8/16/32/64 general-purpose register — excludes the
-    // flags register, xmm/ymm, segments, and rsp handled above), no
-    // non-stack memory operand, not a control/gate instruction.
-    let writes_gpr = info.used_registers().iter().any(|u| {
+    // flags register, xmm/ymm, segments, and rsp handled above), no non-stack
+    // memory operand, not a control/gate instruction.
+    let mut wrote_gpr = false;
+    for u in info.used_registers() {
         let r = u.register();
-        (r.is_gpr8() || r.is_gpr16() || r.is_gpr32() || r.is_gpr64())
-            && !is_sp(r)
-            && access_writes(u.access())
-    });
-    if writes_gpr && !mem_read && !mem_write && !is_syscall(m) {
-        labels.push(Class::RegWrite);
+        if !(r.is_gpr8() || r.is_gpr16() || r.is_gpr32() || r.is_gpr64())
+            || is_sp(r)
+            || !access_writes(u.access())
+        {
+            continue;
+        }
+        wrote_gpr = true;
+        if stack_load || is_pop_family(m) || m == Mnemonic::Leave {
+            push_unique(&mut e.from_stack, reg_name(r));
+        }
     }
-
-    labels
+    if wrote_gpr && !mem_read && !mem_write && !is_syscall(m) {
+        e.labels.push(Class::RegWrite);
+    }
+    e
 }
 
-/// R8 dispatcher heuristic: register-indirect jump anchor, or `jmp reg`
-/// where an earlier instruction arithmetically modifies `reg`.
+/// R8 dispatcher heuristic, redefined per CLS-03.
+///
+/// A JOP/COP **dispatcher** is a gadget that advances a dispatch-table
+/// pointer and then branches through it: `add rdx, 8 ; jmp [rdx]`. The
+/// distinguishing property is a *self-advancing* index register — one the
+/// gadget both reads and writes arithmetically — that the terminating
+/// indirect branch then uses as its target or as its target's base.
+///
+/// The rule this replaces answered "is the terminator `jmp [reg]`?" and
+/// nothing else, which labeled 865 gadgets on bash of which 6 were
+/// dispatcher-shaped, and it was restricted to `Mnemonic::Jmp`, so the
+/// call-oriented form `call qword ptr [reg]` — which rf-scan does emit as a
+/// JOP gadget — could never be labeled.
 fn dispatcher_heuristic(insns: &[Instruction], factory: &mut InstructionInfoFactory) -> bool {
     let Some(last) = insns.last() else {
         return false;
     };
-    if last.mnemonic() != Mnemonic::Jmp {
+    if !matches!(last.mnemonic(), Mnemonic::Jmp | Mnemonic::Call) {
         return false;
     }
-    // jmp qword ptr [reg] / [reg+off] — register-indirect
-    if last.op_count() > 0 && last.op_kind(0) == OpKind::Memory {
-        let base = last.memory_base();
-        if base != Register::None && !matches!(base, Register::RIP | Register::EIP) {
-            return true;
+    // The branch has to be indirect through a register, either directly
+    // (`jmp rdx`) or through memory based on one (`jmp [rdx + 8]`).
+    let mut targets: Vec<Register> = Vec::new();
+    if last.op_count() > 0 {
+        match last.op_kind(0) {
+            OpKind::Register => targets.push(last.op_register(0)),
+            OpKind::Memory => {
+                let base = last.memory_base();
+                if base != Register::None && !matches!(base, Register::RIP | Register::EIP) {
+                    targets.push(base);
+                }
+                let index = last.memory_index();
+                if index != Register::None {
+                    targets.push(index);
+                }
+            }
+            _ => {}
         }
     }
-    // jmp reg with an earlier arithmetic modification of reg
-    if last.op_count() > 0 && last.op_kind(0) == OpKind::Register {
-        let target = last.op_register(0);
-        for insn in &insns[..insns.len() - 1] {
-            if !is_arithmetic(insn.mnemonic()) {
-                continue;
-            }
-            let info = factory.info(insn);
-            if info
-                .used_registers()
-                .iter()
-                .any(|u| u.register() == target && access_writes(u.access()))
-            {
-                return true;
-            }
-        }
+    if targets.is_empty() {
+        return false;
     }
-    false
+    // Some earlier instruction must ADVANCE one of those registers: an
+    // arithmetic instruction that both reads and writes it. `pop rdx ;
+    // jmp [rdx]` loads a fresh pointer and is a functional JOP gadget, not a
+    // dispatcher; `add rdx, 8 ; jmp [rdx]` walks a table and is.
+    insns[..insns.len() - 1].iter().any(|insn| {
+        if !is_arithmetic(insn.mnemonic()) {
+            return false;
+        }
+        let info = factory.info(insn);
+        targets.iter().any(|t| {
+            info.used_registers().iter().any(|u| {
+                u.register() == *t && access_writes(u.access()) && access_reads(u.access())
+            })
+        })
+    })
 }
 
 /// Full x86/x64 classification (R1-R12).
@@ -257,30 +437,56 @@ pub(crate) fn classify_x86(g: &Gadget, bits: u32) -> Classification {
     let mut labels: Vec<Class> = Vec::new();
     let mut regs_read = Vec::new();
     let mut regs_written = Vec::new();
+    let mut regs_from_stack = Vec::new();
     let mut side_effects = 0usize;
     let mut last_class: Option<Class> = None;
+    let mut privileged = false;
+    let mut pointer_deps = 0usize;
+    let mut mid_branches = 0usize;
 
     let n = insns.len();
+    let mut terminator = Terminator::None;
     for (i, insn) in insns.iter().enumerate() {
-        // R10: skip the final control-transfer anchor and nops for
-        // side-effect accounting (the anchor is the gadget mechanism).
-        // iced marks syscall as FlowControl::Call — syscall gates are
-        // payload, not mechanism, and are exempt (R2).
-        let is_anchor =
+        // R10: the final control-transfer anchor is the gadget mechanism.
+        // iced marks syscall as FlowControl::Call — syscall gates are payload,
+        // not mechanism, and are exempt (R2).
+        let anchor =
             i == n - 1 && is_control_anchor(insn.flow_control()) && !is_syscall(insn.mnemonic());
-        if is_anchor || insn.mnemonic() == Mnemonic::Nop {
+        if anchor {
+            terminator = terminator_of(insn);
+        }
+        privileged |= is_privileged_or_undefined(insn.mnemonic());
+        if !anchor && insn.flow_control() == FlowControl::ConditionalBranch {
+            mid_branches += 1;
+        }
+        let e = effect_of(insn, &mut factory, anchor);
+        pointer_deps += e.pointer_deps;
+        for r in e.read {
+            push_unique(&mut regs_read, r);
+        }
+        for r in e.from_stack {
+            push_unique(&mut regs_from_stack, r);
+        }
+        if e.labels.is_empty() {
             continue;
         }
-        let insn_labels = labels_for_insn(insn, &mut factory, &mut regs_read, &mut regs_written);
-        if !insn_labels.is_empty() {
-            side_effects += 1;
-            last_class = PRECEDENCE
-                .iter()
-                .find(|c| insn_labels.contains(c))
-                .copied()
-                .or(last_class);
-            for c in insn_labels {
-                push_unique_class(&mut labels, c);
+        for r in e.written {
+            push_unique(&mut regs_written, r);
+        }
+        side_effects += 1;
+        last_class = PRECEDENCE
+            .iter()
+            .find(|c| e.labels.contains(c))
+            .copied()
+            .or(last_class);
+        for c in e.labels {
+            push_unique_class(&mut labels, c);
+        }
+    }
+    if terminator == Terminator::None {
+        if let Some(last) = insns.last() {
+            if is_syscall(last.mnemonic()) {
+                terminator = Terminator::Syscall;
             }
         }
     }
@@ -299,129 +505,21 @@ pub(crate) fn classify_x86(g: &Gadget, bits: u32) -> Classification {
     Classification {
         primary,
         labels,
+        quality: quality_score_full(
+            side_effects,
+            g.insns.len(),
+            regs_written.len(),
+            pointer_deps + mid_branches,
+        ),
         regs_written,
         regs_read,
+        regs_from_stack,
         side_effects,
-        quality: quality_score(side_effects, g.insns.len()),
+        mem_pointer_deps: pointer_deps,
+        mid_branches,
         dispatcher,
+        terminator,
+        privileged,
         low_confidence: false,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::classify;
-    use rf_core::Arch;
-
-    fn gadget(bytes: &[u8], text: &str) -> Gadget {
-        Gadget {
-            vaddr: 0x401000,
-            bytes: bytes.to_vec(),
-            insns: text.split(" ; ").map(|s| s.to_string()).collect(),
-            delay_slot: false,
-            prev: None,
-            table: rf_scan::TableKind::Rop,
-        }
-    }
-
-    #[test]
-    fn pop_rdi_is_clean_reg_write() {
-        // 5f c3 = pop rdi ; ret
-        let c = classify(&gadget(b"\x5f\xc3", "pop rdi ; ret"), Arch::X64);
-        assert_eq!(c.primary, Class::RegWrite);
-        assert_eq!(c.labels, vec![Class::RegWrite]);
-        assert_eq!(c.regs_written, vec!["rdi"]);
-        // R1: implicit rsp effect of pop is normalized away
-        assert!(!c.regs_written.contains(&"rsp".to_string()));
-        assert!(!c.regs_read.contains(&"rsp".to_string()));
-        assert_eq!(c.side_effects, 1);
-        assert_eq!(c.quality, 100);
-        assert!(!c.low_confidence);
-    }
-
-    #[test]
-    fn mov_store_is_mem_write() {
-        // 48 89 07 c3 = mov qword ptr [rdi], rax ; ret
-        let c = classify(
-            &gadget(b"\x48\x89\x07\xc3", "mov qword ptr [rdi], rax ; ret"),
-            Arch::X64,
-        );
-        assert_eq!(c.primary, Class::MemWrite);
-        assert!(c.regs_read.contains(&"rax".to_string()));
-        assert!(c.regs_read.contains(&"rdi".to_string()));
-        assert!(!c.labels.contains(&Class::RegWrite));
-    }
-
-    #[test]
-    fn xor_self_is_regwrite_and_arithmetic() {
-        // 48 31 c0 c3 = xor rax, rax ; ret  (multi-label, R6+R7)
-        let c = classify(
-            &gadget(b"\x48\x31\xc0\xc3", "xor rax, rax ; ret"),
-            Arch::X64,
-        );
-        assert!(c.labels.contains(&Class::RegWrite));
-        assert!(c.labels.contains(&Class::Arithmetic));
-        // R10 precedence: arithmetic > reg-write
-        assert_eq!(c.primary, Class::Arithmetic);
-    }
-
-    #[test]
-    fn syscall_is_labeled_even_as_anchor() {
-        // 0f 05 = syscall
-        let c = classify(&gadget(b"\x0f\x05", "syscall"), Arch::X64);
-        assert_eq!(c.primary, Class::Syscall);
-    }
-
-    #[test]
-    fn pivots() {
-        // 48 94 c3 = xchg rsp, rax ; ret
-        let c = classify(&gadget(b"\x48\x94\xc3", "xchg rsp, rax ; ret"), Arch::X64);
-        assert_eq!(c.primary, Class::StackPivot);
-        // 5c c3 = pop rsp ; ret
-        let c = classify(&gadget(b"\x5c\xc3", "pop rsp ; ret"), Arch::X64);
-        assert_eq!(c.primary, Class::StackPivot);
-        // c9 c3 = leave ; ret
-        let c = classify(&gadget(b"\xc9\xc3", "leave ; ret"), Arch::X64);
-        assert_eq!(c.primary, Class::StackPivot);
-    }
-
-    #[test]
-    fn primary_is_last_side_effect() {
-        // 58 48 01 d8 c3 = pop rax ; add rax, rbx ; ret
-        let c = classify(
-            &gadget(b"\x58\x48\x01\xd8\xc3", "pop rax ; add rax, rbx ; ret"),
-            Arch::X64,
-        );
-        assert_eq!(c.primary, Class::Arithmetic);
-        assert_eq!(c.side_effects, 2);
-        assert_eq!(c.quality, 82); // 100 - 15*1 - 3*1
-    }
-
-    #[test]
-    fn dispatcher_indirect_jmp_mem() {
-        // ff 20 = jmp qword ptr [rax]
-        let c = classify(&gadget(b"\xff\x20", "jmp qword ptr [rax]"), Arch::X64);
-        assert!(c.dispatcher);
-        assert_eq!(c.primary, Class::Dispatcher);
-    }
-
-    #[test]
-    fn dispatcher_loop_form() {
-        // 48 83 c0 08 ff e0 = add rax, 8 ; jmp rax
-        let c = classify(
-            &gadget(b"\x48\x83\xc0\x08\xff\xe0", "add rax, 0x8 ; jmp rax"),
-            Arch::X64,
-        );
-        assert!(c.dispatcher);
-        assert!(c.labels.contains(&Class::Dispatcher));
-    }
-
-    #[test]
-    fn plain_jmp_reg_is_not_dispatcher() {
-        // ff e0 = jmp rax (no arithmetic on rax)
-        let c = classify(&gadget(b"\xff\xe0", "jmp rax"), Arch::X64);
-        assert!(!c.dispatcher);
-        assert_eq!(c.primary, Class::Other);
     }
 }

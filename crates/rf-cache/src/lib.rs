@@ -17,6 +17,11 @@
 //!   per-directory random key, 0600 entries in a 0700 directory,
 //!   `create_new` + rename for atomicity, and a byte-weighted LRU with a
 //!   TTL (CLI-07/MCP-04, CLI-08/PERF-12).
+//! * **[`MemCache`]** — the in-memory half: a byte-weighted LRU with a
+//!   TTL, weighted by [`CachedScan::heap_bytes`] and evicted on insert
+//!   (MCP-05/ROB-07). The unbounded `HashMap` it replaces walked the MCP
+//!   server's RSS from 5 MB to 84 MB over twelve scans of one 900 KB
+//!   binary and pinned 2.57 GB from a single depth-40 request.
 //! * **[`CachedScan::validate`]** — run on every deserialize, so a
 //!   corrupt or hostile entry is a miss with a counter rather than a
 //!   panic or a lie (ROB-04).
@@ -28,14 +33,17 @@
 
 mod hex;
 mod mac;
+mod mem;
 mod record;
 mod store;
 
 pub use hex::{decode_hex, encode_hex, is_hex_bytes, parse_hex_u64, MAX_GADGET_BYTES};
 pub use mac::{ct_eq, hmac_sha256, sha256_hex, MAC_LEN};
+pub use mem::{now_unix, MemCache, MemLimits, MemStats, DEFAULT_MEM_MAX_BYTES, DEFAULT_MEM_TTL};
 pub use record::{
-    CachedGadget, CachedScan, CACHE_FORMAT_VERSION, KNOWN_CLASSES, MAX_GADGETS_PER_ENTRY,
-    MAX_INSNS_PER_GADGET, MAX_LABEL_BYTES, MAX_PREV_BYTES, MAX_TEXT_BYTES,
+    CachedGadget, CachedScan, CACHE_FORMAT_VERSION, GADGET_OVERHEAD_BYTES, KNOWN_CLASSES,
+    MAX_GADGETS_PER_ENTRY, MAX_INSNS_PER_GADGET, MAX_LABEL_BYTES, MAX_PREV_BYTES, MAX_TEXT_BYTES,
+    SCAN_OVERHEAD_BYTES,
 };
 pub use store::{
     CacheLimits, CacheStats, DiskCache, OpenError, DEFAULT_MAX_ENTRY_BYTES,

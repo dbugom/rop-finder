@@ -46,12 +46,52 @@ struct ServerCli {
     #[arg(long = "cache-dir", value_name = "<path>")]
     cache_dir: Option<PathBuf>,
 
-    /// RESERVED. The JSONL call/denial log lands in v0.3 (MCP-10); the flag
-    /// exists so its path is validated — it must not fall inside an allow
-    /// root — but passing it refuses to start rather than silently logging
-    /// nothing.
+    /// JSONL call/denial log (MCP-09). One JSON object per line, opened
+    /// append/create, mode 0600, rotated at --audit-log-max-mb. Must not
+    /// fall inside an allow root: the agent must not be able to read the
+    /// server's record of it.
     #[arg(long = "audit-log", value_name = "<path>")]
     audit_log: Option<PathBuf>,
+
+    /// Rotate the audit log at this size, keeping <path>.1 and <path>.2.
+    #[arg(long = "audit-log-max-mb", default_value_t = rf_mcp::audit::DEFAULT_AUDIT_MAX_MB)]
+    audit_log_max_mb: u64,
+
+    /// Threads in the scan pool. Default num_cpus-1, so the server never
+    /// consumes every core on the operator's machine.
+    #[arg(long = "scan-threads", value_name = "<n>")]
+    scan_threads: Option<usize>,
+
+    /// In-memory scan-cache budget in MiB (MCP-05/ROB-07). Entries are
+    /// evicted least-recently-used until the total is under it.
+    #[arg(long = "cache-mem-mb", default_value_t = rf_mcp::DEFAULT_CACHE_MEM_BYTES / (1024 * 1024))]
+    cache_mem_mb: u64,
+
+    /// In-memory scan-cache entry lifetime, in seconds.
+    #[arg(long = "cache-ttl-secs", default_value_t = rf_mcp::DEFAULT_CACHE_TTL.as_secs())]
+    cache_ttl_secs: u64,
+
+    /// How long a paged scan stays pinned against eviction so an
+    /// outstanding cursor can walk it (MCP-DESIGN fix #8 part B).
+    #[arg(long = "cursor-ttl-secs", default_value_t = rf_mcp::DEFAULT_CURSOR_TTL.as_secs())]
+    cursor_ttl_secs: u64,
+
+    /// Materialize each paged scan as an NDJSON file here, so an agent
+    /// with filesystem tools can grep the whole result instead of paging
+    /// it. Must NOT fall inside an allow root: the agent must not be able
+    /// to feed the server's own output back in as a binary.
+    #[arg(long = "workspace-dir", value_name = "<path>")]
+    workspace_dir: Option<PathBuf>,
+
+    /// Engine gadget budget: a scan that accepts more than this stops with
+    /// resource_exhausted. 0 disables the budget.
+    #[arg(long = "max-gadgets", default_value_t = rf_mcp::DEFAULT_MAX_GADGETS)]
+    max_gadgets: usize,
+
+    /// Consecutive path_denied results in one session before responses are
+    /// delayed by 250 ms and `probing_suspected` is logged. 0 disables it.
+    #[arg(long = "probe-threshold", default_value_t = rf_mcp::DEFAULT_PROBE_THRESHOLD)]
+    probe_threshold: u64,
 
     /// Default per-request timeout in seconds (1-300)
     #[arg(long, default_value_t = rf_mcp::DEFAULT_TIMEOUT_SECS)]
@@ -242,6 +282,7 @@ fn reject_writable_paths_inside_roots(cli: &ServerCli, roots: &[PathBuf]) -> Res
     for (flag, path) in [
         ("--cache-dir", cli.cache_dir.as_ref()),
         ("--audit-log", cli.audit_log.as_ref()),
+        ("--workspace-dir", cli.workspace_dir.as_ref()),
     ] {
         let Some(p) = path else { continue };
         // The path need not exist yet; canonicalize the nearest existing
@@ -286,16 +327,6 @@ async fn main() -> ExitCode {
         eprintln!("rop-finder-mcp: {msg}");
         return ExitCode::from(EXIT_CONFIG);
     }
-    if cli.audit_log.is_some() {
-        // Accepting the flag and writing nothing would tell an operator
-        // their calls are being recorded when they are not.
-        eprintln!(
-            "rop-finder-mcp: refusing to start: --audit-log is reserved and not implemented \
-             in this release. The JSONL call/denial log lands in v0.3 (see \
-             docs/AUDIT-FINDINGS.md MCP-10); remove the flag to start the server."
-        );
-        return ExitCode::from(EXIT_CONFIG);
-    }
 
     let mut config = ServerConfig {
         allow_dirs: roots,
@@ -315,20 +346,57 @@ async fn main() -> ExitCode {
     config.max_depth = cli.max_depth.max(1);
     config.max_file_bytes = cli.max_file_bytes.max(1);
     config.max_concurrent = cli.max_concurrent.max(1);
+    config.scan_threads = cli
+        .scan_threads
+        .map(|n| n.max(1))
+        .unwrap_or_else(rf_mcp::guard::default_scan_threads);
+    config.max_gadgets = (cli.max_gadgets > 0).then_some(cli.max_gadgets);
+    config.cache_mem_bytes = cli.cache_mem_mb.saturating_mul(1024 * 1024);
+    config.cache_ttl = Duration::from_secs(cli.cache_ttl_secs);
+    config.cursor_ttl = Duration::from_secs(cli.cursor_ttl_secs);
+    if let Some(dir) = &cli.workspace_dir {
+        match std::fs::create_dir_all(dir) {
+            Ok(()) => config.workspace_dir = Some(dir.clone()),
+            Err(e) => {
+                eprintln!("rop-finder-mcp: --workspace-dir {}: {e}", dir.display());
+                return ExitCode::from(EXIT_CONFIG);
+            }
+        }
+    }
+    config.audit_log = cli.audit_log.clone();
+    config.audit_log_max_mb = cli.audit_log_max_mb.max(1);
+    config.probe_threshold = cli.probe_threshold;
     config.verbose_path_errors = cli.verbose_path_errors;
+
+    // MCP-09. stderr, never stdout: stdout is the JSON-RPC transport and a
+    // single stray write corrupts the session with no error anywhere.
+    rf_mcp::logging::init_tracing("warn");
 
     let server = match RopFinderMcp::new(config) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("rop-finder-mcp: cannot pin the allowed directories: {e}");
+            eprintln!("rop-finder-mcp: cannot start: {e}");
             return ExitCode::from(EXIT_CONFIG);
         }
     };
 
     eprintln!(
-        "rop-finder-mcp serving on stdio; allowed dirs: {}",
+        "rop-finder-mcp serving on stdio; session {}; allowed dirs: {}",
+        server.session_id(),
         server.root_paths().join(", ")
     );
+    if cli.accept_wide_allowlist {
+        // A startup warning that reaches the audit log and the operator,
+        // not just a terminal nobody is watching.
+        tracing::warn!(
+            roots = %server.root_paths().join(", "),
+            "--i-accept-a-wide-allowlist is in effect: the agent can read every file under \
+             the allow roots"
+        );
+    }
+    if let Some(p) = &cli.audit_log {
+        eprintln!("rop-finder-mcp: auditing to {}", p.display());
+    }
 
     match server.serve(stdio()).await {
         Ok(running) => {

@@ -203,6 +203,25 @@ pub struct Cli {
     #[arg(long)]
     pub rank: bool,
 
+    /// Keep only gadgets whose primary class is one of these
+    /// (comma-separated): reg-write, stack-pivot, mem-read, mem-write,
+    /// arithmetic, syscall, dispatcher, other. Implies --classify's
+    /// analysis; add --classify to see the fields in --json output
+    /// (CLS-08 — the MCP server has the same filter)
+    #[arg(long = "class", value_name = "<class[,class...]>")]
+    pub class: Option<String>,
+
+    /// Keep only gadgets carrying at least one of these labels (same
+    /// vocabulary as --class; a gadget can earn several)
+    #[arg(long = "label", value_name = "<label[,label...]>")]
+    pub label: Option<String>,
+
+    /// Keep only gadgets that write ALL of these registers
+    /// (comma-separated, e.g. rdi or rdi,rsi). Names are matched
+    /// lowercase and without a $/% sigil
+    #[arg(long = "writes-reg", value_name = "<reg[,reg...]>")]
+    pub writes_reg: Option<String>,
+
     /// Cache scan results on disk, keyed by the binary's content hash plus
     /// all scan parameters. Cache directory: ROP_FINDER_CACHE_DIR, else
     /// %LOCALAPPDATA%/rop-finder/cache (Windows) or ~/.cache/rop-finder
@@ -937,10 +956,15 @@ pub fn info_json(target: &Target, new_base: Option<u64>) -> serde_json::Value {
                 .imports()
                 .iter()
                 .map(|i| {
+                    // CHWIN-03: `iat_vaddr` is the IAT slot the loader
+                    // patches (deref this); `hint_name_vaddr` is the
+                    // IMAGE_IMPORT_BY_NAME record holding the name string.
+                    // Before the fix `iat_vaddr` carried the latter.
                     serde_json::json!({
                         "dll": i.dll,
                         "symbol": i.name,
-                        "iat_vaddr": hexs(i.thunk_vaddr.wrapping_add(delta)),
+                        "iat_vaddr": hexs(i.iat_slot_vaddr.wrapping_add(delta)),
+                        "hint_name_vaddr": hexs(i.hint_name_vaddr.wrapping_add(delta)),
                     })
                 })
                 .collect();
@@ -1969,10 +1993,28 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
         out,
     )?;
     let mut classes: Option<Vec<rf_classify::Classification>> = None;
-    if cli.classify || cli.rank {
+    // CLS-08: the classification is computed for every gadget and was only
+    // ever *printed*. `--class` / `--label` / `--writes-reg` make it
+    // queryable, which is the same surface the MCP server exposes as
+    // class/label/writes_reg — the two front ends must not diverge again.
+    let semantic = SemanticFilter::parse(
+        cli.class.as_deref(),
+        cli.label.as_deref(),
+        cli.writes_reg.as_deref(),
+    )?;
+    if cli.classify || cli.rank || !semantic.is_empty() {
         let (g, c) = classify_gadgets(gadgets, view.arch(), cli.rank);
         gadgets = g;
         classes = Some(c);
+    }
+    if let Some(cs) = classes.as_mut() {
+        if !semantic.is_empty() {
+            let keep: Vec<bool> = cs.iter().map(|c| semantic.matches(c)).collect();
+            let mut it = keep.iter();
+            gadgets.retain(|_| *it.next().unwrap_or(&true));
+            let mut it = keep.iter();
+            cs.retain(|_| *it.next().unwrap_or(&true));
+        }
     }
     let result = ScanResult {
         gadgets,
@@ -1998,6 +2040,102 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
         print_human(&result, cli.noinstr, cli.dump, out);
     }
     Ok(0)
+}
+
+/// CLS-08: the `--class` / `--label` / `--writes-reg` predicate.
+///
+/// The MCP server's `class` / `label` / `writes_reg` parameters are the
+/// same three filters over the same [`rf_classify::Classification`], with
+/// the same any-of / any-of / all-of semantics and the same register-name
+/// normalization. ECO-02's finding is that the two front ends diverge; two
+/// spellings of one filter is how that starts.
+#[derive(Debug, Default)]
+struct SemanticFilter {
+    /// Primary class must be one of these. Empty = no constraint.
+    classes: Vec<String>,
+    /// At least one of these labels must be present.
+    labels: Vec<String>,
+    /// ALL of these registers must be written.
+    writes_regs: Vec<String>,
+}
+
+impl SemanticFilter {
+    fn parse(
+        class: Option<&str>,
+        label: Option<&str>,
+        writes_reg: Option<&str>,
+    ) -> Result<Self, String> {
+        let split = |v: Option<&str>| -> Vec<String> {
+            v.map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|x| !x.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+        };
+        let valid: Vec<&str> = [
+            rf_classify::Class::RegWrite,
+            rf_classify::Class::StackPivot,
+            rf_classify::Class::MemRead,
+            rf_classify::Class::MemWrite,
+            rf_classify::Class::Arithmetic,
+            rf_classify::Class::Syscall,
+            rf_classify::Class::Dispatcher,
+            rf_classify::Class::Other,
+        ]
+        .iter()
+        .map(|c| c.name())
+        .collect();
+        let classes = split(class);
+        let labels = split(label);
+        for (flag, values) in [("--class", &classes), ("--label", &labels)] {
+            for v in values {
+                if !valid.contains(&v.as_str()) {
+                    return Err(format!(
+                        "invalid {flag} value {v:?}; valid values are {}",
+                        valid.join(", ")
+                    ));
+                }
+            }
+        }
+        Ok(SemanticFilter {
+            classes,
+            labels,
+            writes_regs: split(writes_reg)
+                .iter()
+                .map(|r| {
+                    let t = r
+                        .strip_prefix('$')
+                        .or_else(|| r.strip_prefix('%'))
+                        .unwrap_or(r);
+                    t.to_ascii_lowercase()
+                })
+                .collect(),
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.classes.is_empty() && self.labels.is_empty() && self.writes_regs.is_empty()
+    }
+
+    fn matches(&self, c: &rf_classify::Classification) -> bool {
+        if !self.classes.is_empty() && !self.classes.iter().any(|n| n == c.primary.name()) {
+            return false;
+        }
+        if !self.labels.is_empty()
+            && !self
+                .labels
+                .iter()
+                .any(|n| c.labels.iter().any(|l| l.name() == n))
+        {
+            return false;
+        }
+        self.writes_regs
+            .iter()
+            .all(|r| c.regs_written.iter().any(|w| w == r))
+    }
 }
 
 /// Phase 5: classify every gadget and, when `rank` is set, sort by
@@ -2404,6 +2542,10 @@ mod tests {
             nojop: false,
             nosys: false,
             multibr: false,
+            // CLS-08's three semantic filters; None = unfiltered.
+            class: None,
+            label: None,
+            writes_reg: None,
             only: None,
             filter: None,
             range: None,
@@ -2823,6 +2965,149 @@ mod tests {
         }
 
         std::env::remove_var("ROP_FINDER_CACHE_DIR");
+    }
+
+    /// CLS-08 on the CLI: the classification the tool already computes is
+    /// now queryable, with the same three filters the MCP server exposes.
+    ///
+    /// Without the flags this is the finding itself — `--classify` prints
+    /// class, labels and regs_written for 16,707 gadgets and there is no
+    /// way to ask for the 2,027 that are stack pivots.
+    #[test]
+    fn class_label_and_writes_reg_filter_the_gadget_list() {
+        let base = || Cli {
+            binary: Some(format!(
+                "{}/../../tests/fixtures/elf-Linux-x64",
+                env!("CARGO_MANIFEST_DIR")
+            )),
+            depth: 4,
+            json: true,
+            classify: true,
+            ..cli_with(false, None, None, None)
+        };
+        let parse = |s: &str| -> Vec<serde_json::Value> { serde_json::from_str(s).unwrap() };
+
+        let all = parse(&run_to_string(base()));
+        assert!(
+            all.len() > 1000,
+            "{} gadgets is too few to prove anything",
+            all.len()
+        );
+
+        // --class keeps only that primary class, and narrows.
+        let pivots = parse(&run_to_string(Cli {
+            class: Some("stack-pivot".into()),
+            ..base()
+        }));
+        assert!(!pivots.is_empty() && pivots.len() < all.len());
+        for g in &pivots {
+            assert_eq!(g["class"], "stack-pivot", "{g}");
+        }
+
+        // --label is any-of over the full label set, so it is a superset
+        // of the same name used as --class.
+        let labelled = parse(&run_to_string(Cli {
+            label: Some("stack-pivot".into()),
+            ..base()
+        }));
+        assert!(labelled.len() >= pivots.len());
+        for g in &labelled {
+            assert!(
+                g["labels"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|l| l == "stack-pivot"),
+                "{g}"
+            );
+        }
+
+        // --writes-reg is all-of, and sigil/case insensitive.
+        for spelling in ["rdi", "$RDI"] {
+            let writes = parse(&run_to_string(Cli {
+                writes_reg: Some(spelling.into()),
+                ..base()
+            }));
+            assert!(!writes.is_empty(), "{spelling}");
+            for g in &writes {
+                assert!(
+                    g["regs_written"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|r| r == "rdi"),
+                    "{spelling}: {g}"
+                );
+            }
+        }
+        let both = parse(&run_to_string(Cli {
+            writes_reg: Some("rdi,rsi".into()),
+            ..base()
+        }));
+        for g in &both {
+            let w = g["regs_written"].as_array().unwrap();
+            assert!(
+                w.iter().any(|r| r == "rdi") && w.iter().any(|r| r == "rsi"),
+                "{g}"
+            );
+        }
+
+        // The filters compose, and an unknown value names the valid set
+        // instead of leaving the user to guess.
+        let combined = parse(&run_to_string(Cli {
+            class: Some("reg-write".into()),
+            writes_reg: Some("rdi".into()),
+            ..base()
+        }));
+        for g in &combined {
+            assert_eq!(g["class"], "reg-write", "{g}");
+            assert!(g["regs_written"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r == "rdi"));
+        }
+        let err = run(
+            Cli {
+                class: Some("stack_pivot".into()),
+                ..base()
+            },
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("--class"), "{err}");
+        assert!(err.contains("stack-pivot"), "{err}");
+    }
+
+    /// The predicate itself, against classifications the classifier really
+    /// produced rather than ones this test invented.
+    #[test]
+    fn the_semantic_predicate_matches_what_it_claims() {
+        let g = |bytes: Vec<u8>, insns: &[&str]| Gadget {
+            vaddr: 0x1000,
+            bytes,
+            insns: insns.iter().map(|s| (*s).to_string()).collect(),
+            delay_slot: false,
+            prev: None,
+            table: rf_scan::TableKind::Rop,
+        };
+        let pop_rdi = rf_classify::classify(&g(vec![0x5f, 0xc3], &["pop rdi", "ret"]), Arch::X64);
+        let bare_ret = rf_classify::classify(&g(vec![0xc3], &["ret"]), Arch::X64);
+
+        let empty = SemanticFilter::parse(None, None, None).unwrap();
+        assert!(empty.is_empty());
+        assert!(empty.matches(&pop_rdi) && empty.matches(&bare_ret));
+
+        let f = SemanticFilter::parse(None, None, Some("%RDI")).unwrap();
+        assert_eq!(f.writes_regs, ["rdi"]);
+        assert!(f.matches(&pop_rdi));
+        assert!(!f.matches(&bare_ret));
+
+        let f = SemanticFilter::parse(None, None, Some("rdi,rsi")).unwrap();
+        assert!(!f.matches(&pop_rdi), "all-of, not any-of");
+
+        assert!(SemanticFilter::parse(Some("nope"), None, None).is_err());
+        assert!(SemanticFilter::parse(None, Some("stack_pivot"), None).is_err());
     }
 
     /// ROB-04 on the `--opcode` path, which is the same decoder and was
@@ -3359,6 +3644,54 @@ mod tests {
             .contains("KERNEL32")));
         assert!(imports[0]["symbol"].is_string());
         assert!(imports[0]["iat_vaddr"].as_str().unwrap().starts_with("0x"));
+
+        // CHWIN-03: `iat_vaddr` is the IAT slot the loader patches, NOT the
+        // IMAGE_IMPORT_BY_NAME record. Measured out of this fixture by hand:
+        // image_base 0x4ad00000, IAT directory RVA 0x29000, so
+        // msvcrt.dll!memset sits at slot 0x4ad29000 with its hint/name
+        // record at 0x4ad2af40 (which is what --info used to print).
+        let memset = imports
+            .iter()
+            .find(|i| {
+                i["dll"]
+                    .as_str()
+                    .unwrap()
+                    .eq_ignore_ascii_case("msvcrt.dll")
+                    && i["symbol"] == "memset"
+            })
+            .expect("msvcrt.dll!memset");
+        assert_eq!(memset["iat_vaddr"], "0x4ad29000");
+        assert_eq!(memset["hint_name_vaddr"], "0x4ad2af40");
+        for i in imports {
+            assert_ne!(
+                i["iat_vaddr"], i["hint_name_vaddr"],
+                "{i} — the IAT slot must not be the hint/name record"
+            );
+        }
+    }
+
+    /// CHWIN-03: `--base` slides both import addresses by the same delta.
+    #[test]
+    fn info_pe_imports_honour_base() {
+        let bytes = fixture_bytes("pe-x64-cmd-v6.1.7601");
+        let target = load_target(&bytes);
+        let info = info_json(&target, Some(0));
+        let memset = info["imports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| {
+                i["dll"]
+                    .as_str()
+                    .unwrap()
+                    .eq_ignore_ascii_case("msvcrt.dll")
+                    && i["symbol"] == "memset"
+            })
+            .expect("msvcrt.dll!memset")
+            .clone();
+        // rebased to 0 ⇒ the printed addresses are the RVAs.
+        assert_eq!(memset["iat_vaddr"], "0x29000");
+        assert_eq!(memset["hint_name_vaddr"], "0x2af40");
     }
 
     #[test]

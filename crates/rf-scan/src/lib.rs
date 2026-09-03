@@ -19,12 +19,14 @@
 pub mod anchors;
 pub mod cancel;
 pub mod cs;
+pub mod detail;
 mod engine;
 pub mod sink;
 pub mod x86;
 
 pub use anchors::TableKind;
 pub use cancel::{CancelToken, Error};
+pub use detail::{Access, Detailer, InsnDetail, InsnGroups, MemRef, Operand, OperandInfo};
 pub use engine::{
     ibt_applicable, is_call_preceded, post_process, scan_binary, scan_binary_into, scan_bounded,
     scan_section, Gadget, ScanOptions, PREV_BYTES,

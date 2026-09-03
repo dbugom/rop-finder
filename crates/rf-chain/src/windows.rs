@@ -281,8 +281,11 @@ fn emit_api_call64(
     // (rf-core pe.rs) — sanitise it here as well as at render time so the
     // IR (and its JSON form) never carries attacker-controlled control
     // characters either.
+    // CHWIN-03: `iat_slot_vaddr`, not the IMAGE_IMPORT_BY_NAME record. The
+    // deref below reads a pointer-sized cell; the old value pointed at the
+    // hint + name string, so `mov rax, [rax]` loaded eight bytes of ASCII.
     b.data(
-        imp.thunk_vaddr,
+        imp.iat_slot_vaddr,
         format!("@ IAT {} ({})", opts.api_name, py_comment(&imp.dll)),
     );
     b.padding(pop_rax, &[]);
@@ -435,8 +438,12 @@ mod tests {
         vec![PeImport {
             dll: "KERNEL32.dll".into(),
             name: "VirtualProtect".into(),
-            thunk_rva: 0x2000,
-            thunk_vaddr: 0x502000,
+            // CHWIN-03: the IAT slot the loader patches (8-byte aligned
+            // pointer cell), not the IMAGE_IMPORT_BY_NAME record.
+            iat_slot_rva: 0x2000,
+            iat_slot_vaddr: 0x502000,
+            hint_name_rva: 0x3000,
+            hint_name_vaddr: 0x503000,
         }]
     }
 
@@ -447,8 +454,12 @@ mod tests {
         vec![PeImport {
             dll: "KERNEL32\nimport os\nos.system('id')\n.dll".into(),
             name: "VirtualProtect".into(),
-            thunk_rva: 0x2000,
-            thunk_vaddr: 0x502000,
+            // CHWIN-03: the IAT slot the loader patches (8-byte aligned
+            // pointer cell), not the IMAGE_IMPORT_BY_NAME record.
+            iat_slot_rva: 0x2000,
+            iat_slot_vaddr: 0x502000,
+            hint_name_rva: 0x3000,
+            hint_name_vaddr: 0x503000,
         }]
     }
 
@@ -613,6 +624,46 @@ mod tests {
         let jmp = texts.iter().position(|t| *t == "jmp rax").unwrap();
         // jmp rax is the transfer word; it must be at an even index
         assert_eq!(jmp % 2, 0);
+    }
+
+    /// CHWIN-03. The word that `mov rax, qword ptr [rax]` dereferences must
+    /// be the IAT slot — the pointer-sized cell the loader patches — and
+    /// never the `IMAGE_IMPORT_BY_NAME` record, which holds `VirtualProtect`
+    /// as ASCII. Deref the wrong one and rax becomes 0x74726956... .
+    #[test]
+    fn win64_iat_word_is_the_slot_not_the_hint_name_record() {
+        let g = win64_pop_set();
+        let imports = vp_import();
+        let imp = &imports[0];
+        assert_ne!(
+            imp.iat_slot_vaddr, imp.hint_name_vaddr,
+            "the fixture must distinguish the two addresses"
+        );
+        let chain = build_windows_virtualprotect(
+            &g,
+            &data(),
+            &imports,
+            Arch::X64,
+            "pe",
+            &WinChainOpts::default(), // no api_addr → IAT path
+            &[],
+        )
+        .unwrap();
+        let word = chain
+            .words
+            .iter()
+            .find(|w| w.comment.contains("@ IAT VirtualProtect"))
+            .expect("IAT word");
+        assert_eq!(word.value, imp.iat_slot_vaddr);
+        assert_ne!(word.value, imp.hint_name_vaddr);
+        // A pointer cell is pointer-aligned; a hint/name record is not.
+        assert_eq!(word.value % 8, 0, "{:#x} is not a 64-bit slot", word.value);
+        // Nothing anywhere in the chain leaks the hint/name address.
+        assert!(
+            !chain.words.iter().any(|w| w.value == imp.hint_name_vaddr),
+            "hint/name record {:#x} must never appear in a chain",
+            imp.hint_name_vaddr
+        );
     }
 
     #[test]

@@ -45,6 +45,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::json;
 
+use crate::schema::ErrorCode;
 use crate::ToolError;
 
 /// Root identity as recorded at startup: `(dev, ino)` on Unix,
@@ -134,10 +135,11 @@ impl ConfinedFile {
             .map_err(|_| denied_read())?;
         if buf.len() as u64 > max_bytes {
             return Err(ToolError::with_details(
-                "file_too_large",
+                ErrorCode::ResourceExhausted,
                 format!("binary exceeds the {max_bytes}-byte --max-file-bytes cap"),
                 json!({"limit": "max_file_bytes", "limit_value": max_bytes}),
-            ));
+            )
+            .with_kind("file_too_large"));
         }
         Ok(buf)
     }
@@ -153,7 +155,7 @@ pub fn path_denied(roots: &[AllowRoot]) -> ToolError {
         .map(|r| r.display_path().display().to_string())
         .collect();
     ToolError::with_details(
-        "path_denied",
+        ErrorCode::PathDenied,
         format!(
             "binary_path is not inside an allowed directory. Allowed: [{}]. \
              Call get_server_config for the effective allowlist.",
@@ -164,7 +166,11 @@ pub fn path_denied(roots: &[AllowRoot]) -> ToolError {
 }
 
 fn denied_read() -> ToolError {
-    ToolError::new("io_error", "cannot read the confined binary")
+    ToolError::new(
+        ErrorCode::UnsupportedBinary,
+        "cannot read the confined binary",
+    )
+    .with_kind("io_error")
 }
 
 /// Open a file confined to `roots` and return its handle.
@@ -200,7 +206,7 @@ pub fn open_confined_with(
     let detail = |what: &str| -> ToolError {
         if verbose {
             ToolError::with_details(
-                "path_denied",
+                ErrorCode::PathDenied,
                 format!(
                     "{vlabel:?} is inside allow root {} but could not be opened: {what}",
                     root.display_path().display()
@@ -224,10 +230,11 @@ pub fn open_confined_with(
     let len = md.len();
     if len > max_bytes {
         return Err(ToolError::with_details(
-            "file_too_large",
+            ErrorCode::ResourceExhausted,
             format!("binary is {len} bytes; the --max-file-bytes cap is {max_bytes}"),
             json!({"limit": "max_file_bytes", "limit_value": max_bytes, "got": len}),
-        ));
+        )
+        .with_kind("file_too_large"));
     }
     Ok(ConfinedFile { file, len, label })
 }
@@ -596,7 +603,7 @@ mod tests {
         std::fs::write(evil.join("x.bin"), b"secret").unwrap();
         let roots = vec![AllowRoot::open(&root).unwrap()];
         let err = open_confined(&roots, &plain(&evil.join("x.bin")), CAP).unwrap_err();
-        assert_eq!(err.code, "path_denied");
+        assert_eq!(err.code, ErrorCode::PathDenied);
     }
 
     /// MCP-07 regression: absent / directory / existing-file outside the
@@ -644,7 +651,7 @@ mod tests {
             format!("{base}/a\0.bin"),
         ] {
             let err = open_confined(&roots, &bad, CAP).unwrap_err();
-            assert_eq!(err.code, "path_denied", "{bad:?}");
+            assert_eq!(err.code, ErrorCode::PathDenied, "{bad:?}");
         }
     }
 
@@ -669,7 +676,7 @@ mod tests {
             format!(r"{base}\a.bin:secret"),
         ] {
             let err = open_confined(&roots, &bad, CAP).unwrap_err();
-            assert_eq!(err.code, "path_denied", "{bad:?}");
+            assert_eq!(err.code, ErrorCode::PathDenied, "{bad:?}");
         }
     }
 
@@ -680,7 +687,7 @@ mod tests {
         std::fs::create_dir_all(root.join("sub")).unwrap();
         let roots = vec![AllowRoot::open(&root).unwrap()];
         let err = open_confined(&roots, &plain(&root.join("sub")), CAP).unwrap_err();
-        assert_eq!(err.code, "path_denied");
+        assert_eq!(err.code, ErrorCode::PathDenied);
         assert!(!err.message.contains("regular file"), "{err:?}");
     }
 
@@ -692,7 +699,7 @@ mod tests {
         std::fs::write(root.join("big.bin"), vec![0u8; 4096]).unwrap();
         let roots = vec![AllowRoot::open(&root).unwrap()];
         let err = open_confined(&roots, &plain(&root.join("big.bin")), 1024).unwrap_err();
-        assert_eq!(err.code, "file_too_large");
+        assert_eq!(err.kind, "file_too_large");
     }
 
     /// Verbose detail is scoped to paths that already selected a root: a
@@ -748,7 +755,7 @@ mod tests {
         };
         let roots = vec![AllowRoot::open(&root).unwrap()];
         let err = open_confined(&roots, &plain(&link), CAP).unwrap_err();
-        assert_eq!(err.code, "path_denied");
+        assert_eq!(err.code, ErrorCode::PathDenied);
     }
 
     #[test]
@@ -789,7 +796,7 @@ mod tests {
         // The final `openat` sets O_NONBLOCK precisely so this returns
         // instead of blocking in open(2) waiting for a writer.
         let err = open_confined(&roots, &plain(&fifo), CAP).unwrap_err();
-        assert_eq!(err.code, "path_denied");
+        assert_eq!(err.code, ErrorCode::PathDenied);
     }
 
     #[cfg(unix)]

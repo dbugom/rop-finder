@@ -1,6 +1,6 @@
 [
   {
-    "description": "Build a ROP chain. target must be \"linux-execve\" (ELF x86/x64 only, ported from ROPgadget's ropmaker: x86 int 0x80 / x64 syscall, \"/bin//sh\" written to a writable section). Returns the chain IR as JSON (words with kinds gadget / immediate / data / padding plus the referenced gadget table), the equivalent python exploit script, arch, description and word_count. Fails with a structured chain_error when the binary lacks the required gadgets. Chain builds bypass the gadget cache.",
+    "description": "Build a ROP chain. target must be \"linux-execve\" (ELF x86/x64 only, ported from ROPgadget's ropmaker: x86 int 0x80 / x64 syscall, \"/bin//sh\" written to a writable section) or \"windows-virtualprotect\". Returns the chain IR as JSON (words with kinds gadget_addr / immediate / data_addr / code_addr / padding plus the referenced gadget table, each entry carrying the same stable id find_gadgets returns), the equivalent python exploit script, arch, description and word_count. A binary that lacks a required gadget fails with not_found. Chain builds bypass the gadget cache.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -93,10 +93,210 @@
       ],
       "type": "object"
     },
-    "name": "build_rop_chain"
+    "name": "build_rop_chain",
+    "outputSchema": {
+      "$defs": {
+        "ChainGadgetRef": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "description": "The same stable id `find_gadgets` returns, so an agent can look the\ngadget up with `get_gadgets`. `null` when the chain's scan no longer\nholds the gadget's bytes.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "vaddr": {
+              "type": "string"
+            },
+            "vaddr_u64": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "vaddr",
+            "vaddr_u64",
+            "text"
+          ],
+          "type": "object"
+        },
+        "ChainIr": {
+          "additionalProperties": false,
+          "properties": {
+            "arch": {
+              "type": "string"
+            },
+            "description": {
+              "type": "string"
+            },
+            "gadgets": {
+              "items": {
+                "$ref": "#/$defs/ChainGadgetRef"
+              },
+              "type": "array"
+            },
+            "script_comment": {
+              "type": "string"
+            },
+            "word_size": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "words": {
+              "items": {
+                "$ref": "#/$defs/ChainWordRecord"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "arch",
+            "description",
+            "script_comment",
+            "word_size",
+            "words",
+            "gadgets"
+          ],
+          "type": "object"
+        },
+        "ChainWordRecord": {
+          "additionalProperties": false,
+          "properties": {
+            "comment": {
+              "type": "string"
+            },
+            "kind": {
+              "description": "`gadget_addr`, `immediate`, `data_addr`, `code_addr` or `padding`.",
+              "type": "string"
+            },
+            "source_gadget": {
+              "description": "Index into `chain.gadgets` for a `gadget_addr` word; `null`\notherwise. It used to be omitted rather than null.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "value": {
+              "description": "Hex, so a 64-bit word survives a JSON parser with 53-bit numbers.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "value",
+            "kind",
+            "comment"
+          ],
+          "type": "object"
+        },
+        "Warning": {
+          "additionalProperties": false,
+          "description": "A non-fatal fact the agent has to know to read the result correctly\n(CRIT-03 item 4).\n\n`fallback_section_names` used to be a bare boolean with no explanation,\nand truncation was announced nowhere at all. Every entry has a stable\n`code` to branch on and a `message` to show a human.",
+          "properties": {
+            "code": {
+              "description": "Stable machine-readable tag: `low_confidence_classification`,\n`fallback_section_names`, `universal_slice_selected`, `truncated`,\n`sections_truncated`, `imports_truncated`, `ids_not_found`,\n`unmapped_info_fields`.",
+              "type": "string"
+            },
+            "detail": {
+              "description": "Free-form detail (the slice name, the architecture, …).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "field": {
+              "description": "The response field the warning is about, when it is about one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "Human-readable explanation.",
+              "type": "string"
+            },
+            "returned": {
+              "description": "Entries returned in that field.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "total": {
+              "description": "Entries that exist.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "arch": {
+          "type": "string"
+        },
+        "binary_label": {
+          "type": "string"
+        },
+        "binary_sha256": {
+          "type": "string"
+        },
+        "chain": {
+          "$ref": "#/$defs/ChainIr"
+        },
+        "description": {
+          "type": "string"
+        },
+        "python": {
+          "description": "The equivalent python exploit script.",
+          "type": "string"
+        },
+        "warnings": {
+          "items": {
+            "$ref": "#/$defs/Warning"
+          },
+          "type": "array"
+        },
+        "word_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "chain",
+        "python",
+        "arch",
+        "description",
+        "word_count",
+        "binary_sha256",
+        "binary_label",
+        "warnings"
+      ],
+      "type": "object"
+    }
   },
   {
-    "description": "Find ROP gadgets in a binary (ret-terminated). Returns up to max_results gadgets (default 1000) plus total_count and a truncated flag. Set sort_by=\"quality\" to rank gadgets by the Phase 5 quality score (cleanest first) before sampling. binary_path must be an absolute path inside one of the server's allow_roots (call get_server_config to list them); anything else returns path_denied. depth above max_depth is rejected, not clamped.",
+    "description": "Find ROP gadgets in a binary (ret-terminated). Results are RANKED by default (order=\"rank\": usability tier, then quality, then fewest instructions, then fewest side effects, then address), so the first page is the useful gadgets rather than the alphabetical head; order=\"address\"|\"quality\"|\"text\" are also accepted. Every record carries a stable id, the classification (class, labels, regs_written, regs_read, regs_from_stack, side_effects, terminator, usability) and delay_slot. Filter server-side with class/label/writes_reg/reads_reg/preserves_regs/from_stack/terminator/max_side_effects/max_insns instead of pulling gadgets into context. Page with next_cursor. binary_path must be an absolute path inside one of the server's allow_roots (call get_server_config to list them); anything else returns path_denied. depth above max_depth is rejected, not clamped. A request that exceeds timeout_secs is STOPPED, not orphaned, and notifications/cancelled stops it too.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -125,6 +325,20 @@
           "description": "Absolute path to the binary; must be inside one of the server's\nallow_roots (get_server_config lists them).",
           "type": "string"
         },
+        "class": {
+          "description": "Keep only gadgets whose primary class is one of these\n(comma-separated): reg-write, stack-pivot, mem-read, mem-write,\narithmetic, syscall, dispatcher, other.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor": {
+          "description": "`next_cursor` from a previous page of THIS query. Re-send every\nother parameter unchanged; `max_results` and `timeout_secs` may\nchange. A cursor from a different query returns `cursor_expired`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "depth": {
           "description": "Search depth (default 10).",
           "format": "uint",
@@ -134,9 +348,41 @@
             "null"
           ]
         },
+        "from_stack": {
+          "description": "Require the `writes_reg` registers to be loaded off the STACK (a\npop, or a stack-based load), which is what makes them controllable\nfrom the chain payload. With no `writes_reg`, requires at least one\nstack-loaded register.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "label": {
+          "description": "Keep only gadgets carrying at least one of these labels (same\nvocabulary as `class`; a gadget can earn several).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_insns": {
+          "description": "Keep only gadgets with at most this many instructions.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "max_results": {
-          "description": "Maximum gadgets returned (default 1000, hard max 50000).",
+          "description": "Maximum gadgets returned per page (default 1000, hard max 50000).",
           "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_side_effects": {
+          "description": "Keep only gadgets with at most this many side effects.",
+          "format": "uint32",
           "minimum": 0,
           "type": [
             "integer",
@@ -157,8 +403,29 @@
             "null"
           ]
         },
+        "order": {
+          "description": "Result ordering, applied BEFORE paging. \"rank\" (the default) is\nusability tier, then quality, then fewest instructions, then fewest\nside effects, then address — it is what puts `pop rdi ; ret` at the\ntop instead of `adc al, 0x89 ; retf 0xc281`. Also \"address\",\n\"quality\" and \"text\" (the pre-0.3 default). Anything else is\nrejected with the valid set in the error.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preserves_regs": {
+          "description": "Keep only gadgets that write NONE of these registers — \"do not\nclobber rsi or rdx\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "range": {
           "description": "Address range to scan, \"0xSTART-0xEND\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reads_reg": {
+          "description": "Keep only gadgets that read ALL of these registers.",
           "type": [
             "string",
             "null"
@@ -172,7 +439,14 @@
           ]
         },
         "sort_by": {
-          "description": "Result ordering before sampling: \"quality\" sorts by the Phase 5\nquality score (best gadgets first, ties by address). Anything\nelse is rejected.",
+          "description": "Deprecated alias for `order`, kept because it used to be the only\nway to ask for anything but traversal order. Ignored when `order`\nis given.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "terminator": {
+          "description": "Keep only gadgets with this terminator kind: \"ret\" (every returning\nform), \"jmp\", \"call\", \"syscall\", \"none\", or \"any\".",
           "type": [
             "string",
             "null"
@@ -186,6 +460,13 @@
             "integer",
             "null"
           ]
+        },
+        "writes_reg": {
+          "description": "Keep only gadgets that write ALL of these registers\n(comma-separated, e.g. \"rdi\"). Names are matched lowercase and\nwithout a `$`/`%` sigil.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -193,10 +474,315 @@
       ],
       "type": "object"
     },
-    "name": "find_gadgets"
+    "name": "find_gadgets",
+    "outputSchema": {
+      "$defs": {
+        "GadgetRecord": {
+          "additionalProperties": false,
+          "description": "One gadget, in the shape every gadget-returning tool emits.\n\nInvariant: the field set does not depend on the request. A gadget from a\nscan with no `section` parameter carries `\"section\": null`, not a missing\nkey; an x86-64 ELF carries `\"arch\": null` and `\"delay_slot\": false`, not\nnothing at all. `tests/schema_conformance.rs` asserts the four shapes\nthat used to differ — plain, `section=.text`, MIPS, and the fat Mach-O —\nhave identical key sets.",
+          "properties": {
+            "arch": {
+              "description": "Fat Mach-O slice this gadget came from; `null` for every other\ncontainer.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "bytes": {
+              "description": "Gadget bytes, lowercase hex.",
+              "type": "string"
+            },
+            "class": {
+              "description": "Primary class (`reg-write`, `stack-pivot`, `mem-read`, `mem-write`,\n`arithmetic`, `syscall`, `dispatcher`, `other`); `null` when the\narchitecture has no classifier.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "delay_slot": {
+              "description": "MIPS/SPARC: the LAST instruction is the branch's delay slot, so it\nexecutes **before** control transfers. `rf_scan` has always computed\nthis and every output boundary dropped it.",
+              "type": "boolean"
+            },
+            "dispatcher": {
+              "description": "JOP/COP dispatcher heuristic.",
+              "type": "boolean"
+            },
+            "id": {
+              "description": "Stable identity: `g_` + base32 of the first 10 bytes of\n`blake3(binary_sha256 || vaddr_le || bytes)`. Independent of every\nscan parameter, so the same gadget has the same id across calls,\nprocesses and cache evictions. Pass a list of these to\n`get_gadgets`.",
+              "type": "string"
+            },
+            "insns": {
+              "description": "The instructions, already split.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "labels": {
+              "description": "Every class the gadget earns, not just the primary one.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "low_confidence": {
+              "description": "The classification came from disassembly text rather than decoder\nmetadata, so treat the semantic fields as advisory.",
+              "type": "boolean"
+            },
+            "privileged": {
+              "description": "Contains a privileged or undefined instruction, so it faults in user\nmode and cannot appear in a chain.",
+              "type": "boolean"
+            },
+            "quality": {
+              "description": "TAXONOMY.md R12 quality score, higher is cleaner.",
+              "format": "int32",
+              "type": "integer"
+            },
+            "regs_from_stack": {
+              "description": "The subset of `regs_written` loaded off the stack — the registers a\nchain payload can actually control.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "regs_read": {
+              "description": "Registers the gadget reads.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "regs_written": {
+              "description": "Registers the gadget writes, lowercase and sigil-free.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "section": {
+              "description": "Section containing the gadget; `null` when no `section` filter was\napplied (the scan then has no section table to consult).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "side_effects": {
+              "description": "Instructions that earn at least one label.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stack_delta": {
+              "description": "Net change to the stack pointer. **Always `null` in v0.3**: the\ncomputation is ECO-07/CLS-09 and lands in v0.4. The field is here\nnow so the record shape does not change when it does.",
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "terminator": {
+              "description": "How the gadget hands control on: `ret`, `ret-imm`, `retf`, `iret`,\n`far`, `jmp`, `call`, `syscall`, `none`.",
+              "type": "string"
+            },
+            "text": {
+              "description": "`insns.join(\" ; \")`.",
+              "type": "string"
+            },
+            "usability": {
+              "description": "Usability tier 0..=3 — the primary key of the default `rank` order.\n3 = bare return plus a stack-loaded register; 2 = bare return;\n1 = needs a dispatcher or a stack fix-up, or nothing was identified;\n0 = privileged, or pure control flow.",
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "vaddr": {
+              "description": "Zero-padded hex address, for humans. The padding width is 8 on a\n32-bit target and 16 on a 64-bit one, which is why `vaddr_u64`\nexists.",
+              "type": "string"
+            },
+            "vaddr_u64": {
+              "description": "The same address as a number. Agents doing arithmetic should use\nthis and never parse `vaddr`.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id",
+            "vaddr",
+            "vaddr_u64",
+            "bytes",
+            "text",
+            "insns",
+            "delay_slot",
+            "labels",
+            "regs_written",
+            "regs_read",
+            "regs_from_stack",
+            "side_effects",
+            "quality",
+            "usability",
+            "terminator",
+            "dispatcher",
+            "privileged",
+            "low_confidence"
+          ],
+          "type": "object"
+        },
+        "Warning": {
+          "additionalProperties": false,
+          "description": "A non-fatal fact the agent has to know to read the result correctly\n(CRIT-03 item 4).\n\n`fallback_section_names` used to be a bare boolean with no explanation,\nand truncation was announced nowhere at all. Every entry has a stable\n`code` to branch on and a `message` to show a human.",
+          "properties": {
+            "code": {
+              "description": "Stable machine-readable tag: `low_confidence_classification`,\n`fallback_section_names`, `universal_slice_selected`, `truncated`,\n`sections_truncated`, `imports_truncated`, `ids_not_found`,\n`unmapped_info_fields`.",
+              "type": "string"
+            },
+            "detail": {
+              "description": "Free-form detail (the slice name, the architecture, …).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "field": {
+              "description": "The response field the warning is about, when it is about one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "Human-readable explanation.",
+              "type": "string"
+            },
+            "returned": {
+              "description": "Entries returned in that field.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "total": {
+              "description": "Entries that exist.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "binary_label": {
+          "description": "The binary's path relative to its allow root — what the audit log\nrecords, and never the caller's spelling of the path.",
+          "type": "string"
+        },
+        "binary_sha256": {
+          "description": "SHA-256 of the analysed file.",
+          "type": "string"
+        },
+        "cache": {
+          "description": "`hit` when the gadget set came from a cache (in memory, pinned for\na cursor, or authenticated from disk), `miss` when it was scanned.",
+          "type": "string"
+        },
+        "cache_key": {
+          "description": "Key of the cached scan; the second path component of `resource_uri`.",
+          "type": "string"
+        },
+        "fallback_section_names": {
+          "description": "The binary has no section names and synthetic `PT_LOAD#n` names were\nmatched instead. Also reported in `warnings`.",
+          "type": "boolean"
+        },
+        "gadgets": {
+          "items": {
+            "$ref": "#/$defs/GadgetRecord"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "description": "Opaque token for the next page; `null` on the last one. Send it back\nas `cursor` with the SAME query parameters.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Index of this page's first gadget within the ordered result.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "order": {
+          "description": "The order actually applied: `rank`, `address`, `quality`, `text` or\n`ids`. Echoed because the default changed to `rank` and an agent\nmust not have to assume.",
+          "type": "string"
+        },
+        "resource_uri": {
+          "description": "`ropfinder://scan/<cache_key>/gadgets.ndjson` — the WHOLE ordered\nresult, one `GadgetRecord` per line, readable with `resources/read`.\nPresent only when the result was paged.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "returned": {
+          "description": "Gadgets in this page.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_count": {
+          "description": "Gadgets matching the query, before paging.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncated": {
+          "description": "`total_count > offset + returned`.",
+          "type": "boolean"
+        },
+        "warnings": {
+          "description": "Non-fatal facts. Always present; `[]` when there are none.",
+          "items": {
+            "$ref": "#/$defs/Warning"
+          },
+          "type": "array"
+        },
+        "workspace_file": {
+          "description": "The same NDJSON as a real file, when the server was started with\n`--workspace-dir`. An agent with filesystem tools should grep this\ninstead of paging.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "gadgets",
+        "total_count",
+        "returned",
+        "offset",
+        "truncated",
+        "order",
+        "binary_sha256",
+        "binary_label",
+        "cache",
+        "cache_key",
+        "fallback_section_names",
+        "warnings"
+      ],
+      "type": "object"
+    }
   },
   {
-    "description": "Find JOP gadgets in a binary (jmp/call-terminated). Same parameters and caps as find_gadgets.",
+    "description": "Find JOP gadgets in a binary (jmp/call-terminated). Same parameters, ranking, filters, cursor and caps as find_gadgets.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -225,6 +811,20 @@
           "description": "Absolute path to the binary; must be inside one of the server's\nallow_roots (get_server_config lists them).",
           "type": "string"
         },
+        "class": {
+          "description": "Keep only gadgets whose primary class is one of these\n(comma-separated): reg-write, stack-pivot, mem-read, mem-write,\narithmetic, syscall, dispatcher, other.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor": {
+          "description": "`next_cursor` from a previous page of THIS query. Re-send every\nother parameter unchanged; `max_results` and `timeout_secs` may\nchange. A cursor from a different query returns `cursor_expired`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "depth": {
           "description": "Search depth (default 10).",
           "format": "uint",
@@ -234,9 +834,41 @@
             "null"
           ]
         },
+        "from_stack": {
+          "description": "Require the `writes_reg` registers to be loaded off the STACK (a\npop, or a stack-based load), which is what makes them controllable\nfrom the chain payload. With no `writes_reg`, requires at least one\nstack-loaded register.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "label": {
+          "description": "Keep only gadgets carrying at least one of these labels (same\nvocabulary as `class`; a gadget can earn several).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_insns": {
+          "description": "Keep only gadgets with at most this many instructions.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "max_results": {
-          "description": "Maximum gadgets returned (default 1000, hard max 50000).",
+          "description": "Maximum gadgets returned per page (default 1000, hard max 50000).",
           "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_side_effects": {
+          "description": "Keep only gadgets with at most this many side effects.",
+          "format": "uint32",
           "minimum": 0,
           "type": [
             "integer",
@@ -257,8 +889,29 @@
             "null"
           ]
         },
+        "order": {
+          "description": "Result ordering, applied BEFORE paging. \"rank\" (the default) is\nusability tier, then quality, then fewest instructions, then fewest\nside effects, then address — it is what puts `pop rdi ; ret` at the\ntop instead of `adc al, 0x89 ; retf 0xc281`. Also \"address\",\n\"quality\" and \"text\" (the pre-0.3 default). Anything else is\nrejected with the valid set in the error.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preserves_regs": {
+          "description": "Keep only gadgets that write NONE of these registers — \"do not\nclobber rsi or rdx\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "range": {
           "description": "Address range to scan, \"0xSTART-0xEND\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reads_reg": {
+          "description": "Keep only gadgets that read ALL of these registers.",
           "type": [
             "string",
             "null"
@@ -272,7 +925,14 @@
           ]
         },
         "sort_by": {
-          "description": "Result ordering before sampling: \"quality\" sorts by the Phase 5\nquality score (best gadgets first, ties by address). Anything\nelse is rejected.",
+          "description": "Deprecated alias for `order`, kept because it used to be the only\nway to ask for anything but traversal order. Ignored when `order`\nis given.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "terminator": {
+          "description": "Keep only gadgets with this terminator kind: \"ret\" (every returning\nform), \"jmp\", \"call\", \"syscall\", \"none\", or \"any\".",
           "type": [
             "string",
             "null"
@@ -286,6 +946,13 @@
             "integer",
             "null"
           ]
+        },
+        "writes_reg": {
+          "description": "Keep only gadgets that write ALL of these registers\n(comma-separated, e.g. \"rdi\"). Names are matched lowercase and\nwithout a `$`/`%` sigil.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -293,10 +960,315 @@
       ],
       "type": "object"
     },
-    "name": "find_jop_gadgets"
+    "name": "find_jop_gadgets",
+    "outputSchema": {
+      "$defs": {
+        "GadgetRecord": {
+          "additionalProperties": false,
+          "description": "One gadget, in the shape every gadget-returning tool emits.\n\nInvariant: the field set does not depend on the request. A gadget from a\nscan with no `section` parameter carries `\"section\": null`, not a missing\nkey; an x86-64 ELF carries `\"arch\": null` and `\"delay_slot\": false`, not\nnothing at all. `tests/schema_conformance.rs` asserts the four shapes\nthat used to differ — plain, `section=.text`, MIPS, and the fat Mach-O —\nhave identical key sets.",
+          "properties": {
+            "arch": {
+              "description": "Fat Mach-O slice this gadget came from; `null` for every other\ncontainer.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "bytes": {
+              "description": "Gadget bytes, lowercase hex.",
+              "type": "string"
+            },
+            "class": {
+              "description": "Primary class (`reg-write`, `stack-pivot`, `mem-read`, `mem-write`,\n`arithmetic`, `syscall`, `dispatcher`, `other`); `null` when the\narchitecture has no classifier.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "delay_slot": {
+              "description": "MIPS/SPARC: the LAST instruction is the branch's delay slot, so it\nexecutes **before** control transfers. `rf_scan` has always computed\nthis and every output boundary dropped it.",
+              "type": "boolean"
+            },
+            "dispatcher": {
+              "description": "JOP/COP dispatcher heuristic.",
+              "type": "boolean"
+            },
+            "id": {
+              "description": "Stable identity: `g_` + base32 of the first 10 bytes of\n`blake3(binary_sha256 || vaddr_le || bytes)`. Independent of every\nscan parameter, so the same gadget has the same id across calls,\nprocesses and cache evictions. Pass a list of these to\n`get_gadgets`.",
+              "type": "string"
+            },
+            "insns": {
+              "description": "The instructions, already split.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "labels": {
+              "description": "Every class the gadget earns, not just the primary one.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "low_confidence": {
+              "description": "The classification came from disassembly text rather than decoder\nmetadata, so treat the semantic fields as advisory.",
+              "type": "boolean"
+            },
+            "privileged": {
+              "description": "Contains a privileged or undefined instruction, so it faults in user\nmode and cannot appear in a chain.",
+              "type": "boolean"
+            },
+            "quality": {
+              "description": "TAXONOMY.md R12 quality score, higher is cleaner.",
+              "format": "int32",
+              "type": "integer"
+            },
+            "regs_from_stack": {
+              "description": "The subset of `regs_written` loaded off the stack — the registers a\nchain payload can actually control.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "regs_read": {
+              "description": "Registers the gadget reads.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "regs_written": {
+              "description": "Registers the gadget writes, lowercase and sigil-free.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "section": {
+              "description": "Section containing the gadget; `null` when no `section` filter was\napplied (the scan then has no section table to consult).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "side_effects": {
+              "description": "Instructions that earn at least one label.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stack_delta": {
+              "description": "Net change to the stack pointer. **Always `null` in v0.3**: the\ncomputation is ECO-07/CLS-09 and lands in v0.4. The field is here\nnow so the record shape does not change when it does.",
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "terminator": {
+              "description": "How the gadget hands control on: `ret`, `ret-imm`, `retf`, `iret`,\n`far`, `jmp`, `call`, `syscall`, `none`.",
+              "type": "string"
+            },
+            "text": {
+              "description": "`insns.join(\" ; \")`.",
+              "type": "string"
+            },
+            "usability": {
+              "description": "Usability tier 0..=3 — the primary key of the default `rank` order.\n3 = bare return plus a stack-loaded register; 2 = bare return;\n1 = needs a dispatcher or a stack fix-up, or nothing was identified;\n0 = privileged, or pure control flow.",
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "vaddr": {
+              "description": "Zero-padded hex address, for humans. The padding width is 8 on a\n32-bit target and 16 on a 64-bit one, which is why `vaddr_u64`\nexists.",
+              "type": "string"
+            },
+            "vaddr_u64": {
+              "description": "The same address as a number. Agents doing arithmetic should use\nthis and never parse `vaddr`.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id",
+            "vaddr",
+            "vaddr_u64",
+            "bytes",
+            "text",
+            "insns",
+            "delay_slot",
+            "labels",
+            "regs_written",
+            "regs_read",
+            "regs_from_stack",
+            "side_effects",
+            "quality",
+            "usability",
+            "terminator",
+            "dispatcher",
+            "privileged",
+            "low_confidence"
+          ],
+          "type": "object"
+        },
+        "Warning": {
+          "additionalProperties": false,
+          "description": "A non-fatal fact the agent has to know to read the result correctly\n(CRIT-03 item 4).\n\n`fallback_section_names` used to be a bare boolean with no explanation,\nand truncation was announced nowhere at all. Every entry has a stable\n`code` to branch on and a `message` to show a human.",
+          "properties": {
+            "code": {
+              "description": "Stable machine-readable tag: `low_confidence_classification`,\n`fallback_section_names`, `universal_slice_selected`, `truncated`,\n`sections_truncated`, `imports_truncated`, `ids_not_found`,\n`unmapped_info_fields`.",
+              "type": "string"
+            },
+            "detail": {
+              "description": "Free-form detail (the slice name, the architecture, …).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "field": {
+              "description": "The response field the warning is about, when it is about one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "Human-readable explanation.",
+              "type": "string"
+            },
+            "returned": {
+              "description": "Entries returned in that field.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "total": {
+              "description": "Entries that exist.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "binary_label": {
+          "description": "The binary's path relative to its allow root — what the audit log\nrecords, and never the caller's spelling of the path.",
+          "type": "string"
+        },
+        "binary_sha256": {
+          "description": "SHA-256 of the analysed file.",
+          "type": "string"
+        },
+        "cache": {
+          "description": "`hit` when the gadget set came from a cache (in memory, pinned for\na cursor, or authenticated from disk), `miss` when it was scanned.",
+          "type": "string"
+        },
+        "cache_key": {
+          "description": "Key of the cached scan; the second path component of `resource_uri`.",
+          "type": "string"
+        },
+        "fallback_section_names": {
+          "description": "The binary has no section names and synthetic `PT_LOAD#n` names were\nmatched instead. Also reported in `warnings`.",
+          "type": "boolean"
+        },
+        "gadgets": {
+          "items": {
+            "$ref": "#/$defs/GadgetRecord"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "description": "Opaque token for the next page; `null` on the last one. Send it back\nas `cursor` with the SAME query parameters.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Index of this page's first gadget within the ordered result.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "order": {
+          "description": "The order actually applied: `rank`, `address`, `quality`, `text` or\n`ids`. Echoed because the default changed to `rank` and an agent\nmust not have to assume.",
+          "type": "string"
+        },
+        "resource_uri": {
+          "description": "`ropfinder://scan/<cache_key>/gadgets.ndjson` — the WHOLE ordered\nresult, one `GadgetRecord` per line, readable with `resources/read`.\nPresent only when the result was paged.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "returned": {
+          "description": "Gadgets in this page.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_count": {
+          "description": "Gadgets matching the query, before paging.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncated": {
+          "description": "`total_count > offset + returned`.",
+          "type": "boolean"
+        },
+        "warnings": {
+          "description": "Non-fatal facts. Always present; `[]` when there are none.",
+          "items": {
+            "$ref": "#/$defs/Warning"
+          },
+          "type": "array"
+        },
+        "workspace_file": {
+          "description": "The same NDJSON as a real file, when the server was started with\n`--workspace-dir`. An agent with filesystem tools should grep this\ninstead of paging.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "gadgets",
+        "total_count",
+        "returned",
+        "offset",
+        "truncated",
+        "order",
+        "binary_sha256",
+        "binary_label",
+        "cache",
+        "cache_key",
+        "fallback_section_names",
+        "warnings"
+      ],
+      "type": "object"
+    }
   },
   {
-    "description": "Find SYS gadgets in a binary (syscall/sysenter/int). Same parameters and caps as find_gadgets.",
+    "description": "Find SYS gadgets in a binary (syscall/sysenter/int). Same parameters, ranking, filters, cursor and caps as find_gadgets.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -325,6 +1297,20 @@
           "description": "Absolute path to the binary; must be inside one of the server's\nallow_roots (get_server_config lists them).",
           "type": "string"
         },
+        "class": {
+          "description": "Keep only gadgets whose primary class is one of these\n(comma-separated): reg-write, stack-pivot, mem-read, mem-write,\narithmetic, syscall, dispatcher, other.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor": {
+          "description": "`next_cursor` from a previous page of THIS query. Re-send every\nother parameter unchanged; `max_results` and `timeout_secs` may\nchange. A cursor from a different query returns `cursor_expired`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "depth": {
           "description": "Search depth (default 10).",
           "format": "uint",
@@ -334,9 +1320,41 @@
             "null"
           ]
         },
+        "from_stack": {
+          "description": "Require the `writes_reg` registers to be loaded off the STACK (a\npop, or a stack-based load), which is what makes them controllable\nfrom the chain payload. With no `writes_reg`, requires at least one\nstack-loaded register.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "label": {
+          "description": "Keep only gadgets carrying at least one of these labels (same\nvocabulary as `class`; a gadget can earn several).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_insns": {
+          "description": "Keep only gadgets with at most this many instructions.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "max_results": {
-          "description": "Maximum gadgets returned (default 1000, hard max 50000).",
+          "description": "Maximum gadgets returned per page (default 1000, hard max 50000).",
           "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_side_effects": {
+          "description": "Keep only gadgets with at most this many side effects.",
+          "format": "uint32",
           "minimum": 0,
           "type": [
             "integer",
@@ -357,8 +1375,29 @@
             "null"
           ]
         },
+        "order": {
+          "description": "Result ordering, applied BEFORE paging. \"rank\" (the default) is\nusability tier, then quality, then fewest instructions, then fewest\nside effects, then address — it is what puts `pop rdi ; ret` at the\ntop instead of `adc al, 0x89 ; retf 0xc281`. Also \"address\",\n\"quality\" and \"text\" (the pre-0.3 default). Anything else is\nrejected with the valid set in the error.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preserves_regs": {
+          "description": "Keep only gadgets that write NONE of these registers — \"do not\nclobber rsi or rdx\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "range": {
           "description": "Address range to scan, \"0xSTART-0xEND\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reads_reg": {
+          "description": "Keep only gadgets that read ALL of these registers.",
           "type": [
             "string",
             "null"
@@ -372,7 +1411,14 @@
           ]
         },
         "sort_by": {
-          "description": "Result ordering before sampling: \"quality\" sorts by the Phase 5\nquality score (best gadgets first, ties by address). Anything\nelse is rejected.",
+          "description": "Deprecated alias for `order`, kept because it used to be the only\nway to ask for anything but traversal order. Ignored when `order`\nis given.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "terminator": {
+          "description": "Keep only gadgets with this terminator kind: \"ret\" (every returning\nform), \"jmp\", \"call\", \"syscall\", \"none\", or \"any\".",
           "type": [
             "string",
             "null"
@@ -386,6 +1432,13 @@
             "integer",
             "null"
           ]
+        },
+        "writes_reg": {
+          "description": "Keep only gadgets that write ALL of these registers\n(comma-separated, e.g. \"rdi\"). Names are matched lowercase and\nwithout a `$`/`%` sigil.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -393,10 +1446,315 @@
       ],
       "type": "object"
     },
-    "name": "find_syscall_gadgets"
+    "name": "find_syscall_gadgets",
+    "outputSchema": {
+      "$defs": {
+        "GadgetRecord": {
+          "additionalProperties": false,
+          "description": "One gadget, in the shape every gadget-returning tool emits.\n\nInvariant: the field set does not depend on the request. A gadget from a\nscan with no `section` parameter carries `\"section\": null`, not a missing\nkey; an x86-64 ELF carries `\"arch\": null` and `\"delay_slot\": false`, not\nnothing at all. `tests/schema_conformance.rs` asserts the four shapes\nthat used to differ — plain, `section=.text`, MIPS, and the fat Mach-O —\nhave identical key sets.",
+          "properties": {
+            "arch": {
+              "description": "Fat Mach-O slice this gadget came from; `null` for every other\ncontainer.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "bytes": {
+              "description": "Gadget bytes, lowercase hex.",
+              "type": "string"
+            },
+            "class": {
+              "description": "Primary class (`reg-write`, `stack-pivot`, `mem-read`, `mem-write`,\n`arithmetic`, `syscall`, `dispatcher`, `other`); `null` when the\narchitecture has no classifier.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "delay_slot": {
+              "description": "MIPS/SPARC: the LAST instruction is the branch's delay slot, so it\nexecutes **before** control transfers. `rf_scan` has always computed\nthis and every output boundary dropped it.",
+              "type": "boolean"
+            },
+            "dispatcher": {
+              "description": "JOP/COP dispatcher heuristic.",
+              "type": "boolean"
+            },
+            "id": {
+              "description": "Stable identity: `g_` + base32 of the first 10 bytes of\n`blake3(binary_sha256 || vaddr_le || bytes)`. Independent of every\nscan parameter, so the same gadget has the same id across calls,\nprocesses and cache evictions. Pass a list of these to\n`get_gadgets`.",
+              "type": "string"
+            },
+            "insns": {
+              "description": "The instructions, already split.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "labels": {
+              "description": "Every class the gadget earns, not just the primary one.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "low_confidence": {
+              "description": "The classification came from disassembly text rather than decoder\nmetadata, so treat the semantic fields as advisory.",
+              "type": "boolean"
+            },
+            "privileged": {
+              "description": "Contains a privileged or undefined instruction, so it faults in user\nmode and cannot appear in a chain.",
+              "type": "boolean"
+            },
+            "quality": {
+              "description": "TAXONOMY.md R12 quality score, higher is cleaner.",
+              "format": "int32",
+              "type": "integer"
+            },
+            "regs_from_stack": {
+              "description": "The subset of `regs_written` loaded off the stack — the registers a\nchain payload can actually control.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "regs_read": {
+              "description": "Registers the gadget reads.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "regs_written": {
+              "description": "Registers the gadget writes, lowercase and sigil-free.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "section": {
+              "description": "Section containing the gadget; `null` when no `section` filter was\napplied (the scan then has no section table to consult).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "side_effects": {
+              "description": "Instructions that earn at least one label.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stack_delta": {
+              "description": "Net change to the stack pointer. **Always `null` in v0.3**: the\ncomputation is ECO-07/CLS-09 and lands in v0.4. The field is here\nnow so the record shape does not change when it does.",
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "terminator": {
+              "description": "How the gadget hands control on: `ret`, `ret-imm`, `retf`, `iret`,\n`far`, `jmp`, `call`, `syscall`, `none`.",
+              "type": "string"
+            },
+            "text": {
+              "description": "`insns.join(\" ; \")`.",
+              "type": "string"
+            },
+            "usability": {
+              "description": "Usability tier 0..=3 — the primary key of the default `rank` order.\n3 = bare return plus a stack-loaded register; 2 = bare return;\n1 = needs a dispatcher or a stack fix-up, or nothing was identified;\n0 = privileged, or pure control flow.",
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "vaddr": {
+              "description": "Zero-padded hex address, for humans. The padding width is 8 on a\n32-bit target and 16 on a 64-bit one, which is why `vaddr_u64`\nexists.",
+              "type": "string"
+            },
+            "vaddr_u64": {
+              "description": "The same address as a number. Agents doing arithmetic should use\nthis and never parse `vaddr`.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id",
+            "vaddr",
+            "vaddr_u64",
+            "bytes",
+            "text",
+            "insns",
+            "delay_slot",
+            "labels",
+            "regs_written",
+            "regs_read",
+            "regs_from_stack",
+            "side_effects",
+            "quality",
+            "usability",
+            "terminator",
+            "dispatcher",
+            "privileged",
+            "low_confidence"
+          ],
+          "type": "object"
+        },
+        "Warning": {
+          "additionalProperties": false,
+          "description": "A non-fatal fact the agent has to know to read the result correctly\n(CRIT-03 item 4).\n\n`fallback_section_names` used to be a bare boolean with no explanation,\nand truncation was announced nowhere at all. Every entry has a stable\n`code` to branch on and a `message` to show a human.",
+          "properties": {
+            "code": {
+              "description": "Stable machine-readable tag: `low_confidence_classification`,\n`fallback_section_names`, `universal_slice_selected`, `truncated`,\n`sections_truncated`, `imports_truncated`, `ids_not_found`,\n`unmapped_info_fields`.",
+              "type": "string"
+            },
+            "detail": {
+              "description": "Free-form detail (the slice name, the architecture, …).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "field": {
+              "description": "The response field the warning is about, when it is about one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "Human-readable explanation.",
+              "type": "string"
+            },
+            "returned": {
+              "description": "Entries returned in that field.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "total": {
+              "description": "Entries that exist.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "binary_label": {
+          "description": "The binary's path relative to its allow root — what the audit log\nrecords, and never the caller's spelling of the path.",
+          "type": "string"
+        },
+        "binary_sha256": {
+          "description": "SHA-256 of the analysed file.",
+          "type": "string"
+        },
+        "cache": {
+          "description": "`hit` when the gadget set came from a cache (in memory, pinned for\na cursor, or authenticated from disk), `miss` when it was scanned.",
+          "type": "string"
+        },
+        "cache_key": {
+          "description": "Key of the cached scan; the second path component of `resource_uri`.",
+          "type": "string"
+        },
+        "fallback_section_names": {
+          "description": "The binary has no section names and synthetic `PT_LOAD#n` names were\nmatched instead. Also reported in `warnings`.",
+          "type": "boolean"
+        },
+        "gadgets": {
+          "items": {
+            "$ref": "#/$defs/GadgetRecord"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "description": "Opaque token for the next page; `null` on the last one. Send it back\nas `cursor` with the SAME query parameters.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Index of this page's first gadget within the ordered result.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "order": {
+          "description": "The order actually applied: `rank`, `address`, `quality`, `text` or\n`ids`. Echoed because the default changed to `rank` and an agent\nmust not have to assume.",
+          "type": "string"
+        },
+        "resource_uri": {
+          "description": "`ropfinder://scan/<cache_key>/gadgets.ndjson` — the WHOLE ordered\nresult, one `GadgetRecord` per line, readable with `resources/read`.\nPresent only when the result was paged.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "returned": {
+          "description": "Gadgets in this page.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_count": {
+          "description": "Gadgets matching the query, before paging.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncated": {
+          "description": "`total_count > offset + returned`.",
+          "type": "boolean"
+        },
+        "warnings": {
+          "description": "Non-fatal facts. Always present; `[]` when there are none.",
+          "items": {
+            "$ref": "#/$defs/Warning"
+          },
+          "type": "array"
+        },
+        "workspace_file": {
+          "description": "The same NDJSON as a real file, when the server was started with\n`--workspace-dir`. An agent with filesystem tools should grep this\ninstead of paging.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "gadgets",
+        "total_count",
+        "returned",
+        "offset",
+        "truncated",
+        "order",
+        "binary_sha256",
+        "binary_label",
+        "cache",
+        "cache_key",
+        "fallback_section_names",
+        "warnings"
+      ],
+      "type": "object"
+    }
   },
   {
-    "description": "Get binary metadata as JSON: format, arch, endianness, addr_size, image_base, entry, sections (name/vaddr/size/executable/writable) and PE imports. No scan is performed.",
+    "description": "Get binary metadata as JSON: format, arch, endianness, addr_size, image_base, entry, sections (name/vaddr/size/executable/writable), PE imports (iat_vaddr is the IAT slot the loader patches; hint_name_vaddr is the IMAGE_IMPORT_BY_NAME record), fat Mach-O slices, binary_sha256 and warnings. The shape is fixed: an ELF reports slices: [] and a fat Mach-O reports sections: []. No scan is performed. Bounded like every other tool: timeout_secs (default 60), --max-file-bytes, and max_sections/max_imports (default 4096 each) — a truncated array is announced in warnings, never silently short.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -410,6 +1768,33 @@
         "binary_path": {
           "description": "Absolute path to the binary; must be inside one of the server's\nallow_roots (get_server_config lists them).",
           "type": "string"
+        },
+        "max_imports": {
+          "description": "Maximum imports reported (default 4096). A larger array is\ntruncated and `warnings` carries `imports_truncated`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_sections": {
+          "description": "Maximum sections reported (default 4096). A larger array is\ntruncated and `warnings` carries `sections_truncated`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "timeout_secs": {
+          "description": "Per-request timeout in seconds (default 60, max 300).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [
@@ -417,38 +1802,339 @@
       ],
       "type": "object"
     },
-    "name": "get_binary_info"
-  },
-  {
-    "description": "Report the server's effective configuration: allow_roots (the only directories binary_path may name), max_depth, max_file_bytes, max_results, max_concurrent, timeout_secs, whether an on-disk cache is enabled, and the server version. Call this first: paths outside allow_roots are refused with a single path_denied code that deliberately reveals nothing about the target.",
-    "inputSchema": {
-      "properties": {},
+    "name": "get_binary_info",
+    "outputSchema": {
+      "$defs": {
+        "ImportRecord": {
+          "additionalProperties": false,
+          "properties": {
+            "dll": {
+              "type": "string"
+            },
+            "hint_name_vaddr": {
+              "description": "The `IMAGE_IMPORT_BY_NAME` record holding the name string.",
+              "type": "string"
+            },
+            "iat_vaddr": {
+              "description": "CHWIN-03: the IAT slot the loader patches. Dereference this.",
+              "type": "string"
+            },
+            "symbol": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "dll",
+            "symbol",
+            "iat_vaddr",
+            "hint_name_vaddr"
+          ],
+          "type": "object"
+        },
+        "SectionRecord": {
+          "additionalProperties": false,
+          "properties": {
+            "executable": {
+              "type": "boolean"
+            },
+            "name": {
+              "type": "string"
+            },
+            "size": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "vaddr": {
+              "type": "string"
+            },
+            "writable": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "name",
+            "vaddr",
+            "size",
+            "executable",
+            "writable"
+          ],
+          "type": "object"
+        },
+        "SliceRecord": {
+          "additionalProperties": false,
+          "description": "One slice of a fat (Universal) Mach-O.",
+          "properties": {
+            "addr_size": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "arch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "endianness": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "entry": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "format": {
+              "type": "string"
+            },
+            "image_base": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "imports": {
+              "items": {
+                "$ref": "#/$defs/ImportRecord"
+              },
+              "type": "array"
+            },
+            "sections": {
+              "items": {
+                "$ref": "#/$defs/SectionRecord"
+              },
+              "type": "array"
+            },
+            "slice": {
+              "description": "The name `--arch` / the `arch` parameter accepts for this slice.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "slice_offset": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "slice_size": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "format",
+            "sections",
+            "imports"
+          ],
+          "type": "object"
+        },
+        "Warning": {
+          "additionalProperties": false,
+          "description": "A non-fatal fact the agent has to know to read the result correctly\n(CRIT-03 item 4).\n\n`fallback_section_names` used to be a bare boolean with no explanation,\nand truncation was announced nowhere at all. Every entry has a stable\n`code` to branch on and a `message` to show a human.",
+          "properties": {
+            "code": {
+              "description": "Stable machine-readable tag: `low_confidence_classification`,\n`fallback_section_names`, `universal_slice_selected`, `truncated`,\n`sections_truncated`, `imports_truncated`, `ids_not_found`,\n`unmapped_info_fields`.",
+              "type": "string"
+            },
+            "detail": {
+              "description": "Free-form detail (the slice name, the architecture, …).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "field": {
+              "description": "The response field the warning is about, when it is about one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "Human-readable explanation.",
+              "type": "string"
+            },
+            "returned": {
+              "description": "Entries returned in that field.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "total": {
+              "description": "Entries that exist.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "addr_size": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "arch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "arch_selection_required": {
+          "description": "Fat Mach-O only: the scan tools refuse this binary without `arch`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "binary_sha256": {
+          "type": "string"
+        },
+        "endianness": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "entry": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fat64": {
+          "description": "Fat Mach-O only.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "format": {
+          "description": "`elf`, `pe`, `macho`, `raw` or `universal`.",
+          "type": "string"
+        },
+        "image_base": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "imports": {
+          "items": {
+            "$ref": "#/$defs/ImportRecord"
+          },
+          "type": "array"
+        },
+        "sections": {
+          "items": {
+            "$ref": "#/$defs/SectionRecord"
+          },
+          "type": "array"
+        },
+        "slices": {
+          "items": {
+            "$ref": "#/$defs/SliceRecord"
+          },
+          "type": "array"
+        },
+        "warnings": {
+          "items": {
+            "$ref": "#/$defs/Warning"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "format",
+        "sections",
+        "imports",
+        "slices",
+        "binary_sha256",
+        "warnings"
+      ],
       "type": "object"
-    },
-    "name": "get_server_config"
+    }
   },
   {
-    "description": "Run a ROPgadget-style scan with explicit flags. args is a list like [\"--depth\", \"6\", \"--only\", \"pop|ret\"]. Allowlist: --depth --norop --nojop --nosys --only --filter --re --range --section --base --offset --badbytes --align --multibr --json --arch --all --callPreceded; anything else (--string, --dump, --console, ...) is rejected. --align is ROPgadget's real scan-time alignment (decimal, as in ROPgadget's argparse; write 0x.. only if you mean hex), not an address post-filter. --arch names a fat Mach-O slice and is REQUIRED for a multi-slice binary. Output is always structured JSON.",
+    "description": "Resolve stable gadget ids (the `id` field of any gadget record, e.g. \"g_ab12cd34ef56gh78\") back to full records, so a plan can name gadgets instead of re-sending their text. Rescans the binary at `depth` (default 10) and matches by id; an id is independent of every scan parameter except `base`, so pass the same `base` the ids came from. Ids that do not resolve are reported in warnings.ids_not_found rather than failing the call. Results are returned in the order the ids were given.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
-        "args": {
-          "description": "ROPgadget-style flags, e.g. [\"--depth\", \"6\", \"--only\", \"pop|ret\"].\nRestricted to the allowlist: --depth --norop --nojop --nosys --only\n--filter --re --range --section --base --offset --badbytes --align\n--multibr --json. Anything else is rejected.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
+        "arch": {
+          "description": "Architecture slice for a fat (Universal) Mach-O.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base": {
+          "description": "Rebase the image base at load time (hex string). Must match the\nscan the ids came from: an id is independent of every scan\nparameter EXCEPT `base`, which relabels the whole address space.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "binary_path": {
           "description": "Absolute path to the binary; must be inside one of the server's\nallow_roots (get_server_config lists them).",
           "type": "string"
         },
-        "max_results": {
-          "description": "Maximum gadgets returned (default 1000, hard max 50000).",
+        "depth": {
+          "description": "Search depth the ids were found at (default 10). An id from a\ndepth-10 scan will not resolve in a depth-4 one.",
           "format": "uint",
           "minimum": 0,
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "ids": {
+          "description": "Stable gadget ids, as returned in `gadgets[].id` (e.g.\n\"g_ab12cd34ef56gh78\"). Ids that do not resolve are reported in\n`warnings` rather than failing the call.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "offset": {
+          "description": "Offset added to gadget addresses after any rebase (hex string).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "section": {
+          "description": "Executable section name(s); comma-separated, `*` globbing.",
+          "type": [
+            "string",
             "null"
           ]
         },
@@ -464,14 +2150,997 @@
       },
       "required": [
         "binary_path",
+        "ids"
+      ],
+      "type": "object"
+    },
+    "name": "get_gadgets",
+    "outputSchema": {
+      "$defs": {
+        "GadgetRecord": {
+          "additionalProperties": false,
+          "description": "One gadget, in the shape every gadget-returning tool emits.\n\nInvariant: the field set does not depend on the request. A gadget from a\nscan with no `section` parameter carries `\"section\": null`, not a missing\nkey; an x86-64 ELF carries `\"arch\": null` and `\"delay_slot\": false`, not\nnothing at all. `tests/schema_conformance.rs` asserts the four shapes\nthat used to differ — plain, `section=.text`, MIPS, and the fat Mach-O —\nhave identical key sets.",
+          "properties": {
+            "arch": {
+              "description": "Fat Mach-O slice this gadget came from; `null` for every other\ncontainer.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "bytes": {
+              "description": "Gadget bytes, lowercase hex.",
+              "type": "string"
+            },
+            "class": {
+              "description": "Primary class (`reg-write`, `stack-pivot`, `mem-read`, `mem-write`,\n`arithmetic`, `syscall`, `dispatcher`, `other`); `null` when the\narchitecture has no classifier.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "delay_slot": {
+              "description": "MIPS/SPARC: the LAST instruction is the branch's delay slot, so it\nexecutes **before** control transfers. `rf_scan` has always computed\nthis and every output boundary dropped it.",
+              "type": "boolean"
+            },
+            "dispatcher": {
+              "description": "JOP/COP dispatcher heuristic.",
+              "type": "boolean"
+            },
+            "id": {
+              "description": "Stable identity: `g_` + base32 of the first 10 bytes of\n`blake3(binary_sha256 || vaddr_le || bytes)`. Independent of every\nscan parameter, so the same gadget has the same id across calls,\nprocesses and cache evictions. Pass a list of these to\n`get_gadgets`.",
+              "type": "string"
+            },
+            "insns": {
+              "description": "The instructions, already split.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "labels": {
+              "description": "Every class the gadget earns, not just the primary one.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "low_confidence": {
+              "description": "The classification came from disassembly text rather than decoder\nmetadata, so treat the semantic fields as advisory.",
+              "type": "boolean"
+            },
+            "privileged": {
+              "description": "Contains a privileged or undefined instruction, so it faults in user\nmode and cannot appear in a chain.",
+              "type": "boolean"
+            },
+            "quality": {
+              "description": "TAXONOMY.md R12 quality score, higher is cleaner.",
+              "format": "int32",
+              "type": "integer"
+            },
+            "regs_from_stack": {
+              "description": "The subset of `regs_written` loaded off the stack — the registers a\nchain payload can actually control.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "regs_read": {
+              "description": "Registers the gadget reads.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "regs_written": {
+              "description": "Registers the gadget writes, lowercase and sigil-free.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "section": {
+              "description": "Section containing the gadget; `null` when no `section` filter was\napplied (the scan then has no section table to consult).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "side_effects": {
+              "description": "Instructions that earn at least one label.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stack_delta": {
+              "description": "Net change to the stack pointer. **Always `null` in v0.3**: the\ncomputation is ECO-07/CLS-09 and lands in v0.4. The field is here\nnow so the record shape does not change when it does.",
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "terminator": {
+              "description": "How the gadget hands control on: `ret`, `ret-imm`, `retf`, `iret`,\n`far`, `jmp`, `call`, `syscall`, `none`.",
+              "type": "string"
+            },
+            "text": {
+              "description": "`insns.join(\" ; \")`.",
+              "type": "string"
+            },
+            "usability": {
+              "description": "Usability tier 0..=3 — the primary key of the default `rank` order.\n3 = bare return plus a stack-loaded register; 2 = bare return;\n1 = needs a dispatcher or a stack fix-up, or nothing was identified;\n0 = privileged, or pure control flow.",
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "vaddr": {
+              "description": "Zero-padded hex address, for humans. The padding width is 8 on a\n32-bit target and 16 on a 64-bit one, which is why `vaddr_u64`\nexists.",
+              "type": "string"
+            },
+            "vaddr_u64": {
+              "description": "The same address as a number. Agents doing arithmetic should use\nthis and never parse `vaddr`.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id",
+            "vaddr",
+            "vaddr_u64",
+            "bytes",
+            "text",
+            "insns",
+            "delay_slot",
+            "labels",
+            "regs_written",
+            "regs_read",
+            "regs_from_stack",
+            "side_effects",
+            "quality",
+            "usability",
+            "terminator",
+            "dispatcher",
+            "privileged",
+            "low_confidence"
+          ],
+          "type": "object"
+        },
+        "Warning": {
+          "additionalProperties": false,
+          "description": "A non-fatal fact the agent has to know to read the result correctly\n(CRIT-03 item 4).\n\n`fallback_section_names` used to be a bare boolean with no explanation,\nand truncation was announced nowhere at all. Every entry has a stable\n`code` to branch on and a `message` to show a human.",
+          "properties": {
+            "code": {
+              "description": "Stable machine-readable tag: `low_confidence_classification`,\n`fallback_section_names`, `universal_slice_selected`, `truncated`,\n`sections_truncated`, `imports_truncated`, `ids_not_found`,\n`unmapped_info_fields`.",
+              "type": "string"
+            },
+            "detail": {
+              "description": "Free-form detail (the slice name, the architecture, …).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "field": {
+              "description": "The response field the warning is about, when it is about one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "Human-readable explanation.",
+              "type": "string"
+            },
+            "returned": {
+              "description": "Entries returned in that field.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "total": {
+              "description": "Entries that exist.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "binary_label": {
+          "description": "The binary's path relative to its allow root — what the audit log\nrecords, and never the caller's spelling of the path.",
+          "type": "string"
+        },
+        "binary_sha256": {
+          "description": "SHA-256 of the analysed file.",
+          "type": "string"
+        },
+        "cache": {
+          "description": "`hit` when the gadget set came from a cache (in memory, pinned for\na cursor, or authenticated from disk), `miss` when it was scanned.",
+          "type": "string"
+        },
+        "cache_key": {
+          "description": "Key of the cached scan; the second path component of `resource_uri`.",
+          "type": "string"
+        },
+        "fallback_section_names": {
+          "description": "The binary has no section names and synthetic `PT_LOAD#n` names were\nmatched instead. Also reported in `warnings`.",
+          "type": "boolean"
+        },
+        "gadgets": {
+          "items": {
+            "$ref": "#/$defs/GadgetRecord"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "description": "Opaque token for the next page; `null` on the last one. Send it back\nas `cursor` with the SAME query parameters.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Index of this page's first gadget within the ordered result.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "order": {
+          "description": "The order actually applied: `rank`, `address`, `quality`, `text` or\n`ids`. Echoed because the default changed to `rank` and an agent\nmust not have to assume.",
+          "type": "string"
+        },
+        "resource_uri": {
+          "description": "`ropfinder://scan/<cache_key>/gadgets.ndjson` — the WHOLE ordered\nresult, one `GadgetRecord` per line, readable with `resources/read`.\nPresent only when the result was paged.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "returned": {
+          "description": "Gadgets in this page.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_count": {
+          "description": "Gadgets matching the query, before paging.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncated": {
+          "description": "`total_count > offset + returned`.",
+          "type": "boolean"
+        },
+        "warnings": {
+          "description": "Non-fatal facts. Always present; `[]` when there are none.",
+          "items": {
+            "$ref": "#/$defs/Warning"
+          },
+          "type": "array"
+        },
+        "workspace_file": {
+          "description": "The same NDJSON as a real file, when the server was started with\n`--workspace-dir`. An agent with filesystem tools should grep this\ninstead of paging.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "gadgets",
+        "total_count",
+        "returned",
+        "offset",
+        "truncated",
+        "order",
+        "binary_sha256",
+        "binary_label",
+        "cache",
+        "cache_key",
+        "fallback_section_names",
+        "warnings"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Report the server's effective configuration: allow_roots (the only directories binary_path may name), max_depth, max_file_bytes, max_results, max_concurrent, scan_threads, max_gadgets, timeout_secs, cursor_ttl_secs, whether an on-disk cache and a workspace directory are enabled, the complete list of `order` values, the complete list of error codes, and the server version. Call this first: paths outside allow_roots are refused with a single path_denied code that deliberately reveals nothing about the target, and a run of refusals is treated as filesystem probing.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "get_server_config",
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "allow_roots": {
+          "description": "The only directories `binary_path` may name.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "audit_log": {
+          "type": "boolean"
+        },
+        "cache": {
+          "type": "boolean"
+        },
+        "cache_mem_max_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_ttl_secs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cursor_ttl_secs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "error_codes": {
+          "description": "Every code an error can carry.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "hard_max_results": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_concurrent": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_depth": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_file_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_gadgets": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_imports": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_results": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_sections": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "orders": {
+          "description": "Every value `order` accepts.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "probe_threshold": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "scan_threads": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "timeout_secs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "version": {
+          "type": "string"
+        },
+        "workspace_dir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "allow_roots",
+        "max_depth",
+        "max_file_bytes",
+        "max_results",
+        "hard_max_results",
+        "max_concurrent",
+        "scan_threads",
+        "max_sections",
+        "max_imports",
+        "timeout_secs",
+        "cache",
+        "cache_mem_max_bytes",
+        "cache_ttl_secs",
+        "cursor_ttl_secs",
+        "audit_log",
+        "probe_threshold",
+        "orders",
+        "error_codes",
+        "version"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Report this session's counters: requests_total and requests_by_tool, ok/denied/timeout/cancelled/error totals, denied_consecutive and probing_suspected (a run of path_denied results is the signal that an agent is enumerating the filesystem), wedged_total (workers that did not stop within 5 s of being cancelled), busy_total, inflight, bytes_read_total, and the cache's hit/miss/eviction/tamper counters with its live cache_bytes against cache_mem_max_bytes.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "get_server_stats",
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "busy_total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "bytes_read_total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache": {
+          "description": "The cache counters, as `crate::cache::Cache::stats_json` renders\nthem. Left as a free-form object so the cache's own counters can\ngrow without a schema change."
+        },
+        "cancelled_total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "denied_consecutive": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "denied_consecutive_max": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "denied_total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "error_total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inflight": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ok_total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "probing_suspected": {
+          "type": "boolean"
+        },
+        "requests_by_tool": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "requests_total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "timeout_total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "wedged_total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "requests_total",
+        "requests_by_tool",
+        "ok_total",
+        "denied_total",
+        "denied_consecutive",
+        "denied_consecutive_max",
+        "timeout_total",
+        "cancelled_total",
+        "wedged_total",
+        "busy_total",
+        "error_total",
+        "bytes_read_total",
+        "inflight",
+        "probing_suspected",
+        "cache"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Run a ROPgadget-style scan with explicit flags. args is a list like [\"--depth\", \"6\", \"--only\", \"pop|ret\"]. Allowlist: --depth --norop --nojop --nosys --only --filter --re --range --section --base --offset --badbytes --align --multibr --json --arch --all --callPreceded; anything else (--string, --dump, --console, ...) is rejected. --align is ROPgadget's real scan-time alignment (decimal, as in ROPgadget's argparse; write 0x.. only if you mean hex), not an address post-filter. --arch names a fat Mach-O slice and is REQUIRED for a multi-slice binary. The result is ordered, filtered and paged exactly like find_gadgets.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "args": {
+          "description": "ROPgadget-style flags, e.g. [\"--depth\", \"6\", \"--only\", \"pop|ret\"].\nRestricted to the allowlist: --depth --norop --nojop --nosys --only\n--filter --re --range --section --base --offset --badbytes --align\n--multibr --json. Anything else is rejected.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "binary_path": {
+          "description": "Absolute path to the binary; must be inside one of the server's\nallow_roots (get_server_config lists them).",
+          "type": "string"
+        },
+        "class": {
+          "description": "Keep only gadgets whose primary class is one of these.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor": {
+          "description": "`next_cursor` from a previous page of THIS query.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "from_stack": {
+          "description": "Require the `writes_reg` registers to come off the stack.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "label": {
+          "description": "Keep only gadgets carrying at least one of these labels.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_insns": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_results": {
+          "description": "Maximum gadgets returned per page (default 1000, hard max 50000).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_side_effects": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "order": {
+          "description": "Result ordering; see find_gadgets. Default \"rank\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preserves_regs": {
+          "description": "Keep only gadgets that write NONE of these registers.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reads_reg": {
+          "description": "Keep only gadgets that read ALL of these registers.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "terminator": {
+          "description": "Terminator kind: \"ret\", \"jmp\", \"call\", \"syscall\", \"none\", \"any\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_secs": {
+          "description": "Per-request timeout in seconds (default 60, max 300).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "writes_reg": {
+          "description": "Keep only gadgets that write ALL of these registers.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "binary_path",
         "args"
       ],
       "type": "object"
     },
-    "name": "run_ropgadget_command"
+    "name": "run_ropgadget_command",
+    "outputSchema": {
+      "$defs": {
+        "GadgetRecord": {
+          "additionalProperties": false,
+          "description": "One gadget, in the shape every gadget-returning tool emits.\n\nInvariant: the field set does not depend on the request. A gadget from a\nscan with no `section` parameter carries `\"section\": null`, not a missing\nkey; an x86-64 ELF carries `\"arch\": null` and `\"delay_slot\": false`, not\nnothing at all. `tests/schema_conformance.rs` asserts the four shapes\nthat used to differ — plain, `section=.text`, MIPS, and the fat Mach-O —\nhave identical key sets.",
+          "properties": {
+            "arch": {
+              "description": "Fat Mach-O slice this gadget came from; `null` for every other\ncontainer.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "bytes": {
+              "description": "Gadget bytes, lowercase hex.",
+              "type": "string"
+            },
+            "class": {
+              "description": "Primary class (`reg-write`, `stack-pivot`, `mem-read`, `mem-write`,\n`arithmetic`, `syscall`, `dispatcher`, `other`); `null` when the\narchitecture has no classifier.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "delay_slot": {
+              "description": "MIPS/SPARC: the LAST instruction is the branch's delay slot, so it\nexecutes **before** control transfers. `rf_scan` has always computed\nthis and every output boundary dropped it.",
+              "type": "boolean"
+            },
+            "dispatcher": {
+              "description": "JOP/COP dispatcher heuristic.",
+              "type": "boolean"
+            },
+            "id": {
+              "description": "Stable identity: `g_` + base32 of the first 10 bytes of\n`blake3(binary_sha256 || vaddr_le || bytes)`. Independent of every\nscan parameter, so the same gadget has the same id across calls,\nprocesses and cache evictions. Pass a list of these to\n`get_gadgets`.",
+              "type": "string"
+            },
+            "insns": {
+              "description": "The instructions, already split.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "labels": {
+              "description": "Every class the gadget earns, not just the primary one.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "low_confidence": {
+              "description": "The classification came from disassembly text rather than decoder\nmetadata, so treat the semantic fields as advisory.",
+              "type": "boolean"
+            },
+            "privileged": {
+              "description": "Contains a privileged or undefined instruction, so it faults in user\nmode and cannot appear in a chain.",
+              "type": "boolean"
+            },
+            "quality": {
+              "description": "TAXONOMY.md R12 quality score, higher is cleaner.",
+              "format": "int32",
+              "type": "integer"
+            },
+            "regs_from_stack": {
+              "description": "The subset of `regs_written` loaded off the stack — the registers a\nchain payload can actually control.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "regs_read": {
+              "description": "Registers the gadget reads.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "regs_written": {
+              "description": "Registers the gadget writes, lowercase and sigil-free.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "section": {
+              "description": "Section containing the gadget; `null` when no `section` filter was\napplied (the scan then has no section table to consult).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "side_effects": {
+              "description": "Instructions that earn at least one label.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stack_delta": {
+              "description": "Net change to the stack pointer. **Always `null` in v0.3**: the\ncomputation is ECO-07/CLS-09 and lands in v0.4. The field is here\nnow so the record shape does not change when it does.",
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "terminator": {
+              "description": "How the gadget hands control on: `ret`, `ret-imm`, `retf`, `iret`,\n`far`, `jmp`, `call`, `syscall`, `none`.",
+              "type": "string"
+            },
+            "text": {
+              "description": "`insns.join(\" ; \")`.",
+              "type": "string"
+            },
+            "usability": {
+              "description": "Usability tier 0..=3 — the primary key of the default `rank` order.\n3 = bare return plus a stack-loaded register; 2 = bare return;\n1 = needs a dispatcher or a stack fix-up, or nothing was identified;\n0 = privileged, or pure control flow.",
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "vaddr": {
+              "description": "Zero-padded hex address, for humans. The padding width is 8 on a\n32-bit target and 16 on a 64-bit one, which is why `vaddr_u64`\nexists.",
+              "type": "string"
+            },
+            "vaddr_u64": {
+              "description": "The same address as a number. Agents doing arithmetic should use\nthis and never parse `vaddr`.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id",
+            "vaddr",
+            "vaddr_u64",
+            "bytes",
+            "text",
+            "insns",
+            "delay_slot",
+            "labels",
+            "regs_written",
+            "regs_read",
+            "regs_from_stack",
+            "side_effects",
+            "quality",
+            "usability",
+            "terminator",
+            "dispatcher",
+            "privileged",
+            "low_confidence"
+          ],
+          "type": "object"
+        },
+        "Warning": {
+          "additionalProperties": false,
+          "description": "A non-fatal fact the agent has to know to read the result correctly\n(CRIT-03 item 4).\n\n`fallback_section_names` used to be a bare boolean with no explanation,\nand truncation was announced nowhere at all. Every entry has a stable\n`code` to branch on and a `message` to show a human.",
+          "properties": {
+            "code": {
+              "description": "Stable machine-readable tag: `low_confidence_classification`,\n`fallback_section_names`, `universal_slice_selected`, `truncated`,\n`sections_truncated`, `imports_truncated`, `ids_not_found`,\n`unmapped_info_fields`.",
+              "type": "string"
+            },
+            "detail": {
+              "description": "Free-form detail (the slice name, the architecture, …).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "field": {
+              "description": "The response field the warning is about, when it is about one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "Human-readable explanation.",
+              "type": "string"
+            },
+            "returned": {
+              "description": "Entries returned in that field.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "total": {
+              "description": "Entries that exist.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "binary_label": {
+          "description": "The binary's path relative to its allow root — what the audit log\nrecords, and never the caller's spelling of the path.",
+          "type": "string"
+        },
+        "binary_sha256": {
+          "description": "SHA-256 of the analysed file.",
+          "type": "string"
+        },
+        "cache": {
+          "description": "`hit` when the gadget set came from a cache (in memory, pinned for\na cursor, or authenticated from disk), `miss` when it was scanned.",
+          "type": "string"
+        },
+        "cache_key": {
+          "description": "Key of the cached scan; the second path component of `resource_uri`.",
+          "type": "string"
+        },
+        "fallback_section_names": {
+          "description": "The binary has no section names and synthetic `PT_LOAD#n` names were\nmatched instead. Also reported in `warnings`.",
+          "type": "boolean"
+        },
+        "gadgets": {
+          "items": {
+            "$ref": "#/$defs/GadgetRecord"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "description": "Opaque token for the next page; `null` on the last one. Send it back\nas `cursor` with the SAME query parameters.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Index of this page's first gadget within the ordered result.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "order": {
+          "description": "The order actually applied: `rank`, `address`, `quality`, `text` or\n`ids`. Echoed because the default changed to `rank` and an agent\nmust not have to assume.",
+          "type": "string"
+        },
+        "resource_uri": {
+          "description": "`ropfinder://scan/<cache_key>/gadgets.ndjson` — the WHOLE ordered\nresult, one `GadgetRecord` per line, readable with `resources/read`.\nPresent only when the result was paged.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "returned": {
+          "description": "Gadgets in this page.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_count": {
+          "description": "Gadgets matching the query, before paging.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncated": {
+          "description": "`total_count > offset + returned`.",
+          "type": "boolean"
+        },
+        "warnings": {
+          "description": "Non-fatal facts. Always present; `[]` when there are none.",
+          "items": {
+            "$ref": "#/$defs/Warning"
+          },
+          "type": "array"
+        },
+        "workspace_file": {
+          "description": "The same NDJSON as a real file, when the server was started with\n`--workspace-dir`. An agent with filesystem tools should grep this\ninstead of paging.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "gadgets",
+        "total_count",
+        "returned",
+        "offset",
+        "truncated",
+        "order",
+        "binary_sha256",
+        "binary_label",
+        "cache",
+        "cache_key",
+        "fallback_section_names",
+        "warnings"
+      ],
+      "type": "object"
+    }
   },
   {
-    "description": "Search gadgets by pattern: regex matched against gadget text (e.g. \"pop r.*; ret\"); invalid regexes fall back to literal substring match. Runs a full ROP+JOP+SYS scan, then filters. Same caps as find_gadgets.",
+    "description": "Search gadgets by pattern: regex matched against gadget text (e.g. \"pop r.*; ret\"); invalid regexes fall back to literal substring match. Runs a full ROP+JOP+SYS scan, then filters. Same ranking, semantic filters, cursor and caps as find_gadgets.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -500,6 +3169,20 @@
           "description": "Absolute path to the binary; must be inside one of the server's\nallow_roots (get_server_config lists them).",
           "type": "string"
         },
+        "class": {
+          "description": "Keep only gadgets whose primary class is one of these.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor": {
+          "description": "`next_cursor` from a previous page of THIS query.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "depth": {
           "description": "Search depth (default 10).",
           "format": "uint",
@@ -509,9 +3192,39 @@
             "null"
           ]
         },
+        "from_stack": {
+          "description": "Require the `writes_reg` registers to come off the stack.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "label": {
+          "description": "Keep only gadgets carrying at least one of these labels.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_insns": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "max_results": {
-          "description": "Maximum gadgets returned (default 1000, hard max 50000).",
+          "description": "Maximum gadgets returned per page (default 1000, hard max 50000).",
           "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_side_effects": {
+          "format": "uint32",
           "minimum": 0,
           "type": [
             "integer",
@@ -525,9 +3238,23 @@
             "null"
           ]
         },
+        "order": {
+          "description": "Result ordering; see find_gadgets. Default \"rank\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "pattern": {
           "description": "Regex matched against gadget text (e.g. \"pop r.*; ret\"); if the\npattern is not a valid regex it is matched as a literal substring.",
           "type": "string"
+        },
+        "preserves_regs": {
+          "description": "Keep only gadgets that write NONE of these registers.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "range": {
           "description": "Address range to scan, \"0xSTART-0xEND\".",
@@ -536,8 +3263,22 @@
             "null"
           ]
         },
+        "reads_reg": {
+          "description": "Keep only gadgets that read ALL of these registers.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "section": {
           "description": "Executable section name(s); comma-separated, `*` globbing.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "terminator": {
+          "description": "Terminator kind: \"ret\", \"jmp\", \"call\", \"syscall\", \"none\", \"any\".",
           "type": [
             "string",
             "null"
@@ -551,6 +3292,13 @@
             "integer",
             "null"
           ]
+        },
+        "writes_reg": {
+          "description": "Keep only gadgets that write ALL of these registers.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -559,6 +3307,311 @@
       ],
       "type": "object"
     },
-    "name": "search_gadgets_by_pattern"
+    "name": "search_gadgets_by_pattern",
+    "outputSchema": {
+      "$defs": {
+        "GadgetRecord": {
+          "additionalProperties": false,
+          "description": "One gadget, in the shape every gadget-returning tool emits.\n\nInvariant: the field set does not depend on the request. A gadget from a\nscan with no `section` parameter carries `\"section\": null`, not a missing\nkey; an x86-64 ELF carries `\"arch\": null` and `\"delay_slot\": false`, not\nnothing at all. `tests/schema_conformance.rs` asserts the four shapes\nthat used to differ — plain, `section=.text`, MIPS, and the fat Mach-O —\nhave identical key sets.",
+          "properties": {
+            "arch": {
+              "description": "Fat Mach-O slice this gadget came from; `null` for every other\ncontainer.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "bytes": {
+              "description": "Gadget bytes, lowercase hex.",
+              "type": "string"
+            },
+            "class": {
+              "description": "Primary class (`reg-write`, `stack-pivot`, `mem-read`, `mem-write`,\n`arithmetic`, `syscall`, `dispatcher`, `other`); `null` when the\narchitecture has no classifier.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "delay_slot": {
+              "description": "MIPS/SPARC: the LAST instruction is the branch's delay slot, so it\nexecutes **before** control transfers. `rf_scan` has always computed\nthis and every output boundary dropped it.",
+              "type": "boolean"
+            },
+            "dispatcher": {
+              "description": "JOP/COP dispatcher heuristic.",
+              "type": "boolean"
+            },
+            "id": {
+              "description": "Stable identity: `g_` + base32 of the first 10 bytes of\n`blake3(binary_sha256 || vaddr_le || bytes)`. Independent of every\nscan parameter, so the same gadget has the same id across calls,\nprocesses and cache evictions. Pass a list of these to\n`get_gadgets`.",
+              "type": "string"
+            },
+            "insns": {
+              "description": "The instructions, already split.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "labels": {
+              "description": "Every class the gadget earns, not just the primary one.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "low_confidence": {
+              "description": "The classification came from disassembly text rather than decoder\nmetadata, so treat the semantic fields as advisory.",
+              "type": "boolean"
+            },
+            "privileged": {
+              "description": "Contains a privileged or undefined instruction, so it faults in user\nmode and cannot appear in a chain.",
+              "type": "boolean"
+            },
+            "quality": {
+              "description": "TAXONOMY.md R12 quality score, higher is cleaner.",
+              "format": "int32",
+              "type": "integer"
+            },
+            "regs_from_stack": {
+              "description": "The subset of `regs_written` loaded off the stack — the registers a\nchain payload can actually control.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "regs_read": {
+              "description": "Registers the gadget reads.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "regs_written": {
+              "description": "Registers the gadget writes, lowercase and sigil-free.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "section": {
+              "description": "Section containing the gadget; `null` when no `section` filter was\napplied (the scan then has no section table to consult).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "side_effects": {
+              "description": "Instructions that earn at least one label.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stack_delta": {
+              "description": "Net change to the stack pointer. **Always `null` in v0.3**: the\ncomputation is ECO-07/CLS-09 and lands in v0.4. The field is here\nnow so the record shape does not change when it does.",
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "terminator": {
+              "description": "How the gadget hands control on: `ret`, `ret-imm`, `retf`, `iret`,\n`far`, `jmp`, `call`, `syscall`, `none`.",
+              "type": "string"
+            },
+            "text": {
+              "description": "`insns.join(\" ; \")`.",
+              "type": "string"
+            },
+            "usability": {
+              "description": "Usability tier 0..=3 — the primary key of the default `rank` order.\n3 = bare return plus a stack-loaded register; 2 = bare return;\n1 = needs a dispatcher or a stack fix-up, or nothing was identified;\n0 = privileged, or pure control flow.",
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "vaddr": {
+              "description": "Zero-padded hex address, for humans. The padding width is 8 on a\n32-bit target and 16 on a 64-bit one, which is why `vaddr_u64`\nexists.",
+              "type": "string"
+            },
+            "vaddr_u64": {
+              "description": "The same address as a number. Agents doing arithmetic should use\nthis and never parse `vaddr`.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id",
+            "vaddr",
+            "vaddr_u64",
+            "bytes",
+            "text",
+            "insns",
+            "delay_slot",
+            "labels",
+            "regs_written",
+            "regs_read",
+            "regs_from_stack",
+            "side_effects",
+            "quality",
+            "usability",
+            "terminator",
+            "dispatcher",
+            "privileged",
+            "low_confidence"
+          ],
+          "type": "object"
+        },
+        "Warning": {
+          "additionalProperties": false,
+          "description": "A non-fatal fact the agent has to know to read the result correctly\n(CRIT-03 item 4).\n\n`fallback_section_names` used to be a bare boolean with no explanation,\nand truncation was announced nowhere at all. Every entry has a stable\n`code` to branch on and a `message` to show a human.",
+          "properties": {
+            "code": {
+              "description": "Stable machine-readable tag: `low_confidence_classification`,\n`fallback_section_names`, `universal_slice_selected`, `truncated`,\n`sections_truncated`, `imports_truncated`, `ids_not_found`,\n`unmapped_info_fields`.",
+              "type": "string"
+            },
+            "detail": {
+              "description": "Free-form detail (the slice name, the architecture, …).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "field": {
+              "description": "The response field the warning is about, when it is about one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "Human-readable explanation.",
+              "type": "string"
+            },
+            "returned": {
+              "description": "Entries returned in that field.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "total": {
+              "description": "Entries that exist.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "binary_label": {
+          "description": "The binary's path relative to its allow root — what the audit log\nrecords, and never the caller's spelling of the path.",
+          "type": "string"
+        },
+        "binary_sha256": {
+          "description": "SHA-256 of the analysed file.",
+          "type": "string"
+        },
+        "cache": {
+          "description": "`hit` when the gadget set came from a cache (in memory, pinned for\na cursor, or authenticated from disk), `miss` when it was scanned.",
+          "type": "string"
+        },
+        "cache_key": {
+          "description": "Key of the cached scan; the second path component of `resource_uri`.",
+          "type": "string"
+        },
+        "fallback_section_names": {
+          "description": "The binary has no section names and synthetic `PT_LOAD#n` names were\nmatched instead. Also reported in `warnings`.",
+          "type": "boolean"
+        },
+        "gadgets": {
+          "items": {
+            "$ref": "#/$defs/GadgetRecord"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "description": "Opaque token for the next page; `null` on the last one. Send it back\nas `cursor` with the SAME query parameters.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Index of this page's first gadget within the ordered result.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "order": {
+          "description": "The order actually applied: `rank`, `address`, `quality`, `text` or\n`ids`. Echoed because the default changed to `rank` and an agent\nmust not have to assume.",
+          "type": "string"
+        },
+        "resource_uri": {
+          "description": "`ropfinder://scan/<cache_key>/gadgets.ndjson` — the WHOLE ordered\nresult, one `GadgetRecord` per line, readable with `resources/read`.\nPresent only when the result was paged.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "returned": {
+          "description": "Gadgets in this page.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_count": {
+          "description": "Gadgets matching the query, before paging.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncated": {
+          "description": "`total_count > offset + returned`.",
+          "type": "boolean"
+        },
+        "warnings": {
+          "description": "Non-fatal facts. Always present; `[]` when there are none.",
+          "items": {
+            "$ref": "#/$defs/Warning"
+          },
+          "type": "array"
+        },
+        "workspace_file": {
+          "description": "The same NDJSON as a real file, when the server was started with\n`--workspace-dir`. An agent with filesystem tools should grep this\ninstead of paging.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "gadgets",
+        "total_count",
+        "returned",
+        "offset",
+        "truncated",
+        "order",
+        "binary_sha256",
+        "binary_label",
+        "cache",
+        "cache_key",
+        "fallback_section_names",
+        "warnings"
+      ],
+      "type": "object"
+    }
   }
 ]
