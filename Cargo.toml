@@ -5,8 +5,16 @@ members = [
     "crates/rf-scan",
     "crates/rf-classify",
     "crates/rf-chain",
+    # CLI-01/ENG-05, CLI-07/MCP-04, ROB-04, CLI-08/PERF-12: the on-disk scan
+    # cache, shared by rf-cli and rf-mcp. It is its own crate because the
+    # duplication was the finding — the align post-filter and the
+    # char-boundary panic each existed twice.
+    "crates/rf-cache",
     "crates/rf-cli",
     "crates/rf-mcp",
+    # CLAIM-02 / PERF-08: the criterion suite PLAN.md made a Phase-0 exit
+    # criterion and that did not exist. Benches only; `publish = false`.
+    "crates/rf-bench",
 ]
 
 [workspace.package]
@@ -31,10 +39,20 @@ goblin = "0.10"
 # tests/parity.py.
 iced-x86 = { version = "=1.21.0", default-features = false, features = ["std", "decoder", "intel", "instr_info", "fast_fmt"] }
 memchr = "2.7"
+# Used by rf-scan (the ROPgadget-compatible `--filter` / `--re` alternation),
+# rf-cli and rf-mcp. Declared once here so the three cannot drift onto
+# different majors and render `--filter` differently in the engine and in the
+# cache key that is supposed to describe it.
+regex = "1"
 thiserror = "2"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Benchmarks only (crates/rf-bench). `default-features = false` drops the
+# `plotters`/`rayon` HTML-report stack: CI needs the JSON estimates that the
+# regression checker reads, not gnuplot output, and the smaller graph keeps
+# `cargo deny` and the MSRV job honest.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [profile.release]
 lto = true

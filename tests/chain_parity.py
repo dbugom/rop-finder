@@ -21,6 +21,10 @@ Non-x86 ELF fixtures and non-ELF fixtures are skipped: ropmaker only
 supports Linux execve chains on x86 (int 0x80) and x64 (syscall).
 
 Usage:  python tests/chain_parity.py [--release|--debug] [--fixture NAME]
+
+Exits non-zero on any MISMATCH or MISSING-FIXTURE. The rop-finder binary and
+the ROPgadget oracle are resolved by `tests/rf_paths.py` -- by platform, with
+env overrides, and building rop-finder if it is absent (CLAIM-08/ENG-04).
 """
 
 import argparse
@@ -29,10 +33,15 @@ import re
 import subprocess
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(HERE)                       # rop-finder/
-ROPGADGET = os.path.join(os.path.dirname(REPO), "ropgadget", "ROPgadget.py")
-FIXTURES = os.path.join(HERE, "fixtures")
+# No __pycache__ beside the harnesses: tests/ is not gitignored for it,
+# and a stray cache directory in a source tree is noise, not a build product.
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import rf_paths  # noqa: E402
+
+HERE = rf_paths.HERE
+REPO = rf_paths.REPO
+FIXTURES = rf_paths.FIXTURES
 
 SHEBANG = "#!/usr/bin/env python3"
 PACK_ADDR = re.compile(r"pack\('<[QI]', (0x[0-9a-f]+)\)")
@@ -51,16 +60,6 @@ CANDIDATES = [
 ]
 
 
-def find_rop_finder(release: bool) -> str:
-    profile = "release" if release else "debug"
-    exe = os.path.join(REPO, "target", profile, "rop-finder.exe")
-    if not os.path.exists(exe):
-        exe = exe[:-4]  # non-Windows
-    if not os.path.exists(exe):
-        sys.exit(f"rop-finder binary not found at {exe} — build it first")
-    return exe
-
-
 def script_portion(text: str):
     """Extract the generated python script (shebang line to EOF)."""
     idx = text.find(SHEBANG)
@@ -72,7 +71,7 @@ def script_portion(text: str):
 def run_ref(fixture: str):
     """Return the oracle's script portion, or None when it cannot build one."""
     p = subprocess.run(
-        [sys.executable, ROPGADGET, "--binary", fixture, "--ropchain"],
+        rf_paths.oracle_cmd(fixture, ropchain=True),
         capture_output=True, text=True,
     )
     # ROPgadget prints "[-] Can't find ..." messages during its internal
@@ -124,8 +123,10 @@ def main():
     ap.add_argument("--fixture", help="only run this fixture")
     args = ap.parse_args()
 
-    binary = find_rop_finder(args.release)
+    binary = rf_paths.rop_finder(release=args.release)
     names = [args.fixture] if args.fixture else CANDIDATES
+    print(f"# environment: {rf_paths.describe_environment()}")
+    print(f"# rop-finder:  {binary}")
 
     counts = {}
     rows = []

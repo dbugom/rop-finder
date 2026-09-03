@@ -13,11 +13,11 @@ classes a VirtualProtect chain needs:
   * jmp/call reg gadgets                  (dispatchers, indirect calls)
   * call/jmp qword ptr [reg]              (IAT call sites)
 
-Writes tests/spike-report.md. System binaries (kernel32.dll, ntoskrnl.exe)
+Writes tests/spike-report.md (--out/--no-write override). System binaries (kernel32.dll, ntoskrnl.exe)
 are copied into tests/spike-binaries/ (gitignored) -- skip them gracefully
 when absent.
 
-Usage: python tests/spike_inventory.py [--release]
+Usage: python tests/spike_inventory.py [--release] [--out PATH] [--no-write]
 """
 
 import argparse
@@ -27,8 +27,14 @@ import re
 import subprocess
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(HERE)
+# No __pycache__ beside the harnesses: tests/ is not gitignored for it,
+# and a stray cache directory in a source tree is noise, not a build product.
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import rf_paths  # noqa: E402
+
+HERE = rf_paths.HERE
+REPO = rf_paths.REPO
 
 BINARIES = [
     ("tests/fixtures/pe-x64-cmd-v6.1.7601", "cmd.exe x64 6.1.7601"),
@@ -39,15 +45,6 @@ BINARIES = [
 
 POP_ARG = ["rcx", "rdx", "r8", "r9"]
 POP_OTHER = ["rax", "rbx", "rsp", "rsi", "rdi"]
-
-
-def find_rop_finder(release: bool) -> str:
-    exe = os.path.join(REPO, "target", "release" if release else "debug", "rop-finder.exe")
-    if not os.path.exists(exe):
-        exe = exe[:-4]
-    if not os.path.exists(exe):
-        sys.exit(f"rop-finder binary not found at {exe} -- build it first")
-    return exe
 
 
 def clean_tail(insns):
@@ -170,8 +167,18 @@ VERDICT = """
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--release", action="store_true", default=True)
+    ap.add_argument("--debug", dest="release", action="store_false")
+    # CLAIM-08: CI runs this harness purely to prove it *runs* on a non-Windows
+    # host. It must not rewrite the committed report while doing so, so the
+    # destination is a flag and `--no-write` prints only.
+    ap.add_argument(
+        "--out",
+        default=os.path.join(HERE, "spike-report.md"),
+        help="where to write the markdown report (default tests/spike-report.md)",
+    )
+    ap.add_argument("--no-write", action="store_true", help="print the report, write nothing")
     args = ap.parse_args()
-    exe = find_rop_finder(args.release)
+    exe = rf_paths.rop_finder(release=args.release)
 
     rows = []
     for rel, label in BINARIES:
@@ -209,8 +216,10 @@ def main():
         out.append(f"| `{k}` | " + " | ".join(str(r[2][k]) for r in rows) + " |")
     out.append("")
     report = "\n".join(out) + VERDICT
-    with open(os.path.join(HERE, "spike-report.md"), "w", encoding="utf-8") as f:
-        f.write(report)
+    if not args.no_write:
+        with open(args.out, "w", encoding="utf-8", newline="\n") as f:
+            f.write(report)
+        print(f"[wrote] {args.out}", file=sys.stderr)
     print(report)
 
 

@@ -105,7 +105,10 @@ pub struct Cli {
     #[arg(long)]
     pub only: Option<String>,
 
-    /// Suppress specific mnemonics (suffix match, e.g. "leave|enter")
+    /// Suppress gadgets containing a matching mnemonic. A `|`-separated
+    /// regex alternation, FULL-matched against each mnemonic as ROPgadget
+    /// does (e.g. "leave|enter", "j.*"). Not a suffix match: "op" matches
+    /// no mnemonic and so filters nothing, it does not remove `pop`
     #[arg(long)]
     pub filter: Option<String>,
 
@@ -206,6 +209,12 @@ pub struct Cli {
     #[arg(long)]
     pub cache: bool,
 
+    /// Delete every entry in the scan cache directory and exit. Needs no
+    /// --binary. Size cap and lifetime are ROP_FINDER_CACHE_MAX_BYTES
+    /// (default 512 MiB) and ROP_FINDER_CACHE_TTL_SECS (default 14 days)
+    #[arg(long)]
+    pub cache_purge: bool,
+
     /// Search a string (byte regex, e.g. "m..n") in readable (data)
     /// sections instead of gadget scanning
     #[arg(long)]
@@ -262,6 +271,41 @@ pub struct Cli {
     /// binary is preloaded
     #[arg(long)]
     pub console: bool,
+
+    /// Architecture slice to scan in a fat (Universal) Mach-O, e.g.
+    /// x86_64, arm64, i386. REQUIRED for a multi-slice file: without it
+    /// rop-finder refuses rather than concatenating slices whose virtual
+    /// address ranges overlap (CORE-03)
+    #[arg(long, value_name = "<slice>")]
+    pub arch: Option<String>,
+
+    /// Refuse input files larger than this many bytes; accepts a K/M/G
+    /// suffix. Non-regular files (devices, FIFOs, directories) are always
+    /// refused (ROB-06)
+    #[arg(long = "max-file-size", value_name = "<bytes>", default_value = "512M")]
+    pub max_file_size: String,
+
+    /// Stop the scan once this many gadgets have been accepted, and report
+    /// the budget instead of a truncated listing (PERF-05)
+    #[arg(long = "max-gadgets", value_name = "<n>")]
+    pub max_gadgets: Option<usize>,
+
+    /// Stop the scan once the retained gadgets are estimated to exceed this
+    /// many heap bytes; accepts a K/M/G suffix (PERF-05)
+    #[arg(long = "max-memory", value_name = "<bytes>")]
+    pub max_memory: Option<String>,
+
+    /// Bug-for-bug ROPgadget compatibility where rop-finder deliberately
+    /// differs (CLI-11). Exactly two things. (1) A fat (Universal) Mach-O
+    /// with no --arch is scanned as ROPgadget scans it — every slice's
+    /// executable regions concatenated and disassembled with the FIRST
+    /// slice's decoder — instead of being refused; the output is then
+    /// knowingly part-fabricated and a warning says so. (2) --string and
+    /// --memstr read a section's DECLARED file extent (elf.py:332) rather
+    /// than the bytes it really owns, which resurrects the oracle's
+    /// SHT_NOBITS phantom hits. It does NOT change gadget text or layout
+    #[arg(long)]
+    pub compat: bool,
 }
 
 #[derive(Serialize)]
@@ -294,6 +338,86 @@ struct JsonGadget<'a> {
     dispatcher: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     low_confidence: Option<bool>,
+}
+
+/// ROB-06 default input cap: 512 MiB.
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 512 * 1024 * 1024;
+
+/// Parse a byte count with an optional binary `K`/`M`/`G` suffix
+/// (`--max-file-size`, `--max-memory`). Plain decimal, never hex: these
+/// are sizes a human types, and `--max-file-size 10M` must not silently
+/// become 0x10.
+pub fn parse_size(s: &str, what: &str) -> Result<u64, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err(format!("invalid {what} {s:?}: empty"));
+    }
+    let (digits, mult) = match t.as_bytes()[t.len() - 1] {
+        b'k' | b'K' => (&t[..t.len() - 1], 1024u64),
+        b'm' | b'M' => (&t[..t.len() - 1], 1024 * 1024),
+        b'g' | b'G' => (&t[..t.len() - 1], 1024 * 1024 * 1024),
+        _ => (t, 1),
+    };
+    let n: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid {what} {s:?}: {e}"))?;
+    n.checked_mul(mult)
+        .ok_or_else(|| format!("invalid {what} {s:?}: overflows a u64"))
+}
+
+/// ROB-06: decide whether `path` may be read at all, from its metadata
+/// alone — BEFORE a byte is allocated.
+///
+/// Two refusals, both of which `std::fs::read` performs instead of
+/// diagnosing: a non-regular file (character device, FIFO, directory,
+/// socket) has no length, so `read_to_end` grows the buffer until the OS
+/// kills the process (`--binary /dev/zero`: 8.6 GB RSS at 1 s, measured in
+/// ROB-06); and a regular file larger than the cap is materialised in full
+/// before the format is even sniffed.
+///
+/// Split out from [`read_input_file`] so it is unit-testable without a
+/// character device, which Windows CI does not have.
+pub fn check_input_metadata(
+    path: &str,
+    meta: &std::fs::Metadata,
+    max_bytes: u64,
+) -> Result<(), String> {
+    if !meta.is_file() {
+        let kind = if meta.is_dir() {
+            "a directory"
+        } else {
+            "not a regular file (character device, FIFO, socket or symlink loop?)"
+        };
+        return Err(format!(
+            "cannot read {path}: {kind}; rop-finder reads whole files into memory and \
+             refuses inputs with no fixed length"
+        ));
+    }
+    let len = meta.len();
+    if len > max_bytes {
+        return Err(format!(
+            "cannot read {path}: {len} bytes exceeds the --max-file-size limit of \
+             {max_bytes} bytes; re-run with --max-file-size {len} to allow it"
+        ));
+    }
+    Ok(())
+}
+
+/// ROB-06: stat, then read. Never `std::fs::read` a path the caller has
+/// not bounded.
+pub fn read_input_file(path: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    check_input_metadata(path, &meta, max_bytes)?;
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    // TOCTOU: the file may have grown between the stat and the read.
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "cannot read {path}: file grew past the --max-file-size limit of {max_bytes} bytes \
+             while it was being read"
+        ));
+    }
+    Ok(bytes)
 }
 
 pub fn parse_hex(s: &str, what: &str) -> Result<u64, String> {
@@ -472,6 +596,110 @@ pub struct RegionView {
     pub named_exec: Vec<Section>,
     /// True for Universal (multi-slice) binaries (JSON arch field).
     pub universal: bool,
+}
+
+/// CORE-03/CORE-05 — resolve `--arch` against a loaded target.
+///
+/// Returns the architecture whose slice should be scanned, or a usage
+/// error. The three refusals are all deliberate:
+///
+///   * a multi-slice fat Mach-O with no `--arch` is REFUSED, not guessed.
+///     ROPgadget concatenates every slice's executable regions and
+///     disassembles the lot with the FIRST slice's decoder
+///     (`universal.py:92-108`). On an Apple-silicon x86_64+arm64e binary
+///     that means the arm64 slice is read as x86-64: measured on
+///     `/bin/ls`, 202 of 491 gadgets (41% of the output) are x86
+///     misreadings of ARM64 instructions, printed at addresses in the same
+///     range as the genuine ones so the user cannot separate them.
+///   * `--arch` naming a slice the container does not hold is an error
+///     that lists what it does hold (rf-core's message).
+///   * `--arch` on a non-fat image is accepted only when it agrees with
+///     the image's own architecture, so it can be left in a script without
+///     silently selecting nothing.
+pub fn resolve_arch(
+    target: &Target,
+    arch: Option<&str>,
+    compat: bool,
+) -> Result<Option<Arch>, ScanError> {
+    let named = match arch {
+        Some(a) => Some(Arch::from_slice_name(a).ok_or_else(|| {
+            ScanError::Usage(format!(
+                "unknown --arch {a:?}; expected an architecture slice name such as \
+                 x86_64, i386, arm64, arm, ppc, ppc64"
+            ))
+        })?),
+        None => None,
+    };
+    match target {
+        Target::Universal(u) => match named {
+            Some(a) => {
+                u.select(a).map_err(|e| ScanError::Usage(e.to_string()))?;
+                Ok(Some(a))
+            }
+            None => {
+                if u.needs_arch_selection() && !compat {
+                    let available = u
+                        .slice_infos()
+                        .iter()
+                        .map(|s| s.name())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    Err(ScanError::Usage(format!(
+                        "universal (fat Mach-O) binary holds {} architecture slices \
+                         ({available}); pass --arch <slice> to choose one. Refusing to scan \
+                         the concatenation: the slices' virtual address ranges overlap and \
+                         every slice but the first would be disassembled with the wrong \
+                         decoder, so most of the output would be fabricated",
+                        u.slices().len()
+                    )))
+                } else {
+                    Ok(None)
+                }
+            }
+        },
+        other => match named {
+            None => Ok(None),
+            Some(a) => {
+                let actual = build_view(other).arch();
+                if a == actual {
+                    Ok(Some(a))
+                } else {
+                    Err(ScanError::Usage(format!(
+                        "--arch {} does not match this binary: it is {}. --arch selects a \
+                         slice of a fat (Universal) Mach-O; it does not reinterpret a \
+                         single-architecture image (use --rawArch for that)",
+                        a.slice_name(),
+                        actual.slice_name()
+                    )))
+                }
+            }
+        },
+    }
+}
+
+/// [`build_view`] with a fat-Mach-O slice already chosen. `arch` comes
+/// from [`resolve_arch`]; `None` keeps the legacy whole-container view,
+/// which is only reachable for a single-slice container.
+pub fn build_view_selected(target: &Target, arch: Option<Arch>) -> RegionView {
+    match (target, arch) {
+        (Target::Universal(u), Some(a)) => match u.select(a) {
+            Ok(slice) => RegionView {
+                arch: slice.arch(),
+                endian: slice.endianness(),
+                base: slice.image_base(),
+                entry: slice.entry(),
+                regions: slice.exec_scan_regions().to_vec(),
+                named_exec: slice.exec_sections().into_iter().cloned().collect(),
+                // Still flagged universal so the JSON output keeps naming
+                // the architecture the gadgets were decoded with.
+                universal: true,
+            },
+            // resolve_arch validated the slice exists; if it somehow did
+            // not, fall back rather than panic.
+            Err(_) => build_view(target),
+        },
+        _ => build_view(target),
+    }
 }
 
 pub fn build_view(target: &Target) -> RegionView {
@@ -744,9 +972,29 @@ pub fn info_json(target: &Target, new_base: Option<u64>) -> serde_json::Value {
             // new_base - first_base.
             let first_base = u.slices()[0].image_base();
             let delta = rebase_delta(first_base, new_base);
+            // CORE-03: each slice also carries the name `--arch` accepts.
+            // `arch` is rop-finder's internal spelling ("x64"), `slice` is
+            // the Mach-O one ("x86_64"); without both, `--info` tells you a
+            // fat binary has two slices and not what to type to pick one.
+            let slices: Vec<serde_json::Value> = u
+                .slices()
+                .iter()
+                .zip(u.slice_infos())
+                .map(|(s, info)| {
+                    let mut v = macho_info(s, delta);
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("slice".into(), info.name().into());
+                        o.insert("slice_offset".into(), hexs(info.offset).into());
+                        o.insert("slice_size".into(), info.size.into());
+                    }
+                    v
+                })
+                .collect();
             serde_json::json!({
                 "format": "universal",
-                "slices": u.slices().iter().map(|s| macho_info(s, delta)).collect::<Vec<_>>(),
+                "fat64": u.is_fat64(),
+                "arch_selection_required": u.needs_arch_selection(),
+                "slices": slices,
             })
         }
     }
@@ -815,6 +1063,20 @@ pub struct ScanRequest {
     pub all: bool,
     /// ROPgadget --noinstr: skip dedup and sort; print bare addresses.
     pub noinstr: bool,
+    /// Fat Mach-O slice selection (CORE-03/CORE-05), as the `--arch`
+    /// spelling (`x86_64`, `arm64`, ...). `None` on a multi-slice container
+    /// is a REFUSAL, not a guess.
+    pub arch: Option<String>,
+    /// PERF-05 `--max-gadgets`: abort with a budget error once this many
+    /// gadgets have been accepted. `None` = unbounded.
+    pub max_gadgets: Option<usize>,
+    /// PERF-05 `--max-memory`: abort with a budget error once the retained
+    /// gadgets are estimated to exceed this many heap bytes.
+    pub max_memory: Option<usize>,
+    /// `--compat`: reproduce ROPgadget bug-for-bug where rop-finder
+    /// deliberately differs (today: scan a multi-slice fat Mach-O as the
+    /// concatenation instead of refusing it).
+    pub compat: bool,
 }
 
 impl Default for ScanRequest {
@@ -838,6 +1100,10 @@ impl Default for ScanRequest {
             call_preceded: false,
             all: false,
             noinstr: false,
+            arch: None,
+            max_gadgets: None,
+            max_memory: None,
+            compat: false,
         }
     }
 }
@@ -913,6 +1179,13 @@ fn request_options(req: &ScanRequest, raw: Option<RawSpec>) -> Result<ScanOption
         all: req.all,
         noinstr: req.noinstr,
         parallel: true,
+        // The CLI splits --filter on '|' above; rf-scan rejoins the parts
+        // and compiles ROPgadget's anchored `({...})$` itself, so there is
+        // nothing to pre-compile here.
+        filter_re: None,
+        cancel: rf_scan::CancelToken::never(),
+        max_gadgets: req.max_gadgets,
+        max_memory: req.max_memory,
     };
     if let Some((_, _, raw_thumb)) = raw {
         opts.thumb = opts.thumb || raw_thumb;
@@ -933,14 +1206,17 @@ pub struct PreparedView {
     pub fallback_names: bool,
 }
 
-/// Build the scan view for `target`, applying `--base` rebase and
-/// `--section` selection.
+/// Build the scan view for `target`, applying `--arch` slice selection,
+/// `--base` rebase and `--section` selection.
 pub fn prepare_view(
     target: &Target,
     base: Option<u64>,
     sections: &[String],
+    arch: Option<&str>,
+    compat: bool,
 ) -> Result<PreparedView, ScanError> {
-    let mut view = build_view(target);
+    let slice = resolve_arch(target, arch, compat)?;
+    let mut view = build_view_selected(target, slice);
     if let Some(base) = base {
         view.rebase(base);
     }
@@ -979,13 +1255,12 @@ pub fn scan_bytes(
         .map(|b| parse_hex(b, "--base"))
         .transpose()
         .map_err(ScanError::Usage)?;
-    let prepared = prepare_view(&target, base, &req.section)?;
+    let prepared = prepare_view(&target, base, &req.section, req.arch.as_deref(), req.compat)?;
     let view = prepared.view;
     let selected_sections = prepared.selected_sections;
     let fallback_names = prepared.fallback_names;
     let universal_arch = view.universal.then_some(view.arch());
-    let gadgets =
-        rf_scan::scan_binary(&view, &opts).map_err(|e| ScanError::Binary(e.to_string()))?;
+    let gadgets = run_scan_engine(&view, &opts).map_err(ScanError::Binary)?;
     Ok(ScanOutcome {
         result: ScanResult {
             gadgets,
@@ -995,6 +1270,91 @@ pub fn scan_bytes(
         },
         opts,
         fallback_names,
+    })
+}
+
+/// Everything the user has to be told BEFORE reading a gadget listing.
+///
+/// Each of these existed as a silent behaviour before v0.2.0, and each one
+/// makes the listing mean something different from what it looks like:
+///
+///   * CRIT-01 — `--cfg-aware` on a binary with no `endbr32`/`endbr64`
+///     landing pads at all. The flag then constrains nothing, and a user
+///     who believes it does will conclude the JOP surface is empty when it
+///     is merely unmarked. `rf_scan::ibt_applicable` answers this; it is
+///     false for all 24 repository fixtures.
+///   * CORE-07 — an ELF whose `e_machine` and `EI_CLASS` disagree about
+///     the register width (x32, ELFCLASS64 + EM_386, AArch64 ILP32).
+///     rop-finder decodes by `e_machine` and ROPgadget decodes by
+///     `EI_CLASS`, so the two tools' output legitimately differs here and
+///     the user is told which one they are looking at.
+///   * CLI-11/`--compat` — the fat Mach-O concatenation the refusal
+///     normally prevents.
+pub fn scan_warnings(
+    target: &Target,
+    view: &RegionView,
+    cfg_aware: bool,
+    compat: bool,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if cfg_aware && !rf_scan::ibt_applicable(view) {
+        out.push(
+            "[Warning] --cfg-aware: this binary contains no endbr32/endbr64 landing pads, \
+             so Intel CET/IBT is not enforced on it and the flag constrains nothing. \
+             (PE GUARD_CF is a different mitigation and is not what --cfg-aware models.)"
+                .to_string(),
+        );
+    }
+    if let Target::Elf(b) = target {
+        if let Some(d) = b.mode_divergence() {
+            out.push(format!(
+                "[Warning] ELF e_machine {:#x} declares {}-bit code but EI_CLASS says \
+                 {}-bit. rop-finder decodes it as {}-bit (the width the instruction \
+                 encodings actually use); ROPgadget decodes it as {}-bit. Gadget text and \
+                 counts will differ from the oracle on this file.",
+                d.machine, d.rf_bits, d.oracle_bits, d.rf_bits, d.oracle_bits
+            ));
+        }
+    }
+    if compat {
+        if let Target::Universal(u) = target {
+            if u.needs_arch_selection() {
+                out.push(format!(
+                    "[Warning] --compat: scanning all {} slices of this fat Mach-O \
+                     concatenated and decoding every one of them as {}, exactly as \
+                     ROPgadget does. Every slice but the first is decoded with the WRONG \
+                     architecture: its listing mixes FABRICATED gadgets — misreadings of \
+                     another architecture's instructions, at addresses indistinguishable \
+                     from the genuine ones — with real gadgets it silently drops. Use \
+                     --arch <slice> for a trustworthy listing.",
+                    u.slices().len(),
+                    view.arch().slice_name()
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// PERF-05: run the engine, choosing the bounded (streaming-sink) entry
+/// point when `--max-gadgets` / `--max-memory` asked for one.
+///
+/// `scan_binary` collects into an unbounded `Vec`; `scan_bounded` drives a
+/// [`rf_scan::BoundedSink`] that aborts the scan the moment either budget is
+/// crossed, so the residual cost after the limit is one atomic load per
+/// remaining work item rather than the gadgets it would have produced.
+/// The two agree gadget-for-gadget while no budget is set, so the default
+/// path is left exactly as it was.
+pub fn run_scan_engine(view: &RegionView, opts: &ScanOptions) -> Result<Vec<Gadget>, String> {
+    if opts.max_gadgets.is_none() && opts.max_memory.is_none() {
+        return rf_scan::scan_binary(view, opts).map_err(|e| e.to_string());
+    }
+    rf_scan::scan_bounded(view, opts).map_err(|e| match e {
+        rf_scan::Error::Budget { produced, limit } => format!(
+            "scan budget exhausted after {produced} gadgets (limit {limit}); raise \
+             --max-gadgets/--max-memory, lower --depth, or narrow the scan with --section"
+        ),
+        other => other.to_string(),
     })
 }
 
@@ -1161,7 +1521,7 @@ pub fn chain_bytes(
         }
     }
 
-    let prepared = prepare_view(&target, None, &req.section)?;
+    let prepared = prepare_view(&target, None, &req.section, req.arch.as_deref(), req.compat)?;
     let universal_arch = prepared.view.universal.then_some(prepared.view.arch());
     let gadgets = rf_scan::scan_binary(&prepared.view, &opts)
         .map_err(|e| ScanError::Binary(e.to_string()))?;
@@ -1239,30 +1599,40 @@ fn target_base(target: &Target) -> u64 {
 /// first, then --callPreceded. The "Filtered out" line prints even under
 /// --silent because Options runs inside __getGadgets, before the looking
 /// function's silent check.
+///
+/// `json` redirects that line to STDERR. ROPgadget has no --json, so there is
+/// no oracle behaviour to copy here, and a progress line on stdout ahead of
+/// the array makes `--json` unparseable — `--callPreceded --json` emitted
+/// `Options().removeNonCallPreceded(): ...` followed by the JSON and every
+/// consumer (the parity harness included) failed to decode it. Human output
+/// is byte-for-byte unchanged, so the --compat diff against the oracle is
+/// unaffected.
 fn apply_post_filters(
     gadgets: &mut Vec<Gadget>,
     re: &Option<String>,
     call_preceded: bool,
     arch: Arch,
+    json: bool,
     out: &mut dyn std::io::Write,
 ) -> Result<(), String> {
     if let Some(re) = re {
         search::apply_re_filter(gadgets, re)?;
     }
     if call_preceded {
-        if matches!(arch, Arch::X86 | Arch::X64) {
+        let line = if matches!(arch, Arch::X86 | Arch::X64) {
             let before = gadgets.len();
             gadgets.retain(|g| g.prev.as_deref().is_some_and(search::is_call_preceded));
-            let _ = writeln!(
-                out,
+            format!(
                 "Options().removeNonCallPreceded(): Filtered out {} gadgets.",
                 before - gadgets.len()
-            );
+            )
         } else {
-            let _ = writeln!(
-                out,
-                "Options().removeNonCallPreceded(): Unsupported architecture."
-            );
+            "Options().removeNonCallPreceded(): Unsupported architecture.".to_string()
+        };
+        if json {
+            eprintln!("{line}");
+        } else {
+            let _ = writeln!(out, "{line}");
         }
     }
     Ok(())
@@ -1287,6 +1657,12 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
     if cli.noinstr && cli.re.is_some() {
         return Err("--noinstr and --re=<re> can't be used together".to_string());
     }
+    // --cache-purge is maintenance, not analysis: it runs before the
+    // "a binary is required" gate so `rop-finder --cache-purge` works on
+    // its own (CLI-08/PERF-12).
+    if cli.cache_purge {
+        return Ok(run_cache_purge(out));
+    }
     // args.py:142-143: a binary is required unless the console is requested.
     if cli.binary.is_none() && !cli.console {
         return Err("Need a binary filename (--binary/--console or --help)".to_string());
@@ -1298,8 +1674,18 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
     }
 
     let binary = cli.binary.as_deref().unwrap();
-    let bytes = std::fs::read(binary).map_err(|e| format!("cannot read {binary}: {e}"))?;
+    // ROB-06: stat before allocating. `--binary /dev/zero` now errors in
+    // milliseconds instead of consuming the machine.
+    let max_file_size = parse_size(&cli.max_file_size, "--max-file-size")?;
+    let bytes = read_input_file(binary, max_file_size)?;
     let raw = parse_raw_spec(&cli)?;
+
+    let max_memory = cli
+        .max_memory
+        .as_deref()
+        .map(|m| parse_size(m, "--max-memory"))
+        .transpose()?
+        .map(|m| m as usize);
 
     let req = ScanRequest {
         depth: cli.depth,
@@ -1320,6 +1706,10 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
         call_preceded: cli.call_preceded,
         all: cli.all,
         noinstr: cli.noinstr,
+        arch: cli.arch.clone(),
+        max_gadgets: cli.max_gadgets,
+        max_memory,
+        compat: cli.compat,
     };
     let opts = match request_options(&req, raw) {
         Ok(o) => o,
@@ -1396,7 +1786,8 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
         .as_deref()
         .map(|b| parse_hex(b, "--base"))
         .transpose()?;
-    let prepared = match prepare_view(&target, base, &cli.section) {
+    let prepared = match prepare_view(&target, base, &cli.section, cli.arch.as_deref(), cli.compat)
+    {
         Ok(v) => v,
         Err(ScanError::Usage(e)) => return Err(e),
         Err(ScanError::Binary(e) | ScanError::Chain(e)) => return Err(e), // unreachable
@@ -1407,6 +1798,9 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
             "[Warning] binary has no section names (stripped ELF?); \
              executable segments are named PT_LOAD#n"
         );
+    }
+    for w in scan_warnings(&target, &view, cli.cfg_aware, cli.compat) {
+        eprintln!("{w}");
     }
     let universal_arch = view.universal.then_some(view.arch());
 
@@ -1419,8 +1813,13 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
         }
         let delta = view.base.wrapping_sub(orig_base);
         let width8 = search::search_width8(&target, view.arch());
+        // --compat: search the raw file extent a section DECLARES rather
+        // than the content it really owns, reproducing the oracle's
+        // SHT_NOBITS read (see search::compat_bytes).
+        let compat_file = cli.compat.then_some(bytes.as_slice());
         if let Some(s) = &cli.string {
-            let hits = search::find_string(&target, delta, opts.offset, opts.range, s)?;
+            let hits =
+                search::find_string(&target, delta, opts.offset, opts.range, s, compat_file)?;
             if cli.json {
                 // Serialization of this simple structure cannot fail.
                 let _ = writeln!(
@@ -1445,7 +1844,7 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
                 search::print_opcode_hits(&hits, op, width8, out);
             }
         } else if let Some(m) = &cli.memstr {
-            let hits = search::find_memstr(&target, delta, opts.offset, opts.range, m);
+            let hits = search::find_memstr(&target, delta, opts.offset, opts.range, m, compat_file);
             if cli.json {
                 let _ = writeln!(
                     out,
@@ -1461,51 +1860,61 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
     }
 
     let do_scan = |view: &RegionView, opts: &ScanOptions| -> Result<Vec<Gadget>, i32> {
-        match rf_scan::scan_binary(view, opts) {
+        match run_scan_engine(view, opts) {
             Ok(g) => Ok(g),
             Err(e) => {
-                // Scan-time Unsupported errors (e.g. capstone mode) are
+                // Scan-time Unsupported errors (e.g. capstone mode) and
+                // exhausted --max-gadgets/--max-memory budgets are
                 // binary-level failures, like ROPgadget's loader errors.
                 eprintln!("[Error] {e}");
                 Err(2)
             }
         }
     };
+    // Opened once, before the closure, so a cache that cannot be trusted
+    // reports itself exactly once per run.
+    let cache = if cli.cache {
+        let opened = open_cache();
+        if opened.is_none() && cache_dir().is_none() {
+            eprintln!("[Cache] no cache directory (set ROP_FINDER_CACHE_DIR); scanning");
+        }
+        opened
+    } else {
+        None
+    };
     // Gadget acquisition, shared by the --mipsrop and normal paths.
     let acquire = || -> Result<Vec<Gadget>, i32> {
-        if cli.cache {
-            match cache_dir() {
-                Some(dir) => {
-                    let key = cache_key(&bytes, &opts, &cli.section, base);
-                    match cache_load(&dir, &key) {
-                        Some(g) => {
-                            eprintln!("[Cache] hit {} ({} gadgets)", &key[..16], g.len());
-                            Ok(g)
-                        }
-                        None => {
-                            let g = do_scan(&view, &opts)?;
-                            match cache_store(&dir, &key, &g) {
-                                Ok(()) => eprintln!(
-                                    "[Cache] miss {} — stored {} gadgets",
-                                    &key[..16],
-                                    g.len()
-                                ),
-                                Err(e) => {
-                                    eprintln!("[Cache] miss {} — store failed: {e}", &key[..16])
-                                }
-                            }
-                            Ok(g)
-                        }
-                    }
-                }
-                None => {
-                    eprintln!("[Cache] no cache directory (set ROP_FINDER_CACHE_DIR); scanning");
-                    do_scan(&view, &opts)
-                }
-            }
-        } else {
-            do_scan(&view, &opts)
+        let Some(cache) = &cache else {
+            return do_scan(&view, &opts);
+        };
+        let key = cache_key(&bytes, &opts, &CacheIdentity::of(&cli, base));
+        // `load` authenticates and validates; a tampered or corrupt entry
+        // is a warning plus a miss, never a served result (CLI-07, ROB-04).
+        if let Some(g) = cache
+            .load(&key)
+            .as_ref()
+            .and_then(rf_cache::CachedScan::to_scan_gadgets)
+        {
+            eprintln!(
+                "[Cache] hit {} ({} gadgets)",
+                rf_cache::key_prefix(&key),
+                g.len()
+            );
+            return Ok(g);
         }
+        let g = do_scan(&view, &opts)?;
+        match cache.store(&key, &rf_cache::CachedScan::from_scan_gadgets(&g)) {
+            Ok(()) => eprintln!(
+                "[Cache] miss {} — stored {} gadgets",
+                rf_cache::key_prefix(&key),
+                g.len()
+            ),
+            Err(e) => eprintln!(
+                "[Cache] miss {} — store failed: {e}",
+                rf_cache::key_prefix(&key)
+            ),
+        }
+        Ok(g)
     };
 
     // --mipsrop (core.py:118-157): silent check first, then the mode
@@ -1528,7 +1937,14 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
             Ok(g) => g,
             Err(c) => return Ok(c),
         };
-        apply_post_filters(&mut gadgets, &cli.re, cli.call_preceded, view.arch(), out)?;
+        apply_post_filters(
+            &mut gadgets,
+            &cli.re,
+            cli.call_preceded,
+            view.arch(),
+            cli.json,
+            out,
+        )?;
         search::print_mips_gadgets(
             &gadgets,
             &regexes,
@@ -1544,7 +1960,14 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
         Err(c) => return Ok(c),
     };
     // options.py:22-33 — --re then --callPreceded, after the scan.
-    apply_post_filters(&mut gadgets, &cli.re, cli.call_preceded, view.arch(), out)?;
+    apply_post_filters(
+        &mut gadgets,
+        &cli.re,
+        cli.call_preceded,
+        view.arch(),
+        cli.json,
+        out,
+    )?;
     let mut classes: Option<Vec<rf_classify::Classification>> = None;
     if cli.classify || cli.rank {
         let (g, c) = classify_gadgets(gadgets, view.arch(), cli.rank);
@@ -1609,12 +2032,22 @@ pub fn fmt_addr(vaddr: u64, addr_size: usize) -> String {
 /// core.py:99-116 `__lookingForGadgets`. With --noinstr the gadget dicts
 /// carry no text, so the line is the bare address (core.py:110-111);
 /// --dump appends " // hexbytes" (core.py:112).
+///
+/// CLI-11: `noinstr` used to be ignored here on the theory that a
+/// --noinstr scan produced gadgets with empty `insns`. It does not — the
+/// v0.2.0 engine keeps the disassembly and lets --noinstr mean only "skip
+/// dedup and skip the alphabetical sort" (`core.py:87,94`), because
+/// `--filter`/`--badbytes` still have to look at the instructions. The
+/// oracle drops the text at PRINT time (`gadgets.py:117` never stores
+/// `g["gadget"]`, and `core.py:110-111` then formats an empty `insts`), so
+/// the suppression belongs here. Without this, every --noinstr line
+/// carried a ` : <text>` the oracle does not print: 68,386 of 68,390 lines
+/// differed on elf-Linux-x86.
 fn print_human(res: &ScanResult, noinstr: bool, dump: bool, out: &mut dyn std::io::Write) {
-    let _ = noinstr; // noinstr gadgets have empty insns; text() is already ""
     let _ = writeln!(out, "Gadgets information");
     let _ = writeln!(out, "{}", search::RULE60);
     for g in &res.gadgets {
-        let text = g.text();
+        let text = if noinstr { String::new() } else { g.text() };
         let insts = if text.is_empty() {
             String::new()
         } else {
@@ -1698,16 +2131,16 @@ fn print_json(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 5 scan cache (--cache): content-hash + parameter-hash keyed JSON
-// gadget lists on disk.
+// Scan cache (--cache, --cache-purge).
+//
+// The cache itself — the key schema, the HMAC that authenticates an entry,
+// the permissions, the atomic write and the LRU — lives in `rf_cache` and
+// is shared byte for byte with the MCP server. That sharing IS the fix:
+// the ROB-04 char-boundary panic and the ANCH-02 align post-filter each
+// existed twice because there were two copies of this code. What stays
+// here is only what the CLI knows and the library cannot: where the cache
+// directory is, and which flags of *this* front end change the output.
 // ---------------------------------------------------------------------------
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::Digest;
-    let mut h = sha2::Sha256::new();
-    h.update(bytes);
-    format!("{:x}", h.finalize())
-}
 
 /// Cache directory: ROP_FINDER_CACHE_DIR wins, else the platform default
 /// (%LOCALAPPDATA%/rop-finder/cache on Windows, ~/.cache/rop-finder
@@ -1733,118 +2166,158 @@ fn cache_dir() -> Option<std::path::PathBuf> {
     }
 }
 
-/// Cache key: the binary's content hash plus every scan parameter that
-/// can change the output (parallel excluded — output-identical).
-fn cache_key(bytes: &[u8], opts: &ScanOptions, sections: &[String], base: Option<u64>) -> String {
-    let file_hash = sha256_hex(bytes);
-    let param_hash = sha256_hex(
-        format!(
-            "{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{:?}|{:?}|{}|{}|{}",
-            opts.depth,
-            opts.rop,
-            opts.jop,
-            opts.sys,
-            opts.multibr,
-            opts.only,
-            opts.filter,
-            opts.range,
-            opts.badbytes,
-            opts.offset,
-            opts.thumb,
-            opts.cfg_aware,
-            sections,
+/// Everything that changes what a scan produces and is *not* already in
+/// [`ScanOptions`].
+///
+/// CLI-01/ENG-05 was exactly a missing member of this list: the key
+/// omitted `--rawArch`/`--rawMode`/`--rawEndian`, so a cached scan was
+/// served for the wrong architecture. Reproduced on
+/// `tests/fixtures/raw-x86.raw`: `--rawArch x86 --rawMode 32 --cache`
+/// stored 2 gadgets, and `--rawArch arm --rawMode arm --rawEndian little
+/// --cache` was then served those same 2 x86 gadgets, when the true
+/// answer for the ARM query is 0.
+struct CacheIdentity<'a> {
+    /// `--section` globs, as written.
+    sections: &'a [String],
+    /// `--base`, already parsed.
+    base: Option<u64>,
+    /// `--rawArch`/`--rawMode`/`--rawEndian`: which loader runs, and how
+    /// the bytes are decoded. The CLI-01/ENG-05 omission.
+    raw_arch: Option<&'a str>,
+    raw_mode: Option<&'a str>,
+    raw_endian: Option<&'a str>,
+    /// `--arch`: which slice of a fat Mach-O is scanned (CORE-03).
+    arch: Option<&'a str>,
+    /// `--compat`: decides whether a multi-slice container is scanned as a
+    /// concatenation or refused.
+    compat: bool,
+}
+
+impl<'a> CacheIdentity<'a> {
+    fn of(cli: &'a Cli, base: Option<u64>) -> Self {
+        CacheIdentity {
+            sections: &cli.section,
             base,
-            opts.align,
-            opts.call_preceded,
-            opts.all,
-            opts.noinstr
-        )
-        .as_bytes(),
+            raw_arch: cli.raw_arch.as_deref(),
+            raw_mode: cli.raw_mode.as_deref(),
+            raw_endian: cli.raw_endian.as_deref(),
+            arch: cli.arch.as_deref(),
+            compat: cli.compat,
+        }
+    }
+}
+
+/// Cache key: the binary's content hash plus **every** parameter that can
+/// change the output.
+///
+/// `parallel` is the one deliberate omission — rayon scheduling cannot
+/// change the result — and `cancel` is not a parameter. Everything else
+/// goes in: the engine options wave 2A added (`align`, `all`, `noinstr`,
+/// `call_preceded`, `filter_re`), the loader identity above, and the
+/// `--max-gadgets`/`--max-memory` budgets, which *truncate* a result and
+/// so must never let a bounded scan be served for an unbounded query.
+/// [`rf_cache::make_key`] folds in the key-schema version, so the next
+/// time this list grows the old entries miss instead of mismatching.
+fn cache_key(bytes: &[u8], opts: &ScanOptions, id: &CacheIdentity<'_>) -> String {
+    let params = format!(
+        "depth={}|rop={}|jop={}|sys={}|multibr={}|only={:?}|filter={:?}|\
+         filter_re={:?}|range={:?}|badbytes={:?}|offset={}|thumb={}|cfg_aware={}|\
+         align={:?}|call_preceded={}|all={}|noinstr={}|max_gadgets={:?}|\
+         max_memory={:?}|sections={:?}|base={:?}|raw_arch={:?}|raw_mode={:?}|\
+         raw_endian={:?}|arch={:?}|compat={}",
+        opts.depth,
+        opts.rop,
+        opts.jop,
+        opts.sys,
+        opts.multibr,
+        opts.only,
+        opts.filter,
+        opts.filter_re.as_ref().map(regex::Regex::as_str),
+        opts.range,
+        opts.badbytes,
+        opts.offset,
+        opts.thumb,
+        opts.cfg_aware,
+        opts.align,
+        opts.call_preceded,
+        opts.all,
+        opts.noinstr,
+        opts.max_gadgets,
+        opts.max_memory,
+        id.sections,
+        id.base,
+        id.raw_arch,
+        id.raw_mode,
+        id.raw_endian,
+        id.arch,
+        id.compat,
     );
-    // "--" separator: ':' is not allowed in Windows file names.
-    format!("{file_hash}--{param_hash}")
+    rf_cache::make_key(&rf_cache::sha256_hex(bytes), &params)
 }
 
-#[derive(Serialize, serde::Deserialize)]
-struct CacheFile {
-    version: u32,
-    gadgets: Vec<CachedGadget>,
-}
-
-#[derive(Serialize, serde::Deserialize)]
-struct CachedGadget {
-    vaddr: u64,
-    bytes: String,
-    insns: Vec<String>,
-    delay_slot: bool,
-    /// Hex of the up-to-9 preceding section bytes — present only in
-    /// --callPreceded scans.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    prev: Option<String>,
-}
-
-fn cache_load(dir: &std::path::Path, key: &str) -> Option<Vec<Gadget>> {
-    let text = std::fs::read_to_string(dir.join(format!("{key}.json"))).ok()?;
-    let parsed: CacheFile = serde_json::from_str(&text).ok()?;
-    if parsed.version != 1 {
-        return None;
-    }
-    parsed
-        .gadgets
-        .into_iter()
-        .map(|c| {
-            if c.bytes.len() % 2 != 0 {
-                return None;
-            }
-            let bytes: Option<Vec<u8>> = (0..c.bytes.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&c.bytes[i..i + 2], 16).ok())
-                .collect();
-            Some(Gadget {
-                vaddr: c.vaddr,
-                bytes: bytes?,
-                insns: c.insns,
-                delay_slot: c.delay_slot,
-                prev: c.prev.as_deref().and_then(hex_decode),
-            })
-        })
-        .collect()
-}
-
+/// ROB-04. This was `&s[i..i + 2]` — a byte-range slice of a `&str` —
+/// and it is reachable from `--opcode`, not only from the cache:
+/// `rop-finder --binary <elf> --opcode "€€"` aborted the process with
+/// `byte index 2 is not a char boundary; it is inside '€'`. The shared
+/// decoder works over `as_bytes()` and checks the alphabet itself.
+///
+/// `usize::MAX` because `--opcode` has never had a length limit and this
+/// change is about the panic, not about adding one; the *record* fields
+/// that an attacker controls are capped in `rf_cache` instead.
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
+    rf_cache::decode_hex(s, usize::MAX)
 }
 
-fn cache_store(dir: &std::path::Path, key: &str, gadgets: &[Gadget]) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let payload = CacheFile {
-        version: 1,
-        gadgets: gadgets
-            .iter()
-            .map(|g| CachedGadget {
-                vaddr: g.vaddr,
-                bytes: g.bytes_hex(),
-                insns: g.insns.clone(),
-                delay_slot: g.delay_slot,
-                prev: g.prev.as_ref().map(|p| {
-                    let mut s = String::with_capacity(p.len() * 2);
-                    for b in p {
-                        s.push_str(&format!("{b:02x}"));
-                    }
-                    s
-                }),
-            })
-            .collect(),
+/// Open the on-disk cache, or say on stderr why there is none.
+///
+/// CLI-07/MCP-04: when the directory or its key file cannot be trusted,
+/// the cache is *disabled*. It never degrades to unauthenticated reads —
+/// that fallback is the finding.
+fn open_cache() -> Option<rf_cache::DiskCache> {
+    let dir = cache_dir()?;
+    match rf_cache::DiskCache::open(&dir, rf_cache::CacheLimits::from_env()) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("[Cache] disabled: {e}");
+            None
+        }
+    }
+}
+
+/// `--cache-purge` (CLI-08/PERF-12): empty the cache directory and exit.
+/// Before this the only way to reclaim the 5.3 MB per scan configuration
+/// the cache accumulated in `~/.cache/rop-finder` was `rm -rf`, and the
+/// user had to know the path.
+fn run_cache_purge(out: &mut dyn std::io::Write) -> i32 {
+    let Some(dir) = cache_dir() else {
+        eprintln!("[Cache] no cache directory (set ROP_FINDER_CACHE_DIR); nothing to purge");
+        return 0;
     };
-    // Serialization of this simple structure cannot fail.
-    let text = serde_json::to_string(&payload).unwrap();
-    std::fs::write(dir.join(format!("{key}.json")), text)
+    let cache = match rf_cache::DiskCache::open(&dir, rf_cache::CacheLimits::from_env()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "[Error] cannot open the cache directory {}: {e}",
+                dir.display()
+            );
+            return 2;
+        }
+    };
+    match cache.purge() {
+        Ok((files, bytes)) => {
+            let _ = writeln!(
+                out,
+                "Purged {files} cache {} ({bytes} bytes) from {}",
+                if files == 1 { "entry" } else { "entries" },
+                dir.display()
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("[Error] cache purge failed: {e}");
+            2
+        }
+    }
 }
 
 /// CHWIN-09. The Windows VirtualProtect builder emits a chain that does
@@ -1953,6 +2426,7 @@ mod tests {
             classify: false,
             rank: false,
             cache: false,
+            cache_purge: false,
             string: None,
             opcode: None,
             memstr: None,
@@ -1965,6 +2439,11 @@ mod tests {
             mipsrop: None,
             all: false,
             console: false,
+            arch: None,
+            max_file_size: "512M".to_string(),
+            max_gadgets: None,
+            max_memory: None,
+            compat: false,
         }
     }
 
@@ -2005,6 +2484,7 @@ mod tests {
             all: false,
             noinstr: false,
             parallel: true,
+            ..ScanOptions::default()
         }
     }
 
@@ -2092,33 +2572,322 @@ mod tests {
         let mut opts = default_opts();
         opts.depth = 4;
         let dir = TempDir::new("cache");
+        let cache = rf_cache::DiskCache::open(&dir.0, rf_cache::CacheLimits::default()).unwrap();
 
-        let key = cache_key(&bytes, &opts, &[], None);
-        assert!(cache_load(&dir.0, &key).is_none(), "cold cache misses");
-        cache_store(&dir.0, &key, &res.gadgets).unwrap();
-        let loaded = cache_load(&dir.0, &key).expect("warm cache hits");
+        let plain_cli = cli_with(false, None, None, None);
+        let id = CacheIdentity::of(&plain_cli, None);
+        let key = cache_key(&bytes, &opts, &id);
+        assert!(cache.load(&key).is_none(), "cold cache misses");
+        cache
+            .store(&key, &rf_cache::CachedScan::from_scan_gadgets(&res.gadgets))
+            .unwrap();
+        let loaded = cache
+            .load(&key)
+            .and_then(|s| s.to_scan_gadgets())
+            .expect("warm cache hits");
         assert_eq!(loaded.len(), res.gadgets.len());
         for (a, b) in loaded.iter().zip(res.gadgets.iter()) {
             assert_eq!(a.vaddr, b.vaddr);
             assert_eq!(a.bytes, b.bytes);
             assert_eq!(a.insns, b.insns);
             assert_eq!(a.delay_slot, b.delay_slot);
+            assert_eq!(a.prev, b.prev);
         }
 
-        // Every output-affecting parameter changes the key.
-        let by_depth = cache_key(&bytes, &default_opts(), &[], None);
-        assert_ne!(key, by_depth, "depth is part of the key");
-        let by_base = cache_key(&bytes, &opts, &[], Some(0x400000));
-        assert_ne!(key, by_base, "base rebase is part of the key");
-        let by_section = cache_key(&bytes, &opts, &[".text".to_string()], None);
-        assert_ne!(key, by_section, "section selection is part of the key");
-        let by_bytes = cache_key(b"not the same binary", &opts, &[], None);
-        assert_ne!(key, by_bytes, "file content is part of the key");
         // Same inputs → same key (determinism).
-        assert_eq!(key, cache_key(&bytes, &opts, &[], None));
+        assert_eq!(key, cache_key(&bytes, &opts, &id));
         // ':' would be an invalid Windows file name; keys must avoid it.
         assert!(!key.contains(':'));
         drop(view);
+    }
+
+    /// CLI-01/ENG-05 and the wave-2A engine options: every parameter that
+    /// can change the output has to move the key. Each `assert_ne!` below
+    /// that names a raw-loader flag, an align/all/noinstr/callPreceded
+    /// flag or a budget fails against the pre-v0.2 key, which hashed
+    /// eighteen fields and none of these.
+    #[test]
+    fn cache_key_covers_every_output_affecting_parameter() {
+        let bytes = fixture_bytes("elf-Linux-x64");
+        let base_cli = cli_with(false, None, None, None);
+        let opts = default_opts();
+        let key = cache_key(&bytes, &opts, &CacheIdentity::of(&base_cli, None));
+
+        // ScanOptions half.
+        let with = |mutate: &dyn Fn(&mut ScanOptions), what: &str| {
+            let mut o = default_opts();
+            mutate(&mut o);
+            assert_ne!(
+                key,
+                cache_key(&bytes, &o, &CacheIdentity::of(&base_cli, None)),
+                "{what} must be part of the cache key"
+            );
+        };
+        with(&|o| o.depth = 11, "--depth");
+        with(&|o| o.rop = !o.rop, "--norop");
+        with(&|o| o.jop = !o.jop, "--nojop");
+        with(&|o| o.sys = !o.sys, "--nosys");
+        with(&|o| o.multibr = true, "--multibr");
+        with(&|o| o.only = Some(vec!["pop".into()]), "--only");
+        with(&|o| o.filter = vec!["pop".into()], "--filter");
+        with(&|o| o.range = Some((0x1000, 0x2000)), "--range");
+        with(&|o| o.badbytes = vec![0x0a], "--badbytes");
+        with(&|o| o.offset = 0x10, "--offset");
+        with(&|o| o.thumb = true, "--thumb");
+        with(&|o| o.cfg_aware = true, "--cfg-aware");
+        with(&|o| o.align = Some(4), "--align");
+        with(&|o| o.call_preceded = true, "--callPreceded");
+        with(&|o| o.all = true, "--all");
+        with(&|o| o.noinstr = true, "--noinstr");
+        with(&|o| o.max_gadgets = Some(10), "--max-gadgets");
+        with(&|o| o.max_memory = Some(1 << 20), "--max-memory");
+        with(
+            &|o| o.filter_re = Some(regex::Regex::new("pop").unwrap()),
+            "a compiled --filter regex",
+        );
+        // `parallel` is the deliberate exception: it cannot change output.
+        let mut par = default_opts();
+        par.parallel = !par.parallel;
+        assert_eq!(
+            key,
+            cache_key(&bytes, &par, &CacheIdentity::of(&base_cli, None)),
+            "--parallel is output-identical and must NOT split the cache"
+        );
+
+        // CacheIdentity half.
+        let sections = vec![".text".to_string()];
+        let raw_x86 = cli_with(false, Some("x86"), Some("32"), None);
+        let raw_arm = cli_with(false, Some("arm"), Some("arm"), Some("little"));
+        let ids: Vec<(CacheIdentity<'_>, &str)> = vec![
+            (
+                CacheIdentity {
+                    sections: &sections,
+                    ..CacheIdentity::of(&base_cli, None)
+                },
+                "--section",
+            ),
+            (CacheIdentity::of(&base_cli, Some(0x40_0000)), "--base"),
+            (CacheIdentity::of(&raw_x86, None), "--rawArch/--rawMode"),
+            (CacheIdentity::of(&raw_arm, None), "--rawEndian"),
+            (
+                CacheIdentity {
+                    arch: Some("arm64"),
+                    ..CacheIdentity::of(&base_cli, None)
+                },
+                "--arch",
+            ),
+            (
+                CacheIdentity {
+                    compat: true,
+                    ..CacheIdentity::of(&base_cli, None)
+                },
+                "--compat",
+            ),
+        ];
+        for (id, what) in &ids {
+            assert_ne!(
+                key,
+                cache_key(&bytes, &opts, id),
+                "{what} must be part of the cache key"
+            );
+        }
+        // ...and the raw specs differ from EACH OTHER, not just from "none".
+        let x86 = cache_key(&bytes, &opts, &CacheIdentity::of(&raw_x86, None));
+        let arm = cache_key(&bytes, &opts, &CacheIdentity::of(&raw_arm, None));
+        assert_ne!(x86, arm, "--rawArch x86 and arm are different scans");
+
+        // File content, obviously.
+        assert_ne!(
+            key,
+            cache_key(
+                b"not the same binary",
+                &opts,
+                &CacheIdentity::of(&base_cli, None)
+            )
+        );
+    }
+
+    /// Serializes the tests that set `ROP_FINDER_CACHE_DIR`, which is
+    /// process-global.
+    static CACHE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn run_to_string(cli: Cli) -> String {
+        let mut out: Vec<u8> = Vec::new();
+        let code = run(cli, &mut out).expect("no usage error");
+        assert_eq!(code, 0, "scan exited {code}");
+        String::from_utf8(out).unwrap()
+    }
+
+    /// CLI-01/ENG-05, end to end through `run`.
+    ///
+    /// Against the pre-v0.2 key this fails on the first assertion: the ARM
+    /// query is served the x86 entry and prints
+    /// `0x00000010 : xor eax, eax ; ret`, two gadgets, where the truth for
+    /// ARM is zero.
+    #[test]
+    fn a_cached_scan_is_never_served_across_rawarch() {
+        let _guard = CACHE_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = TempDir::new("rawarch");
+        std::env::set_var("ROP_FINDER_CACHE_DIR", &dir.0);
+
+        let raw = format!(
+            "{}/../../tests/fixtures/raw-x86.raw",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mk = |arch: &str, mode: &str, endian: Option<&str>, cache: bool| Cli {
+            binary: Some(raw.clone()),
+            depth: 4,
+            cache,
+            ..cli_with(false, Some(arch), Some(mode), endian)
+        };
+
+        let x86_first = run_to_string(mk("x86", "32", None, true));
+        let arm_cached = run_to_string(mk("arm", "arm", Some("little"), true));
+        let arm_uncached = run_to_string(mk("arm", "arm", Some("little"), false));
+        let x86_uncached = run_to_string(mk("x86", "32", None, false));
+        let x86_hit = run_to_string(mk("x86", "32", None, true));
+
+        assert_ne!(
+            x86_first, arm_cached,
+            "the ARM query was served the x86 cache entry"
+        );
+        assert_eq!(
+            arm_cached, arm_uncached,
+            "the ARM query must reproduce the uncached ARM run byte for byte"
+        );
+        assert_eq!(
+            x86_hit, x86_uncached,
+            "the x86 cache hit must reproduce the uncached x86 run byte for byte"
+        );
+        assert_eq!(x86_first, x86_hit);
+        // One entry per architecture, not one shared between them.
+        let entries = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("rfc"))
+            .count();
+        assert_eq!(entries, 2, "each --rawArch needs its own entry");
+
+        std::env::remove_var("ROP_FINDER_CACHE_DIR");
+    }
+
+    /// CLI-07 through the CLI: a fabricated entry at the deterministic
+    /// file name is not printed. Before v0.2 this run printed
+    /// `0xdeadbeefcafe0000 : pop rdi ; ret`.
+    #[test]
+    fn a_poisoned_cache_entry_is_not_printed() {
+        let _guard = CACHE_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = TempDir::new("poison");
+        std::env::set_var("ROP_FINDER_CACHE_DIR", &dir.0);
+
+        let cli = || Cli {
+            binary: Some(format!(
+                "{}/../../tests/fixtures/elf-Linux-x86",
+                env!("CARGO_MANIFEST_DIR")
+            )),
+            depth: 3,
+            cache: true,
+            ..cli_with(false, None, None, None)
+        };
+        let genuine = run_to_string(cli());
+        assert!(!genuine.contains("0xdeadbeefcafe0000"));
+
+        // Overwrite every entry with the attacker's version, in the shape
+        // the old cache accepted and in the shape the new one writes.
+        let entry = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|s| s.to_str()) == Some("rfc"))
+            .expect("the miss stored an entry");
+        let fabricated = br#"{"version":2,"gadgets":[{"vaddr":"0xdeadbeefcafe0000","bytes":"5fc3","text":"pop rdi ; ret","insns":["pop rdi","ret"]}]}"#;
+        std::fs::write(&entry, fabricated).unwrap();
+        let after_plain = run_to_string(cli());
+        // ...and with the frame header, so only the tag is wrong.
+        let mut framed = Vec::from(b"RFCACHE\x02".as_slice());
+        framed.extend_from_slice(&[0u8; 32]);
+        framed.extend_from_slice(fabricated);
+        std::fs::write(&entry, &framed).unwrap();
+        let after_framed = run_to_string(cli());
+
+        for (what, out) in [("bare JSON", &after_plain), ("bad tag", &after_framed)] {
+            assert!(
+                !out.contains("0xdeadbeefcafe0000"),
+                "{what}: a poisoned entry reached the output"
+            );
+            assert_eq!(out, &genuine, "{what}: the rescan reproduces the truth");
+        }
+
+        std::env::remove_var("ROP_FINDER_CACHE_DIR");
+    }
+
+    /// ROB-04 on the `--opcode` path, which is the same decoder and was
+    /// the same panic: `--opcode "€€"` aborted with
+    /// `byte index 2 is not a char boundary; it is inside '€'`.
+    #[test]
+    fn hex_decode_never_panics_on_non_ascii() {
+        assert_eq!(hex_decode("€€"), None);
+        assert_eq!(hex_decode("c3€"), None);
+        assert_eq!(hex_decode("zz"), None);
+        assert_eq!(hex_decode("c3"), Some(vec![0xc3]));
+        let err = run(
+            Cli {
+                binary: Some(format!(
+                    "{}/../../tests/fixtures/elf-Linux-x86",
+                    env!("CARGO_MANIFEST_DIR")
+                )),
+                opcode: Some("€€".to_string()),
+                ..cli_with(false, None, None, None)
+            },
+            &mut Vec::new(),
+        );
+        assert!(
+            err.unwrap_err().contains("invalid --opcode"),
+            "a bad --opcode is a usage error, not a panic"
+        );
+    }
+
+    /// CLI-08/PERF-12.
+    #[test]
+    fn cache_purge_empties_the_directory() {
+        let _guard = CACHE_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = TempDir::new("purge");
+        std::env::set_var("ROP_FINDER_CACHE_DIR", &dir.0);
+
+        let scan = Cli {
+            binary: Some(format!(
+                "{}/../../tests/fixtures/elf-Linux-x86",
+                env!("CARGO_MANIFEST_DIR")
+            )),
+            depth: 3,
+            cache: true,
+            ..cli_with(false, None, None, None)
+        };
+        run_to_string(scan);
+        let count = |dir: &std::path::Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("rfc"))
+                .count()
+        };
+        assert_eq!(count(&dir.0), 1);
+
+        let report = run_to_string(Cli {
+            cache_purge: true,
+            binary: None,
+            ..cli_with(false, None, None, None)
+        });
+        assert!(report.starts_with("Purged 1 cache entry ("), "{report}");
+        assert_eq!(count(&dir.0), 0);
+
+        std::env::remove_var("ROP_FINDER_CACHE_DIR");
     }
 
     #[test]
@@ -2943,5 +3712,299 @@ mod tests {
             ScanError::Usage(m) => assert!(m.contains("linux-execve"), "{m}"),
             other => panic!("expected Usage, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // ROB-06 - input bounds
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_size_is_decimal_with_binary_suffixes() {
+        assert_eq!(parse_size("512", "x").unwrap(), 512);
+        // The whole point: 16 means SIXTEEN. parse_hex would say 22.
+        assert_eq!(parse_size("16", "x").unwrap(), 16);
+        assert_eq!(parse_size("1K", "x").unwrap(), 1024);
+        assert_eq!(parse_size("1k", "x").unwrap(), 1024);
+        assert_eq!(parse_size("512M", "x").unwrap(), DEFAULT_MAX_FILE_SIZE);
+        assert_eq!(parse_size("2G", "x").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size(" 4M ", "x").unwrap(), 4 * 1024 * 1024);
+        for bad in ["", "0x10", "abc", "-1", "1T", "99999999999999999999G"] {
+            assert!(parse_size(bad, "--max-file-size").is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn check_input_metadata_refuses_non_regular_and_oversized() {
+        let dir = format!("{}/../../tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+        let meta = std::fs::metadata(&dir).unwrap();
+        let err = check_input_metadata(&dir, &meta, DEFAULT_MAX_FILE_SIZE).unwrap_err();
+        assert!(err.contains("directory"), "{err}");
+
+        let f = format!("{dir}/elf-Linux-x86");
+        let meta = std::fs::metadata(&f).unwrap();
+        let len = meta.len();
+        // At the limit: allowed. One byte under: refused, naming both
+        // numbers so the user can raise the cap without guessing.
+        assert!(check_input_metadata(&f, &meta, len).is_ok());
+        let err = check_input_metadata(&f, &meta, len - 1).unwrap_err();
+        assert!(err.contains(&len.to_string()), "{err}");
+        assert!(err.contains(&(len - 1).to_string()), "{err}");
+    }
+
+    #[test]
+    fn read_input_file_honours_the_cap() {
+        let f = format!(
+            "{}/../../tests/fixtures/elf-Linux-x86",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        assert!(read_input_file(&f, 1024).is_err());
+        let got = read_input_file(&f, DEFAULT_MAX_FILE_SIZE).unwrap();
+        assert_eq!(got.len() as u64, std::fs::metadata(&f).unwrap().len());
+    }
+
+    // -----------------------------------------------------------------
+    // CORE-01 / CORE-03 / CORE-05 - refuse rather than fabricate
+    // -----------------------------------------------------------------
+
+    /// CORE-01: the loader refuses, so no caller can hold an image whose
+    /// architecture was guessed. The same bytes used to produce a full
+    /// x86 listing.
+    #[test]
+    fn unrecognized_e_machine_is_a_load_error_not_an_x86_guess() {
+        let mut bytes = fixture_bytes("elf-Linux-x86");
+        bytes[18] = 0x99;
+        bytes[19] = 0x99;
+        let err = scan_bytes(&bytes, None, &ScanRequest::default())
+            .err()
+            .expect("must refuse");
+        match err {
+            ScanError::Binary(m) => {
+                assert!(m.contains("0x9999"), "must name the machine type: {m}");
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+        // ...and --info refuses too, rather than reporting arch "x86".
+        assert!(info_bytes(&bytes, None, None).is_err());
+    }
+
+    /// CORE-03: `resolve_arch` is the refusal gate, and it is the only
+    /// place the decision is made (scan, chain and console all route
+    /// through `prepare_view`).
+    #[test]
+    fn fat_macho_needs_an_explicit_arch() {
+        let bytes = fixture_bytes("UNIVERSAL-x86-x64-libSystem.B.dylib");
+        let target = load_target(&bytes);
+        assert!(matches!(target, Target::Universal(_)));
+
+        let err = resolve_arch(&target, None, false).unwrap_err();
+        match err {
+            ScanError::Usage(m) => {
+                assert!(m.contains("--arch"), "{m}");
+                assert!(m.contains("x86_64") && m.contains("i386"), "{m}");
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+        // --compat opts back into ROPgadget's concatenation.
+        assert_eq!(resolve_arch(&target, None, true).unwrap(), None);
+        // Explicit selection, including aliases and case folding.
+        assert_eq!(
+            resolve_arch(&target, Some("x86_64"), false).unwrap(),
+            Some(Arch::X64)
+        );
+        assert_eq!(
+            resolve_arch(&target, Some("AMD64"), false).unwrap(),
+            Some(Arch::X64)
+        );
+        assert_eq!(
+            resolve_arch(&target, Some("i386"), false).unwrap(),
+            Some(Arch::X86)
+        );
+        assert!(resolve_arch(&target, Some("arm64"), false).is_err());
+        assert!(resolve_arch(&target, Some("nonesuch"), false).is_err());
+    }
+
+    /// The selected slice really is scanned alone: each slice's gadget set
+    /// is a strict subset of the concatenation, and the two differ.
+    #[test]
+    fn fat_macho_slice_selection_scans_one_slice() {
+        let bytes = fixture_bytes("UNIVERSAL-x86-x64-libSystem.B.dylib");
+        let req = |arch: Option<&str>, compat: bool| ScanRequest {
+            arch: arch.map(str::to_string),
+            compat,
+            ..ScanRequest::default()
+        };
+        let keys = |r: &ScanOutcome| -> std::collections::HashSet<(u64, Vec<u8>)> {
+            r.result
+                .gadgets
+                .iter()
+                .map(|g| (g.vaddr, g.bytes.clone()))
+                .collect()
+        };
+        let x64 = scan_bytes(&bytes, None, &req(Some("x86_64"), false)).unwrap();
+        let x86 = scan_bytes(&bytes, None, &req(Some("i386"), false)).unwrap();
+        let cat = scan_bytes(&bytes, None, &req(None, true)).unwrap();
+        let (k64, k86, kc) = (keys(&x64), keys(&x86), keys(&cat));
+        assert!(!k64.is_empty() && !k86.is_empty());
+        assert_ne!(k64, k86);
+        assert!(kc.len() > k64.len());
+
+        // This is CORE-03. The concatenation decodes EVERY slice with the
+        // FIRST slice's decoder (universal.py:92-108, "just return
+        // whatever is in the first binary"), so the x86_64 slice - first
+        // in this container - survives intact while the i386 slice is read
+        // as x86-64. On THIS fixture the two ISAs share most short
+        // encodings, so the damage is mild and measurable rather than
+        // catastrophic: 20 of 185 real i386 gadgets are dropped and one
+        // concatenation entry belongs to neither real slice. (The audit's
+        // 41%-fabricated figure is for an arm64+x86_64 Apple-silicon
+        // binary, where the two decoders share nothing; no such fixture is
+        // in the corpus.) Both directions of the damage are asserted, so
+        // this fails if the concatenation ever silently becomes the union
+        // of two honest scans.
+        assert!(
+            k64.is_subset(&kc),
+            "the first slice decodes correctly in the concatenation"
+        );
+        let lost: Vec<_> = k86.difference(&kc).collect();
+        assert!(
+            !lost.is_empty(),
+            "the concatenation must LOSE real second-slice gadgets"
+        );
+        let real = &k64 | &k86;
+        let fabricated: Vec<_> = kc.difference(&real).collect();
+        assert!(
+            !fabricated.is_empty(),
+            "the concatenation must contain gadgets belonging to NEITHER real slice"
+        );
+    }
+
+    /// `--arch` on a single-architecture image is accepted only when it
+    /// agrees with the image.
+    #[test]
+    fn arch_on_a_single_architecture_image_must_agree() {
+        let target = load_target(&fixture_bytes("elf-Linux-x86"));
+        assert_eq!(
+            resolve_arch(&target, Some("i386"), false).unwrap(),
+            Some(Arch::X86)
+        );
+        assert_eq!(resolve_arch(&target, None, false).unwrap(), None);
+        let err = resolve_arch(&target, Some("arm64"), false).unwrap_err();
+        match err {
+            ScanError::Usage(m) => assert!(m.contains("does not match"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // CRIT-01 / CORE-07 - say it out loud
+    // -----------------------------------------------------------------
+
+    /// `--cfg-aware` on a binary with no landing pads warns instead of
+    /// letting the user read an unconstrained result as a constrained one.
+    #[test]
+    fn cfg_aware_warns_when_ibt_is_not_in_play() {
+        let bytes = fixture_bytes("pe-x64-cmd-v6.1.7601");
+        let target = load_target(&bytes);
+        let view = build_view(&target);
+        let quiet = scan_warnings(&target, &view, false, false);
+        assert!(quiet.is_empty(), "{quiet:?}");
+        let loud = scan_warnings(&target, &view, true, false);
+        assert_eq!(loud.len(), 1, "{loud:?}");
+        assert!(loud[0].contains("endbr"), "{}", loud[0]);
+        assert!(loud[0].contains("GUARD_CF"), "{}", loud[0]);
+    }
+
+    /// CLI-11/`--compat`: the fat-Mach-O escape hatch is never silent.
+    #[test]
+    fn compat_fat_macho_scan_is_announced() {
+        let bytes = fixture_bytes("UNIVERSAL-x86-x64-libSystem.B.dylib");
+        let target = load_target(&bytes);
+        let view = build_view(&target);
+        assert!(scan_warnings(&target, &view, false, false).is_empty());
+        let w = scan_warnings(&target, &view, false, true);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("FABRICATED"), "{}", w[0]);
+    }
+
+    // -----------------------------------------------------------------
+    // PERF-05
+    // -----------------------------------------------------------------
+
+    /// A budget that is not hit changes nothing; a budget that is hit
+    /// reports itself rather than truncating silently.
+    #[test]
+    fn max_gadgets_bounds_the_scan_without_changing_an_unbounded_one() {
+        let bytes = fixture_bytes("macho-x64-ls");
+        let keys = |o: &ScanOutcome| -> Vec<(u64, Vec<u8>)> {
+            o.result
+                .gadgets
+                .iter()
+                .map(|g| (g.vaddr, g.bytes.clone()))
+                .collect()
+        };
+        let plain = scan_bytes(&bytes, None, &ScanRequest::default()).unwrap();
+        let n = plain.result.gadgets.len();
+        assert!(n > 10);
+
+        let generous = scan_bytes(
+            &bytes,
+            None,
+            &ScanRequest {
+                max_gadgets: Some(n * 100),
+                ..ScanRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(keys(&generous), keys(&plain));
+
+        let err = scan_bytes(
+            &bytes,
+            None,
+            &ScanRequest {
+                max_gadgets: Some(5),
+                ..ScanRequest::default()
+            },
+        )
+        .err()
+        .expect("budget must trip");
+        match err {
+            ScanError::Binary(m) => assert!(m.contains("budget"), "{m}"),
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // CLI-11 - the print path
+    // -----------------------------------------------------------------
+
+    /// core.py:110-111: a --noinstr line is the bare address (plus
+    /// " // bytes" under --dump). The engine still carries the text -
+    /// --filter and --badbytes need it - so the suppression is the CLI's.
+    #[test]
+    fn print_human_suppresses_text_under_noinstr() {
+        let res = ScanResult {
+            gadgets: vec![Gadget {
+                vaddr: 0x0804_8000,
+                bytes: vec![0x5f, 0xc3],
+                insns: vec!["pop edi".into(), "ret".into()],
+                delay_slot: false,
+                prev: None,
+                table: rf_scan::TableKind::Rop,
+            }],
+            addr_size: 4,
+            universal_arch: None,
+            selected_sections: None,
+        };
+        let render = |noinstr, dump| {
+            let mut buf: Vec<u8> = Vec::new();
+            print_human(&res, noinstr, dump, &mut buf);
+            String::from_utf8(buf).unwrap()
+        };
+        assert!(render(false, false).contains("0x08048000 : pop edi ; ret\n"));
+        assert!(render(true, false).contains("0x08048000\n"));
+        assert!(!render(true, false).contains("pop edi"));
+        assert!(render(true, true).contains("0x08048000 // 5fc3\n"));
+        assert!(!render(true, true).contains("pop edi"));
+        assert!(render(false, true).contains("0x08048000 : pop edi ; ret // 5fc3\n"));
     }
 }

@@ -1,0 +1,34 @@
+{
+  "fixture": "macho-ppc-openssl",
+  "floor": {
+    "max_ours_only": 0,
+    "min_matched": 106710,
+    "min_ours_total": 106710,
+    "min_text_normalized": 106710
+  },
+  "oracle": {
+    "capstone": "5.0.7",
+    "depth": 10,
+    "extra_flags": [],
+    "ropgadget_commit": "b6e3fe31af46"
+  },
+  "recorded": {
+    "coverage_pct": 100.0,
+    "environment": "win32 python=3.12.10 ROPgadget@b6e3fe31af46 capstone=5.0.7",
+    "matched": 106710,
+    "ours_only": 0,
+    "ours_only_excused": 0,
+    "ours_total": 106710,
+    "ref_only": 0,
+    "ref_only_excused": 0,
+    "ref_total": 106710,
+    "text_divergent": 0,
+    "text_exact": 106710,
+    "text_normalized": 106710,
+    "when": "2026-09-03"
+  },
+  "reference": {
+    "count": 106710,
+    "sha256_vaddr_bytes_set": "bee105a391d99e4b64699df7353acf6025f571b02308ac3c32aa136d606ba355"
+  }
+}

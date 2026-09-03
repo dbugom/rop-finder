@@ -59,7 +59,7 @@ tests/
 | Phase | Deliverable | Status |
 |---|---|---|
 | **0. Spike** | `rf-core` + `rf-scan` MVP: x86/x64 ELF only, memchr anchors, per-start decode cache, JSON out; parity harness | done |
-| **1. Engine** | All ROPgadget arches (capstone-rs), PE/Mach-O/Universal/Raw loaders, rayon parallelism | **partial** — engine and parity done (99.93% over 24 fixtures); the perf exit criterion is NOT MET (see the table above), and the trie index and fuzz corpus are not built |
+| **1. Engine** | All ROPgadget arches (capstone-rs), PE/Mach-O/Universal/Raw loaders, rayon parallelism | **partial** — engine and parity done (99.995% over 24 fixtures); the perf exit criterion is NOT MET (see the table above), and the trie index and fuzz corpus are not built |
 | 2. Features | `--section`, `--base` hardening, `--info` structured binary info | **done** |
 | 3. MCP server | `rf-mcp` stdio tools | **done** |
 | 4a. Chains | Chain IR, Linux execve chains (x86 int 0x80, x64 syscall) | **done** |
@@ -519,9 +519,11 @@ Compares post-dedup `(vaddr, bytes)` gadget sets against
 full fixture corpus (ELF all arches, PE, Mach-O, Universal, raw — raw gets
 `--rawArch=x86 --rawMode=32` on both sides) and prints per-file overlap
 statistics, sample diffs, and per-file timings. Current status
-([`docs/measured-2026-09.md`](docs/measured-2026-09.md)): **763,186 of
-763,718 reference gadgets reproduced — 99.93%** across **24** fixtures, 11
-of which are bit-exact in both directions. The corpus is 24 binaries, not
+([`docs/measured-2026-09.md`](docs/measured-2026-09.md)): **763,166 of
+763,204 reference gadgets reproduced — 99.995%** across **24** fixtures, all
+24 of which are bit-exact by gadget set (22 are also byte-identical in
+rendered instruction text; the other two are recorded intentional
+divergences). The corpus is 24 binaries, not
 25: ROPgadget's own test suite has a 25th, `core` (a 300 KB ET_CORE ELF
 core dump exercising a distinct loader path — no section headers, unusual
 program-header layout), which was never copied into `tests/fixtures/`.
@@ -560,8 +562,8 @@ therefore unmeasured; re-adding the fixture is v0.2 work.
 - **Two different divergence numbers, and they are not interchangeable.**
   Parity is judged on post-dedup `(vaddr, bytes)` SETS: which byte
   sequences at which addresses were found. On that measure the loss is
-  0.07% overall (99.93%, `docs/measured-2026-09.md`) and the residual
-  x86/x64 noise is on the order of a tenth of a percent per fixture
+  0.005% overall (99.995%, `docs/measured-2026-09.md`) and the residual
+  x86/x64 divergence is zero on a default scan
   (`docs/AUDIT-FINDINGS.md` `SCAN-08` confirms the historical
   0.05–0.2% range for this measure) — decoder
   disagreements (capstone accepts some invalid LOCK-prefixed instructions

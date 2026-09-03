@@ -1,0 +1,30 @@
+[package]
+name = "rf-bench"
+description = "Criterion benchmark suite for the rop-finder scan engine (CLAIM-02 / PERF-08)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# This crate exists only to host benches. An empty lib keeps `cargo check -p
+# rf-bench` meaningful and gives the bench targets something to link against.
+
+[dependencies]
+rf-core = { path = "../rf-core" }
+rf-scan = { path = "../rf-scan" }
+
+[dev-dependencies]
+criterion = { workspace = true }
+serde_json.workspace = true
+
+[[bench]]
+name = "scan_throughput"
+harness = false
+
+[[bench]]
+name = "dedup"
+harness = false
+
+[[bench]]
+name = "output"
+harness = false

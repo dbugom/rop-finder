@@ -1,0 +1,220 @@
+{
+  "band": 0.1,
+  "benchmarks": {
+    "output/json/arm64": {
+      "mean_ns": 72177559.99999999,
+      "median_ns": 81572916.66666666,
+      "std_dev_ns": 15974262.605758397,
+      "throughput": {
+        "Elements": 17642
+      }
+    },
+    "output/json/pe-x64": {
+      "mean_ns": 17591229.579173923,
+      "median_ns": 17103268.888888888,
+      "std_dev_ns": 1583401.170496466,
+      "throughput": {
+        "Elements": 12538
+      }
+    },
+    "output/json/x86": {
+      "mean_ns": 94691375.0,
+      "median_ns": 87220825.0,
+      "std_dev_ns": 15347431.130927177,
+      "throughput": {
+        "Elements": 42480
+      }
+    },
+    "output/text/arm64": {
+      "mean_ns": 5523107.150506828,
+      "median_ns": 5708433.333333334,
+      "std_dev_ns": 1181078.45974808,
+      "throughput": {
+        "Elements": 17642
+      }
+    },
+    "output/text/pe-x64": {
+      "mean_ns": 1685927.591224928,
+      "median_ns": 1494771.6666666665,
+      "std_dev_ns": 385645.13220700476,
+      "throughput": {
+        "Elements": 12538
+      }
+    },
+    "output/text/x86": {
+      "mean_ns": 13688271.619784797,
+      "median_ns": 13646306.25,
+      "std_dev_ns": 2881058.9979810393,
+      "throughput": {
+        "Elements": 42480
+      }
+    },
+    "post_process/dedup/arm64": {
+      "mean_ns": 42117327.5,
+      "median_ns": 39838925.0,
+      "std_dev_ns": 8372976.051174759,
+      "throughput": {
+        "Elements": 52115
+      }
+    },
+    "post_process/dedup/pe-x64": {
+      "mean_ns": 7893219.578573967,
+      "median_ns": 8152057.142857143,
+      "std_dev_ns": 1601838.5381362757,
+      "throughput": {
+        "Elements": 18933
+      }
+    },
+    "post_process/dedup/x64": {
+      "mean_ns": 44232992.5,
+      "median_ns": 45380825.0,
+      "std_dev_ns": 6641961.132358166,
+      "throughput": {
+        "Elements": 72334
+      }
+    },
+    "post_process/dedup/x86": {
+      "mean_ns": 38529217.5,
+      "median_ns": 35621700.0,
+      "std_dev_ns": 7467063.920790931,
+      "throughput": {
+        "Elements": 68339
+      }
+    },
+    "post_process/sort_only/arm64": {
+      "mean_ns": 28598810.000000007,
+      "median_ns": 26327400.0,
+      "std_dev_ns": 5101239.667006993,
+      "throughput": {
+        "Elements": 52115
+      }
+    },
+    "post_process/sort_only/pe-x64": {
+      "mean_ns": 4091868.246251491,
+      "median_ns": 4185035.416666667,
+      "std_dev_ns": 689866.0706248408,
+      "throughput": {
+        "Elements": 18933
+      }
+    },
+    "post_process/sort_only/x64": {
+      "mean_ns": 26921905.0,
+      "median_ns": 27900083.333333336,
+      "std_dev_ns": 2761348.592409893,
+      "throughput": {
+        "Elements": 72334
+      }
+    },
+    "post_process/sort_only/x86": {
+      "mean_ns": 26531373.333333332,
+      "median_ns": 26759833.333333336,
+      "std_dev_ns": 2451538.4318342293,
+      "throughput": {
+        "Elements": 68339
+      }
+    },
+    "scan/parallel/arm64": {
+      "mean_ns": 506950240.0,
+      "median_ns": 499258650.0,
+      "std_dev_ns": 68533097.11003712,
+      "throughput": {
+        "Bytes": 808564
+      }
+    },
+    "scan/parallel/armv7": {
+      "mean_ns": 21979826.695767194,
+      "median_ns": 21268034.722222224,
+      "std_dev_ns": 1849064.246625137,
+      "throughput": {
+        "Bytes": 88540
+      }
+    },
+    "scan/parallel/macho-x64": {
+      "mean_ns": 2406806.7367724865,
+      "median_ns": 2423899.3055555555,
+      "std_dev_ns": 85569.56379257045,
+      "throughput": {
+        "Bytes": 15077
+      }
+    },
+    "scan/parallel/pe-x64": {
+      "mean_ns": 25125188.03439153,
+      "median_ns": 24254578.333333336,
+      "std_dev_ns": 2232812.6282323524,
+      "throughput": {
+        "Bytes": 160256
+      }
+    },
+    "scan/parallel/ppc32": {
+      "mean_ns": 1140360720.0,
+      "median_ns": 1178996250.0,
+      "std_dev_ns": 123809884.39113504,
+      "throughput": {
+        "Bytes": 932420
+      }
+    },
+    "scan/parallel/ppc64": {
+      "mean_ns": 601714200.0,
+      "median_ns": 614402050.0,
+      "std_dev_ns": 41113120.36726637,
+      "throughput": {
+        "Bytes": 1138716
+      }
+    },
+    "scan/parallel/riscv64": {
+      "mean_ns": 935687.6695455959,
+      "median_ns": 931349.4553376907,
+      "std_dev_ns": 39441.99669700393,
+      "throughput": {
+        "Bytes": 1988
+      }
+    },
+    "scan/parallel/sparc": {
+      "mean_ns": 37091483.18650793,
+      "median_ns": 36678548.015873015,
+      "std_dev_ns": 1409817.7280763455,
+      "throughput": {
+        "Bytes": 854260
+      }
+    },
+    "scan/parallel/x64": {
+      "mean_ns": 108311183.3333333,
+      "median_ns": 105462500.0,
+      "std_dev_ns": 9890823.65615214,
+      "throughput": {
+        "Bytes": 768026
+      }
+    },
+    "scan/parallel/x86": {
+      "mean_ns": 114325253.33333334,
+      "median_ns": 113854216.66666666,
+      "std_dev_ns": 5051483.034535257,
+      "throughput": {
+        "Bytes": 699757
+      }
+    },
+    "scan/serial/arm64": {
+      "mean_ns": 576227530.0,
+      "median_ns": 575456550.0,
+      "std_dev_ns": 22144438.29382448,
+      "throughput": {
+        "Bytes": 808564
+      }
+    },
+    "scan/serial/x86": {
+      "mean_ns": 184996830.0,
+      "median_ns": 183864000.0,
+      "std_dev_ns": 6779761.275222012,
+      "throughput": {
+        "Bytes": 699757
+      }
+    }
+  },
+  "environment": {
+    "cpu_count": 24,
+    "machine": "AMD64",
+    "os": "Windows",
+    "processor": "AMD64 Family 25 Model 33 Stepping 0, AuthenticAMD",
+    "release": "11"
+  }
+}

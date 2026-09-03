@@ -1,6 +1,6 @@
 {
   "gate": "macro_precision >= 0.90",
-  "held_out": 2872,
+  "held_out": 2860,
   "macro_precision": 1.0,
   "macro_recall": 1.0,
   "passed": true,
@@ -11,7 +11,7 @@
       "fp": 0,
       "precision": 1.0,
       "recall": 1.0,
-      "tp": 1256
+      "tp": 1261
     },
     {
       "class": "stack-pivot",
@@ -19,7 +19,7 @@
       "fp": 0,
       "precision": 1.0,
       "recall": 1.0,
-      "tp": 131
+      "tp": 143
     },
     {
       "class": "mem-read",
@@ -27,7 +27,7 @@
       "fp": 0,
       "precision": 1.0,
       "recall": 1.0,
-      "tp": 1131
+      "tp": 1133
     },
     {
       "class": "mem-write",
@@ -35,7 +35,7 @@
       "fp": 0,
       "precision": 1.0,
       "recall": 1.0,
-      "tp": 1094
+      "tp": 1090
     },
     {
       "class": "arithmetic",
@@ -43,7 +43,7 @@
       "fp": 0,
       "precision": 1.0,
       "recall": 1.0,
-      "tp": 1586
+      "tp": 1594
     },
     {
       "class": "syscall",
@@ -51,7 +51,7 @@
       "fp": 0,
       "precision": 1.0,
       "recall": 1.0,
-      "tp": 22
+      "tp": 18
     },
     {
       "class": "dispatcher",
@@ -59,7 +59,7 @@
       "fp": 0,
       "precision": 1.0,
       "recall": 1.0,
-      "tp": 92
+      "tp": 88
     },
     {
       "class": "other",
@@ -67,8 +67,8 @@
       "fp": 0,
       "precision": 1.0,
       "recall": 1.0,
-      "tp": 639
+      "tp": 625
     }
   ],
-  "samples": 5744
+  "samples": 5720
 }

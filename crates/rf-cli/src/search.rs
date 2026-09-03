@@ -139,21 +139,61 @@ pub struct MemStrHit {
     pub ch: char,
 }
 
+/// `--compat` (CLI-11): re-materialise a section's content the way
+/// ROPgadget does, from the FILE rather than from what the section really
+/// holds at runtime.
+///
+/// `elf.py:332` is `bytes(self.__binary[sh_offset : sh_offset + sh_size])`,
+/// with no check that the section has any file content at all. For an
+/// `SHT_NOBITS` section — `.bss`, which is zero-filled at runtime and
+/// occupies no file bytes — `sh_offset` points at whatever happens to
+/// follow, so the oracle searches `.comment`/`.symtab`/`.strtab` and
+/// reports the hits at `.bss` addresses that hold zeros in the running
+/// process. On tests/fixtures/elf-Linux-x86 that is exactly one phantom
+/// `--string "m..n"` hit, `0x080f4de0 : mmen`, in bytes that are not there.
+///
+/// rf-core clamps `Section::bytes` to the file content a section actually
+/// owns, which is the truthful answer and stays the default. This function
+/// exists so `--compat` can reproduce the oracle bug for bug when a user is
+/// diffing the two tools. Python slicing clamps out of range, so this does
+/// too, and the slice is never longer than the file.
+fn compat_bytes<'a>(sec: &'a Section, file: Option<&'a [u8]>) -> std::borrow::Cow<'a, [u8]> {
+    let Some(file) = file else {
+        return std::borrow::Cow::Borrowed(&sec.bytes);
+    };
+    if sec.bytes.len() as u64 >= sec.size {
+        return std::borrow::Cow::Borrowed(&sec.bytes);
+    }
+    let start = (sec.offset as usize).min(file.len());
+    let end = sec.offset.saturating_add(sec.size).min(file.len() as u64) as usize;
+    if end <= start {
+        return std::borrow::Cow::Borrowed(&sec.bytes);
+    }
+    std::borrow::Cow::Borrowed(&file[start..end])
+}
+
 /// core.py:159-180 `__lookingForAString`: the pattern is a BYTE regex over
 /// the data sections; each hit prints the `pattern.len()` bytes at the
 /// match start, printable-mapped. `delta` is the --base rebase slide;
-/// `offset` is --offset.
+/// `offset` is --offset. `compat_file` is `Some(the raw input)` under
+/// `--compat` — see [`compat_bytes`].
 pub fn find_string(
     target: &Target,
     delta: u64,
     offset: u64,
     range: Option<(u64, u64)>,
     pattern: &str,
+    compat_file: Option<&[u8]>,
 ) -> Result<Vec<StringHit>, String> {
     let re = ByteRegex::new(pattern)
         .map_err(|e| format!("invalid --string byte regex {pattern:?}: {e}"))?;
     let mut hits = Vec::new();
     for sec in data_sections(target) {
+        let content = compat_bytes(&sec, compat_file);
+        let sec = Section {
+            bytes: content.into_owned(),
+            ..sec
+        };
         let vaddr = sec.vaddr.wrapping_add(delta);
         let Some((start, ops)) = section_in_range(vaddr, &sec.bytes, range) else {
             continue;
@@ -216,9 +256,19 @@ pub fn find_memstr(
     offset: u64,
     range: Option<(u64, u64)>,
     memstr: &str,
+    compat_file: Option<&[u8]>,
 ) -> Vec<MemStrHit> {
     let mut sections = exec_search_sections(target);
     sections.extend(data_sections(target));
+    if compat_file.is_some() {
+        sections = sections
+            .into_iter()
+            .map(|sec| Section {
+                bytes: compat_bytes(&sec, compat_file).into_owned(),
+                ..sec
+            })
+            .collect();
+    }
     let mut hits = Vec::new();
     for ch in memstr.chars() {
         let mut buf = [0u8; 4];
@@ -336,28 +386,16 @@ pub fn apply_re_filter(gadgets: &mut Vec<Gadget>, re: &str) -> Result<(), String
     Ok(())
 }
 
-/// options.py:100-120 `__isGadgetCallPreceded`. The six suffix heuristics
-/// over the (up to 9) preceding bytes. Python's `$` matches at the end of
-/// the buffer AND immediately before a trailing 0x0a, so a trailing
-/// newline gives a second effective length.
-pub fn is_call_preceded(prev: &[u8]) -> bool {
-    let check = |eff: &[u8]| {
-        let ends_at = |len: usize, byte: u8| eff.len() >= len && eff[eff.len() - len] == byte;
-        ends_at(5, 0xe8)
-            || ends_at(9, 0xe8)
-            || ends_at(2, 0xff)
-            || ends_at(3, 0xff)
-            || ends_at(4, 0xff)
-            || ends_at(9, 0xff)
-    };
-    if check(prev) {
-        return true;
-    }
-    if prev.last() == Some(&0x0a) {
-        return check(&prev[..prev.len() - 1]);
-    }
-    false
-}
+/// options.py:100-120 `__isGadgetCallPreceded`, re-exported from the engine.
+///
+/// CLI-04/ECO-03: this used to be a second, subtly WRONG copy of the
+/// predicate. `options.py:110` is `\xff` followed by FOUR wildcard bytes,
+/// i.e. `0xff` five bytes back; the copy here tested four bytes back, so it
+/// accepted `ff ?? ?? ??` (nothing ROPgadget calls a call) and rejected the
+/// real five-byte `ff /r disp32` form. The engine owns the predicate now —
+/// it also owns the `prev` bytes it is applied to, so the two halves cannot
+/// drift apart again (rf-scan `engine.rs`).
+pub use rf_scan::is_call_preceded;
 
 // ---------------------------------------------------------------------------
 // --mipsrop (core.py:118-157).
@@ -450,9 +488,11 @@ mod tests {
         assert!(!is_call_preceded(&[1, 2, 3, 4, 5, 6, 0xe8, 8, 9]));
         // ff at eff-2
         assert!(is_call_preceded(&[9, 9, 0xff, 0x14]));
-        // ff at eff-3 / eff-4
+        // ff at eff-3 and eff-5 — options.py:108-111 is \xff followed by
+        // 1, 2, 4 or 8 wildcard bytes, so eff-4 is NOT a call pattern.
         assert!(is_call_preceded(&[0xff, 1, 2]));
-        assert!(is_call_preceded(&[0xff, 1, 2, 3]));
+        assert!(!is_call_preceded(&[0xff, 1, 2, 3]));
+        assert!(is_call_preceded(&[0xff, 1, 2, 3, 4]));
         // ff at eff-9
         assert!(is_call_preceded(&[0xff, 1, 2, 3, 4, 5, 6, 7, 8]));
         // no match

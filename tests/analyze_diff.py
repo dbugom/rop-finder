@@ -9,6 +9,11 @@ Categories for ref-only:
   DECODE        - otherwise (likely capstone vs iced-x86 decode disagreement)
 
 Usage: python tests/analyze_diff.py <fixture>
+
+`<fixture>` may be a bare name from tests/fixtures or a path. The rop-finder
+binary and the ROPgadget oracle are resolved by `tests/rf_paths.py` (CLAIM-08).
+Note `exec_sections` parses ELF section headers only, so this tool is for the
+ELF fixtures; PE/Mach-O diffs are classified by tests/parity.py instead.
 """
 import json
 import os
@@ -17,9 +22,14 @@ import struct
 import subprocess
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(HERE)
-ROPGADGET = os.path.join(os.path.dirname(REPO), "ropgadget", "ROPgadget.py")
+# No __pycache__ beside the harnesses: tests/ is not gitignored for it,
+# and a stray cache directory in a source tree is noise, not a build product.
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import rf_paths  # noqa: E402
+
+HERE = rf_paths.HERE
+REPO = rf_paths.REPO
 REF_LINE = re.compile(r"^(0x[0-9a-f]+)\s*:\s*(.*?)\s*//\s*([0-9a-f]+)\s*$")
 
 
@@ -74,9 +84,18 @@ def norm(text):
 
 
 def main():
+    if len(sys.argv) < 2:
+        sys.exit("usage: python tests/analyze_diff.py <fixture-name-or-path>")
     fixture = sys.argv[1]
-    exe = os.path.join(REPO, "target", "release", "rop-finder.exe")
-    ref = run([sys.executable, ROPGADGET, "--binary", fixture, "--depth", "10", "--dump"], True)
+    if not os.path.exists(fixture):
+        fixture = rf_paths.fixture_path(fixture)
+    if not os.path.exists(fixture):
+        sys.exit(f"no such fixture: {sys.argv[1]}")
+    # CLAIM-08: was `os.path.join(REPO, "target", "release", "rop-finder.exe")`,
+    # a hardcoded Windows name with no fallback, so this script could not run at
+    # all on macOS/Linux. Resolved by platform, and built if absent.
+    exe = rf_paths.rop_finder(release=True)
+    ref = run(rf_paths.oracle_cmd(fixture, depth=10), True)
     ours = run([exe, "--binary", fixture, "--depth", "10", "--json"], False)
     secs = exec_sections(fixture)
 

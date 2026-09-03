@@ -58,6 +58,12 @@ pub struct Console {
     gadgets: Vec<Gadget>,
     addr_size: usize,
     universal_arch: Option<Arch>,
+    /// ROB-06 input cap, inherited from `--max-file-size`.
+    max_file_size: u64,
+    /// CORE-03 `--arch` fat-Mach-O slice, inherited from the command line.
+    arch: Option<String>,
+    /// `--compat`: ROPgadget bug-for-bug fat-Mach-O handling.
+    compat: bool,
 }
 
 impl Console {
@@ -99,9 +105,15 @@ impl Console {
             gadgets: Vec::new(),
             addr_size: 8,
             universal_arch: None,
+            max_file_size: crate::parse_size(&cli.max_file_size, "--max-file-size")?,
+            arch: cli.arch.clone(),
+            compat: cli.compat,
         };
         if let Some(path) = &cli.binary {
-            let bytes = std::fs::read(path).map_err(|_| LOAD_FAIL_MSG.to_string())?;
+            // ROB-06: the console reads whatever path the user types, so it
+            // needs the same stat-first bound as the one-shot CLI.
+            let bytes = crate::read_input_file(path, c.max_file_size)
+                .map_err(|_| LOAD_FAIL_MSG.to_string())?;
             let target = load_target(&bytes, raw).map_err(|e| format!("{LOAD_FAIL_MSG} ({e})"))?;
             c.set_target(target);
         }
@@ -135,6 +147,10 @@ impl Console {
             call_preceded: self.call_preceded,
             all: self.all,
             noinstr: self.noinstr,
+            arch: self.arch.clone(),
+            max_gadgets: None,
+            max_memory: None,
+            compat: self.compat,
         }
     }
 
@@ -151,7 +167,8 @@ impl Console {
             let req = self.scan_request();
             let loaded = (|| -> Result<Vec<Gadget>, String> {
                 let opts = request_options(&req, self.raw).map_err(|e| e.to_string())?;
-                let prepared = prepare_view(target, None, &[]).map_err(|e| e.to_string())?;
+                let prepared = prepare_view(target, None, &[], self.arch.as_deref(), self.compat)
+                    .map_err(|e| e.to_string())?;
                 let view = prepared.view;
                 self.addr_size = view.addr_size();
                 self.universal_arch = view.universal.then_some(view.arch());
@@ -161,6 +178,10 @@ impl Console {
                     &self.re,
                     self.call_preceded,
                     view.arch(),
+                    // The console is a human REPL with no --json mode, so the
+                    // oracle's "Filtered out" line belongs on stdout with the
+                    // rest of the session transcript.
+                    false,
                     out,
                 )?;
                 Ok(gadgets)
@@ -229,7 +250,7 @@ impl Console {
             .unwrap_or(0);
         let width8 = self.arch_width8();
         match which {
-            "string" => match search::find_string(target, 0, offset, range, arg) {
+            "string" => match search::find_string(target, 0, offset, range, arg, None) {
                 Ok(hits) => search::print_string_hits(&hits, width8, out),
                 Err(e) => {
                     let _ = writeln!(out, "[Error] {e}");
@@ -242,7 +263,7 @@ impl Console {
                 }
             },
             "memstr" => {
-                let hits = search::find_memstr(target, 0, offset, range, arg);
+                let hits = search::find_memstr(target, 0, offset, range, arg, None);
                 search::print_memstr_hits(&hits, width8, out);
             }
             _ => unreachable!(),
@@ -333,8 +354,7 @@ fn dispatch(c: &mut Console, line: &str, out: &mut dyn Write) -> bool {
                 // do not split the filename: it might contain whitespaces.
                 c.binary_path = Some(arg.to_string());
                 c.binary_attempted = true;
-                match std::fs::read(arg)
-                    .map_err(|e| e.to_string())
+                match crate::read_input_file(arg, c.max_file_size)
                     .and_then(|b| load_target(&b, c.raw).map_err(|e| e.to_string()))
                 {
                     Ok(t) => {
@@ -597,6 +617,7 @@ mod tests {
             classify: false,
             rank: false,
             cache: false,
+            cache_purge: false,
             string: None,
             opcode: None,
             memstr: None,
@@ -609,6 +630,11 @@ mod tests {
             mipsrop: None,
             all: false,
             console: true,
+            arch: None,
+            max_file_size: "512M".to_string(),
+            max_gadgets: None,
+            max_memory: None,
+            compat: false,
         }
     }
 

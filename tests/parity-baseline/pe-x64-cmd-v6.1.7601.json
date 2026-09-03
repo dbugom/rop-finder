@@ -1,0 +1,34 @@
+{
+  "fixture": "pe-x64-cmd-v6.1.7601",
+  "floor": {
+    "max_ours_only": 0,
+    "min_matched": 12509,
+    "min_ours_total": 12509,
+    "min_text_normalized": 12509
+  },
+  "oracle": {
+    "capstone": "5.0.7",
+    "depth": 10,
+    "extra_flags": [],
+    "ropgadget_commit": "b6e3fe31af46"
+  },
+  "recorded": {
+    "coverage_pct": 100.0,
+    "environment": "win32 python=3.12.10 ROPgadget@b6e3fe31af46 capstone=5.0.7",
+    "matched": 12509,
+    "ours_only": 0,
+    "ours_only_excused": 0,
+    "ours_total": 12509,
+    "ref_only": 0,
+    "ref_only_excused": 0,
+    "ref_total": 12509,
+    "text_divergent": 0,
+    "text_exact": 12509,
+    "text_normalized": 12509,
+    "when": "2026-09-03"
+  },
+  "reference": {
+    "count": 12509,
+    "sha256_vaddr_bytes_set": "91c2dd32358c8533900db7b02b646572c23298029b5ba276860c1f4f7a97b171"
+  }
+}

@@ -309,7 +309,20 @@ pub fn table(kind: TableKind, arch: Arch, endian: Endianness, thumb: bool) -> Ve
                 }
             }
             Jop => arm64_jop(be),
-            Sys => vec![], // gadgets.py:445-446 — TODO in ROPgadget
+            // ANCH-03. ROPgadget leaves this table EMPTY (gadgets.py:445-446
+            // is a bare `TODO`), so `--sys` finds nothing at all on AArch64 —
+            // no `svc` gadget, on the architecture where a syscall gadget is
+            // the whole point of a SYS search. We populate it, which is a
+            // deliberate, RECORDED divergence from the oracle: see
+            // tests/known-divergences.json (kind "extra-anchor-table").
+            //
+            // `SVC #imm16` is `0xd4000001 | (imm16 << 5)`: bits 31..21 are
+            // fixed at 0b11010100000, bits 20..5 hold the immediate and bits
+            // 4..0 are 0b00001. In little-endian byte order that pins byte 3
+            // to 0xd4, constrains byte 2 to 0x00..0x1f (its top three bits
+            // are part of the fixed field) and byte 0 to the eight values
+            // whose low five bits are 0b00001.
+            Sys => arm64_sys(be),
         },
         Arch::Mips32 | Arch::Mips64 => match kind {
             Rop => vec![], // gadgets.py:147-148 — MIPS has no RET
@@ -378,7 +391,13 @@ pub fn table(kind: TableKind, arch: Arch, endian: Endianness, thumb: bool) -> Ve
                     )]
                 }
             }
-            Sys => vec![], // gadgets.py:443-444 — TODO (ta inst) in ROPgadget
+            // ANCH-03, same deliberate divergence as ARM64: ROPgadget's
+            // table is a `TODO (ta inst)` comment (gadgets.py:443-444).
+            // SPARC's software trap is `Ticc` with cond=1000 (always):
+            // `ta %g0 + imm7` is `0x91d02000 | imm7` — `ta 0x10` is the
+            // Solaris/Linux syscall gate. Recorded in
+            // tests/known-divergences.json.
+            Sys => sparc_sys(be),
         },
         Arch::RiscV32 | Arch::RiscV64 => match kind {
             // gadgets.py:193-202 — ROPgadget uses the same table for RV32/RV64
@@ -399,6 +418,41 @@ pub fn table(kind: TableKind, arch: Arch, endian: Endianness, thumb: bool) -> Ve
                 }
             }
         },
+    }
+}
+
+/// ARM64 SYS anchors (ANCH-03 — ROPgadget's table is empty).
+/// `svc #imm16` = `0xd4000001 | (imm16 << 5)`.
+fn arm64_sys(be: bool) -> Vec<Anchor> {
+    /// The low byte's possible values: `0b000` | `imm[2:0] << 5` | `0b00001`.
+    const SVC_LOW: &[(u8, u8)] = &[
+        (0x01, 0x01),
+        (0x21, 0x21),
+        (0x41, 0x41),
+        (0x61, 0x61),
+        (0x81, 0x81),
+        (0xa1, 0xa1),
+        (0xc1, 0xc1),
+        (0xe1, 0xe1),
+    ];
+    /// Byte 2 holds `imm[15:11]` in its low five bits; the top three are 0.
+    const SVC_HIGH: &[(u8, u8)] = &[(0x00, 0x1f)];
+    if be {
+        vec![m("svc", pat!(f(0xd4), r(SVC_HIGH), ANY, r(SVC_LOW)), 4, 4)]
+    } else {
+        vec![m("svc", pat!(r(SVC_LOW), ANY, r(SVC_HIGH), f(0xd4)), 4, 4)]
+    }
+}
+
+/// SPARC SYS anchors (ANCH-03 — ROPgadget's table is empty).
+/// `ta %g0 + imm7` = `0x91d02000 | imm7` (Ticc, cond = always, i = 1,
+/// rs1 = %g0); `ta 0x10` is the Linux/Solaris syscall trap.
+fn sparc_sys(be: bool) -> Vec<Anchor> {
+    const IMM7: &[(u8, u8)] = &[(0x00, 0x7f)];
+    if be {
+        vec![m("ta", pat!(f(0x91), f(0xd0), f(0x20), r(IMM7)), 4, 4)]
+    } else {
+        vec![m("ta", pat!(r(IMM7), f(0x20), f(0xd0), f(0x91)), 4, 4)]
     }
 }
 

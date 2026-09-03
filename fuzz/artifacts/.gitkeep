@@ -1,0 +1,2 @@
+# libFuzzer writes crashers here as artifacts/<target>/crash-<sha1>.
+# They are committed: a crasher found in CI must reproduce from a clean clone.

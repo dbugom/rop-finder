@@ -1,0 +1,34 @@
+{
+  "fixture": "elf-Mips-Defcon-20-pwn100",
+  "floor": {
+    "max_ours_only": 0,
+    "min_matched": 133163,
+    "min_ours_total": 133163,
+    "min_text_normalized": 133163
+  },
+  "oracle": {
+    "capstone": "5.0.7",
+    "depth": 10,
+    "extra_flags": [],
+    "ropgadget_commit": "b6e3fe31af46"
+  },
+  "recorded": {
+    "coverage_pct": 100.0,
+    "environment": "win32 python=3.12.10 ROPgadget@b6e3fe31af46 capstone=5.0.7",
+    "matched": 133163,
+    "ours_only": 0,
+    "ours_only_excused": 0,
+    "ours_total": 133163,
+    "ref_only": 0,
+    "ref_only_excused": 0,
+    "ref_total": 133163,
+    "text_divergent": 0,
+    "text_exact": 133163,
+    "text_normalized": 133163,
+    "when": "2026-09-03"
+  },
+  "reference": {
+    "count": 133163,
+    "sha256_vaddr_bytes_set": "1b8a7ccd17b1087ac18daadd6e6029ffaf42cfde3b45e7d979509e924207c583"
+  }
+}

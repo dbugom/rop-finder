@@ -1,0 +1,27 @@
+[package]
+name = "rf-cache"
+description = "Integrity-tagged, bounded on-disk scan cache shared by the rop-finder CLI and MCP server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rf-scan = { path = "../rf-scan" }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+# 32 random bytes for the entry-authentication key, once per cache
+# directory. Already in the resolved graph (uuid pulls it), so this adds an
+# edge to Cargo.lock, not a package.
+getrandom = "0.4"
+
+# Owner check on a pre-existing cache directory (CLI-07/MCP-04). Windows has
+# no uid; see `store::check_dir_owner` for what is enforced there instead.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
+[dev-dependencies]
+# Only to prove KNOWN_CLASSES has not drifted from the classifier
+# (`known_classes_match_rf_classify`). rf-classify does not depend on
+# rf-cache, so this is not a cycle.
+rf-classify = { path = "../rf-classify" }

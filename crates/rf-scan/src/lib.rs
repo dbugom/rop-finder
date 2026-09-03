@@ -17,11 +17,19 @@
 #![forbid(unsafe_code)]
 
 pub mod anchors;
+pub mod cancel;
 pub mod cs;
 mod engine;
+pub mod sink;
 pub mod x86;
 
-pub use engine::{post_process, scan_binary, scan_section, Gadget, ScanOptions};
+pub use anchors::TableKind;
+pub use cancel::{CancelToken, Error};
+pub use engine::{
+    ibt_applicable, is_call_preceded, post_process, scan_binary, scan_binary_into, scan_bounded,
+    scan_section, Gadget, ScanOptions, PREV_BYTES,
+};
+pub use sink::{BoundedSink, GadgetSink, VecSink};
 
 /// The capstone C library this build is linked against, as `"major.minor"`.
 ///

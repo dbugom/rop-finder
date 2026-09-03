@@ -14,9 +14,12 @@ rf-core = { path = "../rf-core" }
 rf-scan = { path = "../rf-scan" }
 rf-chain = { path = "../rf-chain" }
 rf-classify = { path = "../rf-classify" }
+# CLI-01/ENG-05, CLI-07, ROB-04, CLI-08/PERF-12: the authenticated,
+# bounded scan cache, shared byte for byte with rf-mcp.
+rf-cache = { path = "../rf-cache" }
 clap.workspace = true
 globset = "0.4"
-regex = "1"
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"

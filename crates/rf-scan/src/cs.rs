@@ -29,11 +29,14 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use capstone::{Arch as CsArch, Capstone, Endian as CsEndian, ExtraMode, Mode};
+use regex::Regex;
 
 use rf_core::{Arch, Endianness, Error};
 
-use crate::anchors::{self, Anchor};
-use crate::engine::{Gadget, ScanOptions};
+use crate::anchors::{self, Anchor, TableKind};
+use crate::engine::{
+    step_back, Gadget, ScanCtx, CANCEL_CHECK_CANDIDATES, CANCEL_CHECK_HITS, PREV_BYTES,
+};
 
 /// Static per-arch capstone configuration.
 #[derive(Debug, Clone, Copy)]
@@ -55,8 +58,12 @@ pub struct CsSpec {
 ///  - ARM: `CS_MODE_ARM` or `CS_MODE_THUMB` (gadgets.py:348, 362, 457, 467).
 ///  - MIPS/PPC: ELF class mode (`CS_MODE_32`/`CS_MODE_64`) — ROPgadget's
 ///    `getArchMode` (loaders/elf.py:354-360) is pure ELF-class based.
-///  - RISCV: always `RISCV64 | RISCVC`, even for RV32 binaries
-///    (gadgets.py:202, 392, 479).
+///  - RISCV: ROPgadget hardcodes `CS_MODE_RISCV64 | CS_MODE_RISCVC` even
+///    for RV32 (gadgets.py:202, 392, 479). We select RV32 for an ELFCLASS32
+///    RISC-V image instead (ANCH-04): RV64-only text (`sd`, `ld`, `addiw`,
+///    `c.ldsp`, the `x`-register widths) does not exist on RV32, so the
+///    oracle's mode prints instructions the target cannot execute. This is
+///    a deliberate, recorded divergence — see tests/known-divergences.json.
 pub fn spec(arch: Arch, endian: Endianness, thumb: bool) -> Result<CsSpec, Error> {
     let cs_endian = match endian {
         Endianness::Little => None, // CS_MODE_LITTLE_ENDIAN == 0 (default)
@@ -82,7 +89,8 @@ pub fn spec(arch: Arch, endian: Endianness, thumb: bool) -> Result<CsSpec, Error
         // ROPgadget's ELF loader only maps EM_SPARCv8p; EM_SPARCV9 and
         // 64-bit SPARC get V9 mode here (capstone's only 64-bit SPARC mode).
         Arch::Sparc64 | Arch::SparcV9 => (CsArch::SPARC, Mode::V9, false),
-        Arch::RiscV32 | Arch::RiscV64 => (CsArch::RISCV, Mode::RiscV64, true),
+        Arch::RiscV32 => (CsArch::RISCV, Mode::RiscV32, true),
+        Arch::RiscV64 => (CsArch::RISCV, Mode::RiscV64, true),
     };
     let builtin_filter: &'static [&'static str] = match arch {
         Arch::Arm64 => &["brk", "smc", "hvc"], // gadgets.py:34-35
@@ -223,19 +231,21 @@ fn squash_double_spaces(s: String) -> String {
 /// `--filter` suffix. NO branch-in-middle rejection — that exists only in
 /// `__passCleanX86` (gadgets.py:43-53).
 ///
-/// Note: ROPgadget anchors the user `--filter` regex at both ends
-/// (`re.match("(…)$")`, i.e. full-mnemonic equality); like the x86 engine we
-/// apply the documented Phase-0 suffix matcher instead (see ScanOptions).
+/// SCAN-01/CLI-02: ROPgadget anchors the `--filter` regex at both ends
+/// (`re.match("({})$")`), i.e. a FULL match against the mnemonic — never a
+/// suffix test. `builtin` (ARM64's `brk|smc|hvc`) is the other half of that
+/// same alternation and stays an exact-equality check so the common
+/// no-filter path allocates nothing extra.
 pub fn pass_clean(
     cs: &Capstone,
     decodes: &[WinInsn],
     builtin: &[&str],
-    filter_suffixes: &[String],
+    filter: Option<&Regex>,
 ) -> bool {
     if decodes.is_empty() {
         return true;
     }
-    if builtin.is_empty() && filter_suffixes.is_empty() {
+    if builtin.is_empty() && filter.is_none() {
         return false;
     }
     for d in decodes {
@@ -245,10 +255,7 @@ pub fn pass_clean(
         if builtin.contains(&m.as_str()) {
             return true;
         }
-        if filter_suffixes
-            .iter()
-            .any(|s| !s.is_empty() && m.ends_with(s.as_str()))
-        {
+        if filter.is_some_and(|re| re.is_match(&m)) {
             return true;
         }
     }
@@ -264,49 +271,51 @@ pub fn pass_clean(
 /// address space; otherwise the byte-stepped `ref - i` is used when in
 /// bounds and aligned; otherwise the candidate is skipped.
 #[allow(clippy::too_many_arguments)]
-pub fn scan_anchor(
+pub(crate) fn scan_anchor(
     cs: &Capstone,
     spec: &CsSpec,
     code: &[u8],
     sec_vaddr: u64,
     anchor: &Anchor,
-    opts: &ScanOptions,
+    kind: TableKind,
+    ctx: &ScanCtx<'_>,
     delay_slot: bool,
     out: &mut Vec<Gadget>,
 ) {
-    let align = opts.align.unwrap_or_else(|| anchor.align());
+    let opts = ctx.opts;
+    let align = opts.effective_align(anchor);
     // Max decode window: from the deepest candidate start to the gadget end.
     let window = opts.depth.saturating_sub(1) * align.max(1) + anchor.size();
     // Per-start decode cache (memoization only — does not affect output).
     let mut cache: HashMap<usize, Rc<Vec<WinInsn>>> = HashMap::new();
+    let mut hits = 0usize;
+    let mut candidates = 0usize;
+    let mut item_bytes = 0usize;
 
     for ref_pos in anchors::find_matches(code, anchor) {
+        hits += 1;
+        if hits % CANCEL_CHECK_HITS == 0 && opts.cancel.is_cancelled() {
+            return;
+        }
         let end = ref_pos + anchor.size();
         if end > code.len() {
             continue; // gadgets.py:71
         }
         for i in 0..opts.depth {
-            let stepped = i * align;
-            // Aligned path (gadgets.py:75-81).
-            let aligned_ok = align != 0 && ref_pos >= stepped && {
-                let s = ref_pos - stepped;
-                s < code.len() && (sec_vaddr.wrapping_add(s as u64)) % align as u64 == 0
-            };
-            let start = if aligned_ok {
-                ref_pos - stepped
-            } else {
-                // Byte-by-byte fallback (gadgets.py:82-89).
-                if ref_pos < i {
-                    continue;
+            candidates += 1;
+            if candidates % CANCEL_CHECK_CANDIDATES == 0 {
+                if opts.cancel.is_cancelled() {
+                    return;
                 }
-                let s = ref_pos - i;
-                if s >= code.len() {
-                    continue;
+                if let Some(cap) = ctx.item_cap {
+                    if out.len() >= cap {
+                        return;
+                    }
                 }
-                if align != 0 && (sec_vaddr.wrapping_add(s as u64)) % align as u64 != 0 {
-                    continue;
-                }
-                s
+            }
+            // gadgets.py:73-89, shared with the x86 path.
+            let Some(start) = step_back(ref_pos, i, align, sec_vaddr, code.len()) else {
+                continue;
             };
             let insns = cache
                 .entry(start)
@@ -324,10 +333,10 @@ pub fn scan_anchor(
             if spec.is_riscv && decodes[decodes.len() - 1].size != anchor.size() {
                 continue; // gadgets.py:109-112
             }
-            if pass_clean(cs, decodes, spec.builtin_filter, &opts.filter) {
+            if pass_clean(cs, decodes, spec.builtin_filter, ctx.filter.as_ref()) {
                 continue;
             }
-            out.push(Gadget {
+            let g = Gadget {
                 vaddr: opts
                     .offset
                     .wrapping_add(sec_vaddr)
@@ -337,27 +346,45 @@ pub fn scan_anchor(
                 delay_slot,
                 prev: opts
                     .call_preceded
-                    .then(|| code[start.saturating_sub(9)..start].to_vec()),
-            });
+                    .then(|| code[start.saturating_sub(PREV_BYTES)..start].to_vec()),
+                table: kind,
+            };
+            if let Some(cap) = ctx.item_byte_cap {
+                item_bytes += crate::sink::gadget_bytes(&g);
+                if item_bytes > cap {
+                    out.push(g);
+                    return;
+                }
+            }
+            out.push(g);
         }
     }
 }
 
 /// Scan a buffer for one arch (test helper and serial driver): all enabled
 /// tables in ROP/JOP/SYS order, anchors in table order.
-pub fn scan_buffer(
+#[cfg(test)]
+pub(crate) fn scan_buffer(
     spec: &CsSpec,
     code: &[u8],
     sec_vaddr: u64,
-    tables: &[Vec<Anchor>],
-    opts: &ScanOptions,
+    tables: &[(TableKind, Vec<Anchor>)],
+    opts: &crate::engine::ScanOptions,
     delay_slot: bool,
     out: &mut Vec<Gadget>,
 ) -> Result<(), Error> {
     let cs = open(spec)?;
-    for table in tables {
+    let ctx = ScanCtx {
+        opts,
+        filter: opts.compiled_filter().map_err(rf_core::Error::from)?,
+        item_cap: opts.max_gadgets,
+        item_byte_cap: opts.max_memory,
+    };
+    for (kind, table) in tables {
         for anchor in table {
-            scan_anchor(&cs, spec, code, sec_vaddr, anchor, opts, delay_slot, out);
+            scan_anchor(
+                &cs, spec, code, sec_vaddr, anchor, *kind, &ctx, delay_slot, out,
+            );
         }
     }
     Ok(())
@@ -366,7 +393,8 @@ pub fn scan_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anchors::{self, TableKind};
+    use crate::anchors;
+    use crate::engine::ScanOptions;
 
     fn opts() -> ScanOptions {
         ScanOptions::default()
@@ -377,17 +405,26 @@ mod tests {
         arch: Arch,
         endian: Endianness,
         thumb: bool,
-    ) -> Vec<Vec<Anchor>> {
+    ) -> Vec<(TableKind, Vec<Anchor>)> {
         [
-            kind_enabled
-                .0
-                .then(|| anchors::table(TableKind::Rop, arch, endian, thumb)),
-            kind_enabled
-                .1
-                .then(|| anchors::table(TableKind::Jop, arch, endian, thumb)),
-            kind_enabled
-                .2
-                .then(|| anchors::table(TableKind::Sys, arch, endian, thumb)),
+            kind_enabled.0.then(|| {
+                (
+                    TableKind::Rop,
+                    anchors::table(TableKind::Rop, arch, endian, thumb),
+                )
+            }),
+            kind_enabled.1.then(|| {
+                (
+                    TableKind::Jop,
+                    anchors::table(TableKind::Jop, arch, endian, thumb),
+                )
+            }),
+            kind_enabled.2.then(|| {
+                (
+                    TableKind::Sys,
+                    anchors::table(TableKind::Sys, arch, endian, thumb),
+                )
+            }),
         ]
         .into_iter()
         .flatten()

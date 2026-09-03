@@ -947,3 +947,157 @@ async fn audit_log_is_validated_and_refused_as_unimplemented() {
     assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
     assert!(stderr.contains("not implemented"), "{stderr}");
 }
+// ---------------------------------------------------------------------------
+// ANCH-02 - --align is the engine's alignment, decimal, not an address
+// post-filter parsed as hex
+// ---------------------------------------------------------------------------
+
+/// End to end, through the real server: `--align N` must be ROPgadget's
+/// scan-time alignment.
+///
+/// Two independent defects are asserted dead here.
+///
+/// 1. It used to be an ADDRESS POST-FILTER over a normal align=1 scan.
+///    That is not what `gadgets.py:66-67` does: the oracle also multiplies
+///    the backward depth stride by N, so an `--align 4 --depth 10` run
+///    walks back up to 36 bytes while post-filtering a depth-10 align=1 run
+///    can never expose a gadget reaching more than 9 bytes back. The test
+///    reproduces the old post-filter from the align=1 result and requires
+///    the real answer to be strictly bigger.
+/// 2. The value used to go through `rf_cli::parse_hex`, which always parses
+///    base 16, so `--align 16` meant 0x16 = 22. The test pins 16 and 22 to
+///    different answers and requires "16" and "0x10" to agree.
+#[tokio::test]
+async fn align_is_scan_time_alignment_parsed_as_decimal() {
+    let mut mcp = McpChild::spawn().await;
+    let bin = fixtures_dir().join("macho-x64-ls");
+
+    async fn scan(mcp: &mut McpChild, id: u64, bin: &Path, extra: &[&str]) -> Value {
+        let mut args: Vec<String> = vec!["--depth".into(), "10".into()];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let resp = mcp
+            .call_tool(
+                id,
+                "run_ropgadget_command",
+                json!({"binary_path": bin, "args": args, "max_results": 50000}),
+            )
+            .await;
+        assert_eq!(resp["result"]["isError"], Value::Bool(false), "{resp}");
+        structured(&resp).clone()
+    }
+
+    let plain = scan(&mut mcp, 90, &bin, &[]).await;
+    let a4 = scan(&mut mcp, 91, &bin, &["--align", "4"]).await;
+    let a16 = scan(&mut mcp, 92, &bin, &["--align", "16"]).await;
+    let a16hex = scan(&mut mcp, 93, &bin, &["--align", "0x10"]).await;
+    let a22 = scan(&mut mcp, 94, &bin, &["--align", "22"]).await;
+
+    let count = |v: &Value| v["total_count"].as_u64().expect("total_count");
+    let addrs = |v: &Value| -> Vec<u64> {
+        v["gadgets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| {
+                u64::from_str_radix(g["vaddr"].as_str().unwrap().trim_start_matches("0x"), 16)
+                    .unwrap()
+            })
+            .collect()
+    };
+
+    // (1) The engine option beats the post-filter it replaced.
+    let post_filter_4 = addrs(&plain).iter().filter(|v| *v % 4 == 0).count() as u64;
+    assert!(
+        count(&a4) > post_filter_4,
+        "--align 4 through the engine ({}) must find more than the old address \
+         post-filter over an align=1 scan ({post_filter_4})",
+        count(&a4)
+    );
+    // Every result really is 4-aligned, so this is not just "more gadgets".
+    assert!(addrs(&a4).iter().all(|v| v % 4 == 0));
+
+    // (2) 16 means sixteen. If it were parsed as hex it would equal 22.
+    assert_eq!(
+        count(&a16),
+        count(&a16hex),
+        "\"16\" and \"0x10\" must name the same alignment"
+    );
+    assert_ne!(
+        count(&a16),
+        count(&a22),
+        "--align 16 must not be read as 0x16 = 22"
+    );
+    assert!(addrs(&a16).iter().all(|v| v % 16 == 0));
+
+    // A bad value is a usage error, not a silent alignment of 0.
+    let bad = mcp
+        .call_tool(
+            95,
+            "run_ropgadget_command",
+            json!({"binary_path": bin, "args": ["--align", "eight"]}),
+        )
+        .await;
+    assert_eq!(bad["result"]["isError"], Value::Bool(true), "{bad}");
+}
+
+/// CORE-03 mirrored onto the MCP surface: a multi-slice fat Mach-O is
+/// refused unless the caller names a slice, and `arch` picks one.
+#[tokio::test]
+async fn fat_macho_requires_an_arch_on_the_mcp_surface() {
+    let mut mcp = McpChild::spawn().await;
+    let bin = fixtures_dir().join("UNIVERSAL-x86-x64-libSystem.B.dylib");
+
+    let refused = mcp
+        .call_tool(80, "find_gadgets", json!({"binary_path": bin, "depth": 6}))
+        .await;
+    assert_eq!(refused["result"]["isError"], Value::Bool(true), "{refused}");
+    let text = refused.to_string();
+    assert!(text.contains("arch"), "{text}");
+    assert!(text.contains("x86_64"), "{text}");
+
+    let ok = mcp
+        .call_tool(
+            81,
+            "find_gadgets",
+            json!({"binary_path": bin, "depth": 6, "arch": "x86_64"}),
+        )
+        .await;
+    assert_eq!(ok["result"]["isError"], Value::Bool(false), "{ok}");
+    assert!(structured(&ok)["total_count"].as_u64().unwrap() > 0);
+
+    // The two slices are different scans, and the server never falls back
+    // to ROPgadget's concatenation.
+    let other = mcp
+        .call_tool(
+            82,
+            "find_gadgets",
+            json!({"binary_path": bin, "depth": 6, "arch": "i386"}),
+        )
+        .await;
+    assert_eq!(other["result"]["isError"], Value::Bool(false), "{other}");
+    // Compare the gadget SETS, not the counts: two different slices of a
+    // 32/64-bit pair can coincidentally return the same number.
+    let keys = |v: &Value| -> std::collections::BTreeSet<String> {
+        v["gadgets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| format!("{}|{}", g["vaddr"], g["bytes"]))
+            .collect()
+    };
+    assert_ne!(
+        keys(structured(&ok)),
+        keys(structured(&other)),
+        "the two slices must not produce the same gadget set"
+    );
+
+    // A slice the container does not hold is an error naming what it holds.
+    let missing = mcp
+        .call_tool(
+            83,
+            "find_gadgets",
+            json!({"binary_path": bin, "depth": 6, "arch": "arm64"}),
+        )
+        .await;
+    assert_eq!(missing["result"]["isError"], Value::Bool(true), "{missing}");
+}

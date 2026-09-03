@@ -10,10 +10,29 @@ rf-core = { path = "../rf-core" }
 goblin.workspace = true
 iced-x86.workspace = true
 memchr.workspace = true
-# capstone-rs 0.13.0 (wraps capstone-sys 0.17.0, bundling the C capstone
-# "auto-sync" 5.0.x core: API 5.0 + RISC-V from the next branch — the same
-# core generation as the parity oracle's python capstone 5.0.7). PINNED
-# EXACTLY: capstone disassembly text drifts between releases and is a known
-# parity risk — do not upgrade without re-running tests/parity.py.
-capstone = "=0.13.0"
+# ANCH-05. capstone-rs 0.14.0 wraps capstone-sys 0.18.0, which vendors the C
+# capstone whose header says CS_API_MAJOR 5 / CS_API_MINOR 0 /
+# CS_VERSION_EXTRA 6 — i.e. capstone 5.0.6. The previous pin (0.13.0 ->
+# capstone-sys 0.17.0) vendored CS_VERSION_EXTRA 0, i.e. 5.0.0, while the
+# parity oracle runs the python `capstone` 5.0.7 binding. 0.14.0 is still the
+# 5.0 API (CS_ARCH_ARM64, not capstone 6's CS_ARCH_AARCH64), so it moves
+# TOWARD the oracle rather than past it.
+#
+# Measured on the 24-fixture corpus, (vaddr, bytes) sets vs the oracle dumps,
+# before -> after the bump (docs/measured-2026-09.md):
+#   ARM (A32)   elf-ARMv7-ls     3230 -> 3244 gadgets, 14 missing -> 0
+#   ARM64       elf-ARM64-bash  17642 -> 17653 gadgets, 11 missing -> 0,
+#                               5 text divergences -> 0
+#   MIPS32, PPC32, PPC64, SPARC, RISC-V 32/64: byte-identical, 0 change.
+# No architecture regressed, so the bump is kept.
+#
+# STILL PINNED EXACTLY: capstone disassembly text drifts between releases and
+# is a known parity risk — do not move it without re-running tests/parity.py
+# and re-recording that table.
+capstone = "=0.14.0"
 rayon = "1.10"
+# SCAN-01/CLI-02: ROPgadget's --filter is `re.match("({})$")` over the whole
+# mnemonic, not a suffix test. Declared here rather than in the workspace
+# table because the root Cargo.toml is owned elsewhere this release; promote
+# it to `regex.workspace = true` when rf-cli/rf-mcp need the same crate.
+regex.workspace = true

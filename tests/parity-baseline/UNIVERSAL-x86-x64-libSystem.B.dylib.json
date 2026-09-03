@@ -1,0 +1,34 @@
+{
+  "fixture": "UNIVERSAL-x86-x64-libSystem.B.dylib",
+  "floor": {
+    "max_ours_only": 0,
+    "min_matched": 366,
+    "min_ours_total": 366,
+    "min_text_normalized": 366
+  },
+  "oracle": {
+    "capstone": "5.0.7",
+    "depth": 10,
+    "extra_flags": [],
+    "ropgadget_commit": "b6e3fe31af46"
+  },
+  "recorded": {
+    "coverage_pct": 100.0,
+    "environment": "win32 python=3.12.10 ROPgadget@b6e3fe31af46 capstone=5.0.7",
+    "matched": 366,
+    "ours_only": 0,
+    "ours_only_excused": 0,
+    "ours_total": 366,
+    "ref_only": 0,
+    "ref_only_excused": 0,
+    "ref_total": 366,
+    "text_divergent": 0,
+    "text_exact": 366,
+    "text_normalized": 366,
+    "when": "2026-09-03"
+  },
+  "reference": {
+    "count": 366,
+    "sha256_vaddr_bytes_set": "c440871244d3fdae1312e1754375ff739d16fd191fa9f8994c30a97e313fb296"
+  }
+}

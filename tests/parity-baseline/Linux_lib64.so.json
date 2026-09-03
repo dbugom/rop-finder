@@ -1,0 +1,34 @@
+{
+  "fixture": "Linux_lib64.so",
+  "floor": {
+    "max_ours_only": 0,
+    "min_matched": 53759,
+    "min_ours_total": 53759,
+    "min_text_normalized": 53759
+  },
+  "oracle": {
+    "capstone": "5.0.7",
+    "depth": 10,
+    "extra_flags": [],
+    "ropgadget_commit": "b6e3fe31af46"
+  },
+  "recorded": {
+    "coverage_pct": 100.0,
+    "environment": "win32 python=3.12.10 ROPgadget@b6e3fe31af46 capstone=5.0.7",
+    "matched": 53759,
+    "ours_only": 0,
+    "ours_only_excused": 0,
+    "ours_total": 53759,
+    "ref_only": 0,
+    "ref_only_excused": 0,
+    "ref_total": 53759,
+    "text_divergent": 0,
+    "text_exact": 53759,
+    "text_normalized": 53759,
+    "when": "2026-09-03"
+  },
+  "reference": {
+    "count": 53759,
+    "sha256_vaddr_bytes_set": "5fd7c9c5476cd2f54adeec59c8356cdf1d738491869a0a4957d8e71c6926a91d"
+  }
+}

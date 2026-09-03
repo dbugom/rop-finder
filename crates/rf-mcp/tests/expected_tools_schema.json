@@ -11,6 +11,13 @@
             "null"
           ]
         },
+        "arch": {
+          "description": "Architecture slice for a fat (Universal) Mach-O, e.g. \"x86_64\",\n\"arm64\", \"i386\". REQUIRED for a multi-slice container: without it\nthe scan is refused rather than concatenating slices whose virtual\naddress ranges overlap (CORE-03).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "badbytes": {
           "description": "Reject chain words whose packed value contains these bytes\n(e.g. \"0a|0d\" or \"00-1f\").",
           "type": [
@@ -93,6 +100,13 @@
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "arch": {
+          "description": "Architecture slice for a fat (Universal) Mach-O, e.g. \"x86_64\",\n\"arm64\", \"i386\". REQUIRED for a multi-slice container: without it\nthe scan is refused rather than concatenating slices whose virtual\naddress ranges overlap (CORE-03).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "badbytes": {
           "description": "Reject gadgets whose final address contains these bytes\n(e.g. \"0a|0d\" or \"00-1f\").",
           "type": [
@@ -186,6 +200,13 @@
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "arch": {
+          "description": "Architecture slice for a fat (Universal) Mach-O, e.g. \"x86_64\",\n\"arm64\", \"i386\". REQUIRED for a multi-slice container: without it\nthe scan is refused rather than concatenating slices whose virtual\naddress ranges overlap (CORE-03).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "badbytes": {
           "description": "Reject gadgets whose final address contains these bytes\n(e.g. \"0a|0d\" or \"00-1f\").",
           "type": [
@@ -279,6 +300,13 @@
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "arch": {
+          "description": "Architecture slice for a fat (Universal) Mach-O, e.g. \"x86_64\",\n\"arm64\", \"i386\". REQUIRED for a multi-slice container: without it\nthe scan is refused rather than concatenating slices whose virtual\naddress ranges overlap (CORE-03).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "badbytes": {
           "description": "Reject gadgets whose final address contains these bytes\n(e.g. \"0a|0d\" or \"00-1f\").",
           "type": [
@@ -400,7 +428,7 @@
     "name": "get_server_config"
   },
   {
-    "description": "Run a ROPgadget-style scan with explicit flags. args is a list like [\"--depth\", \"6\", \"--only\", \"pop|ret\"]. Allowlist: --depth --norop --nojop --nosys --only --filter --re --range --section --base --offset --badbytes --align --multibr --json; anything else (--string, --dump, --console, ...) is rejected. Output is always structured JSON.",
+    "description": "Run a ROPgadget-style scan with explicit flags. args is a list like [\"--depth\", \"6\", \"--only\", \"pop|ret\"]. Allowlist: --depth --norop --nojop --nosys --only --filter --re --range --section --base --offset --badbytes --align --multibr --json --arch --all --callPreceded; anything else (--string, --dump, --console, ...) is rejected. --align is ROPgadget's real scan-time alignment (decimal, as in ROPgadget's argparse; write 0x.. only if you mean hex), not an address post-filter. --arch names a fat Mach-O slice and is REQUIRED for a multi-slice binary. Output is always structured JSON.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -447,6 +475,13 @@
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "arch": {
+          "description": "Architecture slice for a fat (Universal) Mach-O, e.g. \"x86_64\",\n\"arm64\", \"i386\". REQUIRED for a multi-slice container: without it\nthe scan is refused rather than concatenating slices whose virtual\naddress ranges overlap (CORE-03).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "badbytes": {
           "description": "Reject gadgets whose final address contains these bytes.",
           "type": [

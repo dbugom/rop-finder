@@ -37,7 +37,7 @@ rop-finder is a rewrite of [ROPgadget](https://github.com/jonathansalwan/ROPgadg
 
 | Capability | Details |
 |---|---|
-| **Gadget discovery** | ROP, JOP, and syscall gadgets; 99.93% parity with ROPgadget across 24 reference binaries — measured on post-dedup `(address, bytes)` sets, **not** on instruction text (see [§10, "Different output from ROPgadget?"](#10-troubleshooting--faq)) |
+| **Gadget discovery** | ROP, JOP, and syscall gadgets; 99.995% parity with ROPgadget across 24 reference binaries — measured on post-dedup `(address, bytes)` sets, **not** on instruction text (see [§10, "Different output from ROPgadget?"](#10-troubleshooting--faq)) |
 | **Formats** | ELF, PE (.exe/.dll), Mach-O, fat/Universal Mach-O, raw blobs |
 | **Architectures** | x86, x64, ARM, Thumb, ARM64, MIPS 32/64, PowerPC 32/64, SPARC, RISC-V 32/64 |
 | **Chain generation** | Linux `execve("/bin//sh")` (x86/x64), emitted as a Python exploit script or JSON IR. Windows `VirtualProtect` (x86/x64) is **experimental** and prints a warning — see [UC6](#uc6--auto-generating-a-windows-virtualprotect-chain) |
@@ -255,52 +255,96 @@ rop-finder additionally has `--section`, `--base`, `--info`, `--classify`,
 
 ### Known divergences
 
-These are the places where the same command produces different output. They
-are real and unfixed as of this release; each names its finding ID in
-[`docs/AUDIT-FINDINGS.md`](docs/AUDIT-FINDINGS.md).
+These are the places where the same command produces different output. Each
+names its finding ID in
+[`docs/AUDIT-FINDINGS.md`](docs/AUDIT-FINDINGS.md). Items 1-6 were the v0.1.1
+divergences and are **fixed in v0.2.0** — they are kept here, with the measured
+result, because the previous release's advice ("do not reuse ROPgadget-era
+greps") is now wrong and saying so is more useful than deleting it. Items 7-13
+are what still differs.
 
-1. **Instruction text differs far more than the gadget sets do** (`SCAN-08`).
-   Parity is measured on post-dedup `(address, bytes)` sets and is 99.93%.
-   The *text* of x86/x64 gadgets diverges in 15–29% of cases, because
-   iced-x86 renders differently from capstone: immediates always in hex
-   (`add rsp, 0x8` vs `add rsp, 8`), no spaces around displacement signs
-   (`[rbp-0x38]` vs `[rbp - 0x38]`), and different mnemonics for
-   `popal`/`popad`, `pushal`/`pushad`, `xlatb` vs `xlat byte ptr [rbx]`,
-   `retf`/`retfq`, `fucompi`/`fucomip`, `call`/`callf`, `jmp`/`jmpf`, and
-   `xrelease mov` for f3-prefixed stores. **Do not reuse ROPgadget-era
-   greps, `--only` lists or `--re` patterns unchanged**: `--only "popal|ret"`,
-   `--only "xlatb"` and `--only "call"` (far calls are `callf` here) all
-   select a different set.
-2. **`--filter` is a literal suffix match, not a regex** (`CLI-02`,
-   `SCAN-01`). `--filter "j.*"` filters nothing here and removes every jump
-   gadget in ROPgadget; `--filter "op"` removes every `pop` gadget here and
-   nothing in ROPgadget. The parity harness does not exercise `--filter`.
-   Scheduled for v0.2.
-3. **`--align` does not deepen the search on x86/x64** (`ANCH-01`,
-   `SCAN-05`). ROPgadget steps candidate starts back by `ref - i*align`, so
-   `--align 4 --depth 10` reaches 36 bytes behind the anchor. On the
-   capstone architectures rop-finder reproduces that stepping exactly
-   (`crates/rf-scan/src/cs.rs`); on x86/x64 it steps by one byte and then
-   discards unaligned starts (`crates/rf-scan/src/engine.rs`), so it reaches
-   only 9 bytes back and returns a subset.
-4. **`--range` with `--offset`** (`SCAN-10`). ROPgadget applies the range
-   twice — once truncating the section on raw addresses, once over the
-   final `--offset`-shifted address. rop-finder only truncates. Without
-   `--offset` the two agree exactly; with it they can disagree completely.
-5. **`--cfg-aware` is a forward-edge CET/IBT filter with a proxy warning**
-   (`CRIT-01`). goblin does not expose the PE load-config CET fields, so the
-   "is this binary hardened?" warning keys on `IMAGE_DLLCHARACTERISTICS_GUARD_CF`
-   — Microsoft's *software* Control Flow Guard, which is a different
-   mitigation from Intel CET/IBT. The filter itself keeps only gadgets
-   entering on `endbr64`/`endbr32`, and no binary in this repository
-   contains those bytes, so **`--cfg-aware` currently returns zero gadgets
-   on every fixture here**. Fix scheduled for v0.2.
-6. **`mov cs, r/m16` gadgets are missing** (`SCAN-09`). iced-x86 rejects the
-   encoding (MOV to CS is architecturally illegal), capstone decodes it and
-   ROPgadget emits the gadget. They are junk gadgets — executing one faults
-   — but they are an undocumented source of missing output.
-7. **Ordering is identical, not different.** Both tools sort alphabetically
-   by gadget text. See [§10](#10-troubleshooting--faq).
+1. **Instruction text on x86/x64 now matches exactly** (`SCAN-08`, fixed in
+   v0.2.0). This entry previously warned that 15-29% of x86/x64 gadget texts
+   diverged and told you not to reuse ROPgadget-era greps. That is no longer
+   true: on a default `--depth 10` scan the rendered text is byte-identical to
+   capstone's on **all 361,954 matched x86/x64 gadgets across the corpus —
+   0 differences**. `--only "popal|ret"`, `--only "xlatb"`, `--only "call"` and
+   `repz ret` all select what ROPgadget selects.
+
+   Two spellings still differ, and only under `--align` or `--all`:
+   `fndisi` where capstone prints `fdisi8087_nop` (an undocumented x87 alias),
+   and `cldemote [eax]` where capstone prints `cldemote byte ptr [eax]`.
+   Three lines total on the whole corpus.
+
+2. **`--filter` is a regex, matched in full** (`CLI-02`, `SCAN-01`, fixed in
+   v0.2.0). `--filter "j.*"` removes every gadget containing a jump, exactly as
+   ROPgadget does; `--filter "op"` matches no mnemonic and so filters nothing
+   (it does **not** remove `pop`). Verified against the oracle on
+   `elf-Linux-x86`: 13,762 and 42,508 gadgets respectively, set-identical.
+
+3. **`--align` steps the candidate start** (`ANCH-01`, `SCAN-05`, fixed in
+   v0.2.0). x86/x64 now steps back by `ref - i*align` like the capstone
+   architectures instead of filtering unaligned starts, so `--align 4 --depth
+   10` reaches the full 36 bytes behind the anchor. Verified on
+   `elf-Linux-x86`: `--align 4` -> 19,240 and `--align 8` -> 9,136, both
+   set-identical to the oracle.
+
+4. **`--range` is applied twice** (`SCAN-10`, fixed in v0.2.0), once truncating
+   the section on raw addresses and once over the final `--offset`-shifted
+   address, matching ROPgadget.
+
+5. **`--cfg-aware` models Intel CET/IBT correctly** (`CRIT-01`, fixed in
+   v0.2.0). It used to require an `endbr32`/`endbr64` at the entry of every
+   gadget, which is a contradiction — IBT does not check returns — and so it
+   returned **zero gadgets on every binary**. It now keeps ROP gadgets
+   unconditionally and requires an endbr entry only for JOP/SYS gadgets, which
+   are the ones reached through an indirect branch. Measured:
+   `pe-x64-cmd-v6.1.7601` 2,097, `pe-x86-cmd-v6.1.7600` 2,304,
+   `elf-Linux-x64` 8,389, `elf-Linux-x86` 12,056. When the image contains no
+   landing pads at all the flag prints a warning saying so, because then it can
+   only ever remove gadgets.
+
+6. **`mov cs, r/m16` gadgets** (`SCAN-09`, fixed in v0.2.0) are no longer
+   missing.
+
+### What still differs
+
+7. **`movdqu` with a redundant `LOCK` prefix** — 18 gadgets under
+   `--align 4` and 3 under `--all` on `elf-Linux-x64`. capstone 5.0.7 accepts
+   `f0 f3 0f 7f 47 f0 c3`; rop-finder's lock whitelist rejects it. These are
+   gadgets ROPgadget finds and rop-finder does not; rop-finder never invents
+   the reverse. Reproduce with
+   `rop-finder --binary tests/fixtures/elf-Linux-x64 --depth 10 --align 4`.
+
+8. **RISC-V 32 gadget text** (`ANCH-04`) — deliberate. ROPgadget opens *every*
+   RISC-V binary in RV64 mode, including ELFCLASS32 ones, and prints RV64-only
+   text for instructions an RV32 target cannot execute. rop-finder decodes an
+   ELFCLASS32 image as RV32. The `(address, bytes)` sets are identical; 68 of
+   279 texts on `elf-Linux-RISCV_32` differ.
+
+9. **Windows ARM Thumb-2 images** (`ANCH-06`) — deliberate. An
+   `IMAGE_FILE_MACHINE_ARMNT` PE is Thumb-2 only. ROPgadget scans it with the
+   A32 tables unless `--thumb` is passed, so its 38 gadgets are
+   misinterpretations of Thumb code; rop-finder routes the image to the Thumb
+   tables and returns a different, correct set of 404.
+
+10. **AArch64 and SPARC `--sys`** (`ANCH-03`) — deliberate. ROPgadget's ARM64
+    and SPARC syscall anchor tables are empty (`gadgets.py` has two `TODO`
+    comments there), so `--sys` returns nothing on AArch64. rop-finder
+    populates them, so its result can be a superset. Neither `bash` fixture in
+    this corpus contains an inline `svc`/`ta`, so on the corpus the two agree.
+
+11. **Unloadable input goes to stderr with exit 2** — deliberate. ROPgadget
+    prints `[Error] Binary format not supported` on *stdout* and exits 1.
+    rop-finder prints a more specific message on *stderr* and exits 2, which is
+    the documented 0/1/2 contract and the better behaviour in a pipeline.
+
+12. **A multi-slice fat Mach-O is refused, not guessed** (`CORE-03`) —
+    deliberate. Pass `--arch <slice>` to choose one, or `--compat` to reproduce
+    ROPgadget's flat concatenation bug-for-bug.
+
+13. **Ordering is identical, not different.** Both tools sort alphabetically
+    by gadget text. See [§10](#10-troubleshooting--faq).
 
 ---
 
@@ -620,7 +664,7 @@ You're comparing absolute addresses across runs. Use `--base 0` (RVA) for analys
 **Different output from ROPgadget?**
 Two answers, for two different questions.
 
-*Which gadgets were found:* the post-dedup `(address, bytes)` sets are 99.93% identical (`docs/measured-2026-09.md`); the ~0.07% that differ are decoder disagreements between iced-x86 and capstone.
+*Which gadgets were found:* the post-dedup `(address, bytes)` sets are 99.995% identical (`docs/measured-2026-09.md`); the ~0.005% that differ are the recorded intentional divergences in `tests/known-divergences.json`.
 
 *How each gadget is printed:* 15–29% of x86/x64 gadget **texts** differ, because the two tools use different disassembler formatters. That is 100–500× the set-level number and it is the one that will bite you, because it breaks greps, `--only` lists and `--re` patterns carried over from ROPgadget. See [known divergences](#known-divergences) for the full list.
 

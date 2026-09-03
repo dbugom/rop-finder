@@ -13,10 +13,10 @@
 //!   stored MSB-first means big-endian.
 //!
 //! Conscious deviations:
-//! - `image_base` = MINIMUM `vmaddr` over all LC_SEGMENT/LC_SEGMENT_64
-//!   commands (PLAN §8 review finding 11). ROPgadget's Mach-O loader has no
-//!   image-base concept at all; min *section* vaddr was considered and
-//!   rejected because sections can sit below their segment's vmaddr.
+//! - `image_base` = the load address of the first real mapping (see
+//!   [`text_image_base`]). ROPgadget's Mach-O loader has no image-base
+//!   concept at all; min *section* vaddr was considered and rejected because
+//!   sections can sit below their segment's vmaddr.
 //! - `writable` is always false: Mach-O sections have no writable flag and
 //!   ROPgadget infers "data" sections only as the complement of the
 //!   instruction-attribute test (macho.py:293-304).
@@ -24,7 +24,7 @@
 use goblin::mach::constants::cputype;
 use goblin::mach::constants::{S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS};
 
-use crate::util::{cstr_lossy, slice_clamped};
+use crate::util::{cstr_lossy, ByteBudget};
 use crate::{Arch, Endianness, Error, Section};
 
 /// A parsed Mach-O binary (single architecture slice).
@@ -36,7 +36,7 @@ pub struct MachOBinary {
     is_64: bool,
     little_endian: bool,
     entry: u64,
-    /// Minimum `vmaddr` over all LC_SEGMENT/LC_SEGMENT_64 commands.
+    /// Load address of the first real mapping — see [`text_image_base`].
     image_base: u64,
     sections: Vec<Section>,
     /// ROPgadget-compatible scan regions: sections with instruction attrs.
@@ -76,6 +76,7 @@ impl MachOBinary {
         let mut sections = Vec::new();
         let mut exec_regions = Vec::new();
         let mut entry = 0u64;
+        let mut budget = ByteBudget::for_file(bytes.len());
         // Section header sizes: segment_command is 56/72 bytes, each
         // section header is 68/80 bytes (32/64-bit Mach-O).
         let seg_hdr: u64 = if is_64 { 72 } else { 56 };
@@ -111,8 +112,11 @@ impl MachOBinary {
                     .wrapping_add(sec.addr)
                     .wrapping_sub(segment.vmaddr)
                     & 0xffff_ffff;
-                let content = slice_clamped(bytes, offset, sec.size);
-                let size = content.len() as u64;
+                let content = budget.take(bytes, offset, sec.size, "Mach-O section headers")?;
+                // CORE-04 — the declared size, as the oracle reports it
+                // (macho.py:263-272 stores `section.size`); `content` stays
+                // clamped to what the file holds.
+                let size = sec.size;
                 // 16-byte sectname, not guaranteed NUL-terminated.
                 let name = cstr_lossy(&sec.sectname);
                 // macho.py:275-278 — entry is the first __text* section addr.
@@ -139,9 +143,7 @@ impl MachOBinary {
             }
         }
 
-        // PLAN §8 review finding 11: min vmaddr over LC_SEGMENT* commands
-        // (e.g. the __TEXT segment), NOT min section vaddr.
-        let image_base = macho.segments.iter().map(|s| s.vmaddr).min().unwrap_or(0);
+        let image_base = text_image_base(macho);
 
         Ok(MachOBinary {
             cpu_type,
@@ -199,7 +201,8 @@ impl MachOBinary {
         &self.exec_regions
     }
 
-    /// Minimum `vmaddr` over all LC_SEGMENT commands, captured at parse time.
+    /// Load address of the image — see [`text_image_base`]. Captured at
+    /// parse time.
     pub fn image_base(&self) -> u64 {
         self.image_base
     }
@@ -217,6 +220,48 @@ impl MachOBinary {
         self.entry = self.entry.wrapping_add(delta);
         self.image_base = new_base;
     }
+}
+
+/// CORE-02 — the Mach-O load address, which is NOT the minimum segment
+/// `vmaddr`.
+///
+/// Every Mach-O *executable* carries a `__PAGEZERO` segment mapped at
+/// vmaddr 0 (its whole job is to make the first pages unmapped), so taking
+/// the minimum `vmaddr` over LC_SEGMENT/LC_SEGMENT_64 commands returned 0
+/// for every executable ever loaded. `--info` then reported
+/// `"image_base": "0x0"` where the real `__TEXT` base is 0x100000000, and
+/// `rebase(new)` computed `delta = new - 0`, so the documented `--base 0`
+/// ASLR workflow was a no-op and `--base <leaked base>` doubled the address.
+///
+/// The rule here, in order:
+///
+/// 1. The `__TEXT` segment's `vmaddr`, if there is one. This is the segment
+///    the loader maps the image at, and it is what `otool -l` readers,
+///    `lldb` and `lipo` all call the load address.
+/// 2. Otherwise the first segment in load-command order that is not
+///    `__PAGEZERO`.
+/// 3. Otherwise the minimum `vmaddr`, or 0 for a file with no segments.
+///
+/// Step 1 exists because "first non-`__PAGEZERO` segment with a NONZERO
+/// vmaddr" — the obvious phrasing — is wrong for dylibs: in
+/// `UNIVERSAL-x86-x64-libSystem.B.dylib` both slices map `__TEXT` at vmaddr
+/// 0x0 and `__DATA` at 0x2000, so a nonzero test picks `__DATA` and reports
+/// a load address 0x2000 above the truth. A dylib's `__TEXT` at 0 is the
+/// correct answer, and step 1 gives it.
+fn text_image_base(macho: &goblin::mach::MachO) -> u64 {
+    let mut first_mapped: Option<u64> = None;
+    for seg in macho.segments.iter() {
+        let name = cstr_lossy(&seg.segname);
+        if name == "__TEXT" {
+            return seg.vmaddr;
+        }
+        if name != "__PAGEZERO" && first_mapped.is_none() {
+            first_mapped = Some(seg.vmaddr);
+        }
+    }
+    first_mapped
+        .or_else(|| macho.segments.iter().map(|s| s.vmaddr).min())
+        .unwrap_or(0)
 }
 
 impl crate::Image for MachOBinary {
@@ -277,7 +322,8 @@ mod tests {
         for s in exec {
             assert!(s.executable);
             assert!(!s.bytes.is_empty());
-            assert_eq!(s.size, s.bytes.len() as u64);
+            // CORE-04: declared size, never below the materialised bytes.
+            assert!(s.size >= s.bytes.len() as u64);
         }
         // entry = __text section address (macho.py:275-278)
         assert_eq!(bin.entry(), bin.exec_scan_regions()[0].vaddr);
@@ -304,13 +350,61 @@ mod tests {
         assert!(bin.entry() != 0);
     }
 
+    /// CORE-02. The old rule (min vmaddr over all LC_SEGMENT commands)
+    /// returned 0 on every one of these, because each carries __PAGEZERO at
+    /// vmaddr 0. The expected values below were read out of the fixtures by
+    /// hand with a struct-by-struct parse of the load commands.
     #[test]
-    fn image_base_is_min_segment_vmaddr() {
-        let bytes = load_fixture("macho-x86-ls");
-        let bin = MachOBinary::parse(&bytes).unwrap();
-        // 32-bit Mach-O: __TEXT is the first segment at vmaddr 0x1000-ish.
-        let exec = bin.exec_scan_regions();
-        assert!(exec[0].vaddr >= bin.image_base());
+    fn image_base_is_the_text_segment_not_pagezero() {
+        for (name, want) in [
+            ("macho-x64-ls", 0x1_0000_0000u64),
+            ("macho-x86-ls", 0x1000),
+            ("macho-ppc-openssl", 0x1000),
+        ] {
+            let bytes = load_fixture(name);
+            let bin = MachOBinary::parse(&bytes).unwrap();
+            assert_eq!(
+                bin.image_base(),
+                want,
+                "{name}: image_base {:#x}, want {want:#x}",
+                bin.image_base()
+            );
+            assert!(bin.exec_scan_regions()[0].vaddr >= bin.image_base());
+            // __PAGEZERO really is present and really is at vmaddr 0, so
+            // the old min-vmaddr rule would have returned 0 here.
+            let macho = goblin::mach::MachO::parse(&bytes, 0).unwrap();
+            let min = macho.segments.iter().map(|s| s.vmaddr).min().unwrap();
+            assert_eq!(min, 0, "{name} must carry a __PAGEZERO at vmaddr 0");
+        }
+    }
+
+    /// CORE-02, the case that rules out "first segment with a NONZERO
+    /// vmaddr": a dylib maps __TEXT at 0 and __DATA at 0x2000, and 0 is the
+    /// right answer.
+    #[test]
+    fn dylib_image_base_is_text_at_zero_not_the_first_nonzero_segment() {
+        let bytes = load_fixture("UNIVERSAL-x86-x64-libSystem.B.dylib");
+        let uni = crate::UniversalBinary::parse(&bytes).unwrap();
+        for slice in uni.slices() {
+            assert_eq!(slice.image_base(), 0, "dylib __TEXT is mapped at 0");
+        }
+    }
+
+    /// `--base 0` must be a real shift on a Mach-O executable, which it was
+    /// not while image_base was 0.
+    #[test]
+    fn rebase_zero_yields_text_relative_addresses() {
+        let bytes = load_fixture("macho-x64-ls");
+        let mut bin = MachOBinary::parse(&bytes).unwrap();
+        let base = bin.image_base();
+        assert_eq!(base, 0x1_0000_0000);
+        let vaddr0 = bin.exec_scan_regions()[0].vaddr;
+        let entry0 = bin.entry();
+        bin.rebase(0);
+        assert_eq!(bin.image_base(), 0);
+        assert_eq!(bin.exec_scan_regions()[0].vaddr, vaddr0 - base);
+        assert_eq!(bin.entry(), entry0 - base);
+        assert!(bin.exec_scan_regions()[0].vaddr < 0x1_0000_0000);
     }
 
     #[test]
@@ -325,6 +419,25 @@ mod tests {
         assert_eq!(bin.image_base(), 0x1000_0000);
         assert_eq!(bin.entry(), entry0.wrapping_add(delta));
         assert_eq!(bin.exec_scan_regions()[0].vaddr, vaddr0.wrapping_add(delta));
+    }
+
+    /// ROB-02's byte budget and de-overlap must not change what a
+    /// well-formed Mach-O materialises: every section still holds its
+    /// declared size, clamped to the file.
+    #[test]
+    fn every_macho_fixture_still_loads_with_full_content() {
+        for name in ["macho-x86-ls", "macho-x64-ls", "macho-ppc-openssl"] {
+            let bytes = load_fixture(name);
+            let bin = MachOBinary::parse(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(!bin.sections().is_empty(), "{name}");
+            for s in bin.sections() {
+                let start = usize::try_from(s.offset).unwrap_or(usize::MAX);
+                let expect = usize::try_from(s.size)
+                    .unwrap_or(usize::MAX)
+                    .min(bytes.len().saturating_sub(start));
+                assert_eq!(s.bytes.len(), expect, "{name} section {}", s.name);
+            }
+        }
     }
 
     #[test]

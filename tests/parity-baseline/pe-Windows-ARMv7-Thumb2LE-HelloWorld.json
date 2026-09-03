@@ -1,0 +1,34 @@
+{
+  "fixture": "pe-Windows-ARMv7-Thumb2LE-HelloWorld",
+  "floor": {
+    "max_ours_only": 0,
+    "min_matched": 0,
+    "min_ours_total": 404,
+    "min_text_normalized": 0
+  },
+  "oracle": {
+    "capstone": "5.0.7",
+    "depth": 10,
+    "extra_flags": [],
+    "ropgadget_commit": "b6e3fe31af46"
+  },
+  "recorded": {
+    "coverage_pct": 0.0,
+    "environment": "win32 python=3.12.10 ROPgadget@b6e3fe31af46 capstone=5.0.7",
+    "matched": 0,
+    "ours_only": 0,
+    "ours_only_excused": 404,
+    "ours_total": 404,
+    "ref_only": 0,
+    "ref_only_excused": 38,
+    "ref_total": 38,
+    "text_divergent": 0,
+    "text_exact": 0,
+    "text_normalized": 0,
+    "when": "2026-09-03"
+  },
+  "reference": {
+    "count": 38,
+    "sha256_vaddr_bytes_set": "fb5c754f530871c98765674d17e74006f33c62467fdb0a07ca64758f1c3f40f8"
+  }
+}

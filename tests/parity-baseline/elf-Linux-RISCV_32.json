@@ -1,0 +1,34 @@
+{
+  "fixture": "elf-Linux-RISCV_32",
+  "floor": {
+    "max_ours_only": 0,
+    "min_matched": 279,
+    "min_ours_total": 279,
+    "min_text_normalized": 211
+  },
+  "oracle": {
+    "capstone": "5.0.7",
+    "depth": 10,
+    "extra_flags": [],
+    "ropgadget_commit": "b6e3fe31af46"
+  },
+  "recorded": {
+    "coverage_pct": 100.0,
+    "environment": "win32 python=3.12.10 ROPgadget@b6e3fe31af46 capstone=5.0.7",
+    "matched": 279,
+    "ours_only": 0,
+    "ours_only_excused": 0,
+    "ours_total": 279,
+    "ref_only": 0,
+    "ref_only_excused": 0,
+    "ref_total": 279,
+    "text_divergent": 68,
+    "text_exact": 211,
+    "text_normalized": 211,
+    "when": "2026-09-03"
+  },
+  "reference": {
+    "count": 279,
+    "sha256_vaddr_bytes_set": "0217e1169580976330bbc4ae1406e2f665b5e96d8a13609a535e6ff2b5a243f4"
+  }
+}

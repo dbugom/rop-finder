@@ -1,0 +1,93 @@
+# cargo-fuzz workspace for rop-finder (ROB-08 / CLAIM-03 / ENG-10).
+#
+# This package is DELIBERATELY NOT a member of the root workspace: it depends
+# on `libfuzzer-sys`, which only builds under a nightly toolchain with the
+# sanitizer runtime, and adding it to the root `members` list would make
+# `cargo build` on stable fail for everyone. The self-contained `[workspace]`
+# stanza at the bottom of this file is what `cargo fuzz init` generates for
+# exactly that reason; nothing in the root Cargo.toml needs to change.
+#
+# The portable smoke harness lives in `smoke/` and is a THIRD workspace (its
+# own `[workspace]` stanza) so that it can be built and run on stable Rust on
+# any platform, including Windows, where cargo-fuzz cannot run at all. See
+# fuzz/README.md.
+
+[package]
+name = "rop-finder-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "BSD-2-Clause"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rf-core = { path = "../crates/rf-core" }
+rf-cli = { path = "../crates/rf-cli" }
+
+# Fuzzing is worthless without optimisation, and worthless without the
+# `debug_assertions` that turn a silent wrong answer into a crash the fuzzer
+# can see. Keep both.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
+# --- loader targets: one per container format (see README "Why four targets") -
+
+[[bin]]
+name = "load_elf"
+path = "fuzz_targets/load_elf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "load_pe"
+path = "fuzz_targets/load_pe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "load_macho"
+path = "fuzz_targets/load_macho.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "load_universal"
+path = "fuzz_targets/load_universal.rs"
+test = false
+doc = false
+bench = false
+
+# --- CLI-level targets ------------------------------------------------------
+
+[[bin]]
+name = "cli_info_bytes"
+path = "fuzz_targets/cli_info_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cli_scan_bytes"
+path = "fuzz_targets/cli_scan_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cli_scan_raw"
+path = "fuzz_targets/cli_scan_raw.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+exclude = ["smoke"]

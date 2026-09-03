@@ -1,0 +1,34 @@
+{
+  "fixture": "elf-FreeBSD-x86",
+  "floor": {
+    "max_ours_only": 0,
+    "min_matched": 11565,
+    "min_ours_total": 11565,
+    "min_text_normalized": 11565
+  },
+  "oracle": {
+    "capstone": "5.0.7",
+    "depth": 10,
+    "extra_flags": [],
+    "ropgadget_commit": "b6e3fe31af46"
+  },
+  "recorded": {
+    "coverage_pct": 100.0,
+    "environment": "win32 python=3.12.10 ROPgadget@b6e3fe31af46 capstone=5.0.7",
+    "matched": 11565,
+    "ours_only": 0,
+    "ours_only_excused": 0,
+    "ours_total": 11565,
+    "ref_only": 0,
+    "ref_only_excused": 0,
+    "ref_total": 11565,
+    "text_divergent": 0,
+    "text_exact": 11565,
+    "text_normalized": 11565,
+    "when": "2026-09-03"
+  },
+  "reference": {
+    "count": 11565,
+    "sha256_vaddr_bytes_set": "89dc550e894d5acf662f8f5516d7526e842b7ebab6b6ac2a3574abe55d3123d9"
+  }
+}

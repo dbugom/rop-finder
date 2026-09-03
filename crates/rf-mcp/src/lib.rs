@@ -44,12 +44,24 @@
 //!   * Errors are structured JSON `{error: {code, message, details?}}` with
 //!     the MCP `isError` flag; the server never panics on malformed input.
 
+// ROB-04. The char-boundary panic (`&c.bytes[i..i + 2]` on a `&str`) was
+// reachable from a poisoned cache entry through the live server. Denying
+// the two lints that permit it means the bug class cannot come back by
+// accident; the checked decoders in `rf_cache` are the way to write it.
+#![deny(clippy::indexing_slicing, clippy::string_slice)]
+
+// `confine` predates this rule and has four indexing sites of its own; the
+// attribute on the module declaration keeps them compiling without editing
+// a file this change has no other business in. Its own wave removes them.
+#[allow(clippy::indexing_slicing)]
 pub mod confine;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
+
+use rf_cache::{CachedGadget, CachedScan};
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -77,12 +89,29 @@ pub const DEFAULT_MAX_CONCURRENT: usize = 2;
 
 /// PLAN §6.1 flag allowlist for `run_ropgadget_command`.
 const ALLOWED_FLAGS: &[&str] = &[
-    "depth", "norop", "nojop", "nosys", "only", "filter", "re", "range", "section", "base",
-    "offset", "badbytes", "align", "multibr", "json",
+    "depth",
+    "norop",
+    "nojop",
+    "nosys",
+    "only",
+    "filter",
+    "re",
+    "range",
+    "section",
+    "base",
+    "offset",
+    "badbytes",
+    "align",
+    "multibr",
+    "json",
+    "arch",
+    "all",
+    "callPreceded",
 ];
 /// Allowlisted flags that take a value (the rest are boolean switches).
 const VALUE_FLAGS: &[&str] = &[
     "depth", "only", "filter", "re", "range", "section", "base", "offset", "badbytes", "align",
+    "arch",
 ];
 
 // ---------------------------------------------------------------------------
@@ -166,29 +195,15 @@ impl ToolError {
 // Cache (content-hash → gadget list)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct CachedGadget {
-    vaddr: String,
-    bytes: String,
-    text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    arch: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    section: Option<String>,
-    /// Phase 5 quality score (TAXONOMY.md R12), computed once at scan
-    /// time; enables `sort_by: "quality"` without rescanning.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    quality: Option<i32>,
-    /// Phase 5 primary class.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    class: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct CachedScan {
-    gadgets: Vec<CachedGadget>,
-    fallback_names: bool,
-}
+// `CachedGadget` and `CachedScan` are `rf_cache`'s, not this crate's —
+// see the `use` at the top of the file. The record, the checked hex
+// decoder, the `validate()` that runs on every deserialize, and the
+// on-disk half of this cache are shared with rf-cli. That sharing is the
+// point of the change: the ROB-04 char-boundary panic existed here *and*
+// at rf-cli/src/lib.rs because there were two copies of the same twenty
+// lines. The serialized shape is unchanged — the fields only rf-cli fills
+// are skipped when empty, so a gadget in a tool response still carries
+// exactly vaddr/bytes/text plus the optional arch/section/quality/class.
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = sha2::Sha256::new();
@@ -198,51 +213,70 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[derive(Default)]
 pub struct Cache {
+    /// Per-process memory cache. Giving *this* half a byte budget and a
+    /// TTL is MCP-05/ROB-07 and lands in v0.3; what v0.2 fixes is the disk
+    /// half, which is the one an attacker can write to.
     mem: Mutex<HashMap<String, Arc<CachedScan>>>,
-    dir: Option<PathBuf>,
+    /// `None` when `--cache-dir` was not given, and also when the
+    /// directory could not be trusted: MCP-04 means an untrustworthy cache
+    /// is *disabled*, never downgraded to unauthenticated reads.
+    disk: Option<rf_cache::DiskCache>,
 }
 
 impl Cache {
     pub fn new(dir: Option<PathBuf>) -> Self {
+        let disk = dir.and_then(|dir| {
+            match rf_cache::DiskCache::open(&dir, rf_cache::CacheLimits::from_env()) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    // stderr, never stdout: stdout is the JSON-RPC transport.
+                    eprintln!("[cache] on-disk cache disabled: {e}");
+                    None
+                }
+            }
+        });
         Cache {
             mem: Mutex::new(HashMap::new()),
-            dir,
+            disk,
         }
     }
 
+    /// A panic anywhere else must not disable the cache for the rest of
+    /// the session, and the map cannot be left half-updated by one: an
+    /// insert either happened or did not.
+    fn mem(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<CachedScan>>> {
+        self.mem.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn get(&self, key: &str) -> Option<Arc<CachedScan>> {
-        if let Some(hit) = self.mem.lock().unwrap().get(key) {
+        if let Some(hit) = self.mem().get(key) {
             return Some(hit.clone());
         }
-        if let Some(dir) = &self.dir {
-            let path = dir.join(format!("{key}.json"));
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                if let Ok(scan) = serde_json::from_str::<CachedScan>(&text) {
-                    let scan = Arc::new(scan);
-                    self.mem
-                        .lock()
-                        .unwrap()
-                        .insert(key.to_string(), scan.clone());
-                    return Some(scan);
-                }
-            }
-        }
-        None
+        // `load` authenticates the entry against the directory's key and
+        // validates every record before it returns: a tampered or corrupt
+        // entry is a warning plus a counter plus a miss (MCP-04, ROB-04).
+        let scan = Arc::new(self.disk.as_ref()?.load(key)?);
+        self.mem().insert(key.to_string(), scan.clone());
+        Some(scan)
     }
 
     fn put(&self, key: &str, scan: CachedScan) -> Arc<CachedScan> {
         let scan = Arc::new(scan);
-        self.mem
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), scan.clone());
-        if let Some(dir) = &self.dir {
-            let path = dir.join(format!("{key}.json"));
-            if let Ok(text) = serde_json::to_string(&*scan) {
-                let _ = std::fs::write(path, text);
+        self.mem().insert(key.to_string(), scan.clone());
+        if let Some(disk) = &self.disk {
+            if let Err(e) = disk.store(key, &scan) {
+                eprintln!("[cache] entry not written: {e}");
             }
         }
         scan
+    }
+
+    /// Integrity and eviction counters for the on-disk half; `None` when
+    /// there is no on-disk half. `get_server_stats` (MCP-09, v0.3) is
+    /// where these surface to an operator.
+    #[must_use]
+    pub fn stats(&self) -> Option<rf_cache::CacheStats> {
+        self.disk.as_ref().map(rf_cache::DiskCache::stats)
     }
 }
 
@@ -278,6 +312,11 @@ pub struct GadgetQuery {
     /// quality score (best gadgets first, ties by address). Anything
     /// else is rejected.
     pub sort_by: Option<String>,
+    /// Architecture slice for a fat (Universal) Mach-O, e.g. "x86_64",
+    /// "arm64", "i386". REQUIRED for a multi-slice container: without it
+    /// the scan is refused rather than concatenating slices whose virtual
+    /// address ranges overlap (CORE-03).
+    pub arch: Option<String>,
     /// Per-request timeout in seconds (default 60, max 300).
     pub timeout_secs: Option<u64>,
 }
@@ -289,41 +328,30 @@ fn arch_from_bytes(bytes: &[u8]) -> Option<rf_core::Arch> {
         LoadedBinary::Elf(b) => Some(Image::arch(&b)),
         LoadedBinary::Pe(b) => Some(Image::arch(&b)),
         LoadedBinary::MachO(b) => Some(Image::arch(&b)),
-        LoadedBinary::Universal(u) => Some(Image::arch(&u.slices()[0])),
+        // `.first()`, not `[0]`: a fat container with no slices is a
+        // malformed input, not a reason to abort the server.
+        LoadedBinary::Universal(u) => u.slices().first().map(Image::arch),
         LoadedBinary::Raw(b) => Some(Image::arch(&b)),
     }
-}
-
-/// Reconstruct a scan gadget from its cached form (for on-demand
-/// classification of cache entries that predate quality caching).
-fn gadget_from_cached(c: &CachedGadget) -> Option<rf_scan::Gadget> {
-    if c.bytes.len() % 2 != 0 {
-        return None;
-    }
-    let bytes: Option<Vec<u8>> = (0..c.bytes.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&c.bytes[i..i + 2], 16).ok())
-        .collect();
-    let vaddr = u64::from_str_radix(c.vaddr.trim_start_matches("0x"), 16).ok()?;
-    Some(rf_scan::Gadget {
-        vaddr,
-        bytes: bytes?,
-        insns: c.text.split(" ; ").map(str::to_string).collect(),
-        delay_slot: false,
-        prev: None,
-    })
 }
 
 /// Order gadgets by Phase 5 quality (descending, vaddr-ascending ties,
 /// R12). Quality missing from a cache entry (old cache file) is computed
 /// on demand from the cached bytes; unclassifiable entries sort last.
+///
+/// ROB-04 lived on this path: the local `gadget_from_cached` sliced the
+/// `bytes` field by byte range and a poisoned entry containing `"€€"`
+/// aborted the server. Reconstruction is now
+/// [`rf_cache::CachedGadget::to_scan_gadget`] — one checked decoder,
+/// shared with the CLI.
 fn sort_by_quality(gadgets: Vec<&CachedGadget>, arch: Option<rf_core::Arch>) -> Vec<&CachedGadget> {
     let mut keyed: Vec<(i32, &CachedGadget)> = gadgets
         .into_iter()
         .map(|g| {
             let q = g.quality.or_else(|| {
                 arch.and_then(|a| {
-                    gadget_from_cached(g).map(|rg| rf_classify::classify(&rg, a).quality)
+                    g.to_scan_gadget()
+                        .map(|rg| rf_classify::classify(&rg, a).quality)
                 })
             });
             (q.unwrap_or(0), g)
@@ -355,6 +383,11 @@ pub struct SearchQuery {
     pub badbytes: Option<String>,
     /// Maximum gadgets returned (default 1000, hard max 50000).
     pub max_results: Option<usize>,
+    /// Architecture slice for a fat (Universal) Mach-O, e.g. "x86_64",
+    /// "arm64", "i386". REQUIRED for a multi-slice container: without it
+    /// the scan is refused rather than concatenating slices whose virtual
+    /// address ranges overlap (CORE-03).
+    pub arch: Option<String>,
     /// Per-request timeout in seconds (default 60, max 300).
     pub timeout_secs: Option<u64>,
 }
@@ -411,6 +444,11 @@ pub struct ChainQuery {
     pub shellcode_addr: Option<String>,
     /// windows-virtualprotect: dwSize argument (hex; default 0x1000).
     pub shellcode_size: Option<String>,
+    /// Architecture slice for a fat (Universal) Mach-O, e.g. "x86_64",
+    /// "arm64", "i386". REQUIRED for a multi-slice container: without it
+    /// the scan is refused rather than concatenating slices whose virtual
+    /// address ranges overlap (CORE-03).
+    pub arch: Option<String>,
     /// Per-request timeout in seconds (default 60, max 300).
     pub timeout_secs: Option<u64>,
 }
@@ -432,10 +470,30 @@ fn clamp_timeout(req: Option<u64>, default: Duration) -> Duration {
 #[derive(Debug)]
 pub struct ParsedArgs {
     pub request: rf_cli::ScanRequest,
-    /// --re post-filter (regex over gadget text).
+    /// --re post-filter (regex over gadget text). This one really is a
+    /// post-filter in ROPgadget too (options.py:22-33).
     pub re: Option<String>,
-    /// --align post-filter (address alignment).
-    pub align: Option<u64>,
+}
+
+/// ANCH-02 - parse `--align` the way ROPgadget's argparse does.
+///
+/// ROPgadget declares `--align` as `type=int`, i.e. DECIMAL. rf-mcp used to
+/// hand the value to `rf_cli::parse_hex`, which strips an optional `0x` and
+/// then always parses base 16, so `--align 16` meant 0x16 = 22 - a
+/// different, and for a power-of-two request nonsensical, alignment.
+/// Decimal first; hexadecimal only when the caller writes an explicit `0x`,
+/// which no ROPgadget user would but an MCP client echoing an address
+/// literal might.
+pub fn parse_align(v: &str) -> Result<usize, String> {
+    let t = v.trim();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        if hex.is_empty() {
+            return Err(format!("invalid --align {v:?}: no digits after 0x"));
+        }
+        return usize::from_str_radix(hex, 16).map_err(|e| format!("invalid --align {v:?}: {e}"));
+    }
+    t.parse::<usize>()
+        .map_err(|e| format!("invalid --align {v:?}: {e}"))
 }
 
 /// Validate `args` against the PLAN §6.1 allowlist and map them onto a
@@ -443,10 +501,9 @@ pub struct ParsedArgs {
 pub fn parse_ropgadget_args(args: &[String]) -> Result<ParsedArgs, ToolError> {
     let mut req = rf_cli::ScanRequest::default();
     let mut re = None;
-    let mut align = None;
     let mut i = 0;
     while i < args.len() {
-        let arg = &args[i];
+        let Some(arg) = args.get(i) else { break };
         let Some(stripped) = arg.strip_prefix("--") else {
             return Err(ToolError::new(
                 "invalid_flag",
@@ -519,25 +576,19 @@ pub fn parse_ropgadget_args(args: &[String]) -> Result<ParsedArgs, ToolError> {
             "offset" => req.offset = value,
             "badbytes" => req.badbytes = value,
             "re" => re = value,
+            "arch" => req.arch = value,
+            "all" => req.all = true,
+            "callPreceded" => req.call_preceded = true,
             "align" => {
+                // ANCH-02: a real engine option, not an address post-filter.
                 let v = value.unwrap();
-                align = Some(
-                    rf_cli::parse_hex(&v, "--align")
-                        .or_else(|_| v.parse::<u64>().map_err(|e| format!("{e}")))
-                        .map_err(|e| {
-                            ToolError::new("usage_error", format!("invalid --align {v:?}: {e}"))
-                        })?,
-                );
+                req.align = Some(parse_align(&v).map_err(|e| ToolError::new("usage_error", e))?);
             }
             _ => unreachable!("allowlist checked above"),
         }
         i += 1;
     }
-    Ok(ParsedArgs {
-        request: req,
-        re,
-        align,
-    })
+    Ok(ParsedArgs { request: req, re })
 }
 
 fn split_sections(section: Option<&str>) -> Vec<String> {
@@ -571,6 +622,13 @@ fn query_to_request(q: &GadgetQuery, rop: bool, jop: bool, sys: bool) -> rf_cli:
         call_preceded: false,
         all: false,
         noinstr: false,
+        arch: q.arch.clone(),
+        max_gadgets: None,
+        max_memory: None,
+        // The MCP server never runs the bug-for-bug ROPgadget fallback: an
+        // agent cannot inspect the output to notice that most of it is
+        // fabricated, so a fat Mach-O without `arch` is always refused.
+        compat: false,
     }
 }
 
@@ -582,9 +640,15 @@ fn query_to_request(q: &GadgetQuery, rop: bool, jop: bool, sys: bool) -> rf_cli:
 #[derive(Default)]
 struct PostOpts {
     /// Regex/substring filter over gadget text (`--re`).
+    ///
+    /// `--align` used to live here as an address post-filter. It does not
+    /// any more (ANCH-02): dropping unaligned addresses out of an align=1
+    /// scan is not what ROPgadget's `--align` does - the oracle also
+    /// multiplies the backward depth stride by N, so post-filtering a
+    /// depth-10 align-1 run can never expose a gadget reaching more than 9
+    /// bytes back. `--align` is now `ScanRequest::align`, which reaches
+    /// `rf_scan::ScanOptions::align` and steps the scan itself.
     re: Option<String>,
-    /// Address alignment filter (`--align`).
-    align: Option<u64>,
     /// Ordering before sampling; only "quality" is supported.
     sort_by: Option<String>,
 }
@@ -732,7 +796,6 @@ impl RopFinderMcp {
     ) -> Result<Value, ToolError> {
         let PostOpts {
             re: post_re,
-            align: post_align,
             sort_by,
         } = post;
         if let Some(sb) = &sort_by {
@@ -755,12 +818,22 @@ impl RopFinderMcp {
             let _permit = permit;
             let bytes = confined.read_all(max_file_bytes)?;
             let file_hash = sha256_hex(&bytes);
-            // base and cfg_aware change the scan output too — they must be
-            // part of the key or different requests would share a cache
-            // entry (cache poisoning).
-            let param_hash = sha256_hex(
-                format!(
-                    "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{}|{}|{}",
+            // CLI-01/ENG-05, the MCP half: every parameter that can change
+            // the output is in the key, or two different requests share an
+            // entry and one of them is served the other's answer. `align`
+            // and `arch` change WHAT IS SCANNED (ANCH-02, CORE-03);
+            // `max_gadgets`/`max_memory` TRUNCATE a result, so a bounded
+            // scan must never be served for an unbounded query; `compat`
+            // decides whether a multi-slice container is scanned at all.
+            // `rf_cache::make_key` folds in the key-schema version, so the
+            // next addition to this list makes old entries MISS.
+            let key = rf_cache::make_key(
+                &file_hash,
+                &format!(
+                    "depth={}|rop={}|jop={}|sys={}|multibr={}|only={}|filter={}|range={}|\
+                     badbytes={}|offset={}|section={:?}|thumb={}|base={}|cfg_aware={}|\
+                     align={:?}|arch={}|all={}|noinstr={}|call_preceded={}|\
+                     max_gadgets={:?}|max_memory={:?}|compat={}",
                     req.depth,
                     req.rop,
                     req.jop,
@@ -774,12 +847,17 @@ impl RopFinderMcp {
                     req.section,
                     req.thumb,
                     req.base.as_deref().unwrap_or(""),
-                    req.cfg_aware
-                )
-                .as_bytes(),
+                    req.cfg_aware,
+                    req.align,
+                    req.arch.as_deref().unwrap_or(""),
+                    req.all,
+                    req.noinstr,
+                    req.call_preceded,
+                    req.max_gadgets,
+                    req.max_memory,
+                    req.compat,
+                ),
             );
-            // "--" separator: ':' is not allowed in Windows file names.
-            let key = format!("{file_hash}--{param_hash}");
             let (scan, cache_status) = match cache.get(&key) {
                 Some(hit) => (hit, "hit"),
                 None => {
@@ -806,6 +884,10 @@ impl RopFinderMcp {
                                 }),
                                 quality: cls.as_ref().map(|c| c.quality),
                                 class: cls.as_ref().map(|c| c.primary.name().to_string()),
+                                // insns/delay_slot/prev are rf-cli's half of
+                                // the shared record; skipped when empty, so
+                                // the response shape is unchanged.
+                                ..CachedGadget::default()
                             }
                         })
                         .collect();
@@ -815,6 +897,7 @@ impl RopFinderMcp {
                             CachedScan {
                                 gadgets,
                                 fallback_names: outcome.fallback_names,
+                                ..CachedScan::default()
                             },
                         ),
                         "miss",
@@ -822,21 +905,14 @@ impl RopFinderMcp {
                 }
             };
 
-            // Post-filters (--re, --align) run over the cached set.
+            // The only surviving post-filter is --re, which is a post-filter
+            // in ROPgadget too. --align is an engine option (ANCH-02) and has
+            // already been applied by the scan above.
             let mut gadgets: Vec<&CachedGadget> = scan.gadgets.iter().collect();
             if let Some(re) = &post_re {
                 match regex::Regex::new(re) {
                     Ok(re) => gadgets.retain(|g| re.is_match(&g.text)),
                     Err(_) => gadgets.retain(|g| g.text.contains(re.as_str())),
-                }
-            }
-            if let Some(align) = post_align {
-                if align > 1 {
-                    gadgets.retain(|g| {
-                        u64::from_str_radix(g.vaddr.trim_start_matches("0x"), 16)
-                            .map(|v| v % align == 0)
-                            .unwrap_or(false)
-                    });
                 }
             }
             // Phase 5: quality ordering before sampling (top-N by quality).
@@ -907,6 +983,10 @@ impl RopFinderMcp {
             call_preceded: false,
             all: false,
             noinstr: false,
+            arch: q.arch.clone(),
+            max_gadgets: None,
+            max_memory: None,
+            compat: false,
         };
         let spec = rf_cli::ChainSpec {
             target: q.target.clone(),
@@ -1140,6 +1220,10 @@ impl RopFinderMcp {
             call_preceded: false,
             all: false,
             noinstr: false,
+            arch: q.arch.clone(),
+            max_gadgets: None,
+            max_memory: None,
+            compat: false,
         };
         match self
             .run_scan(
@@ -1183,8 +1267,11 @@ impl RopFinderMcp {
         description = "Run a ROPgadget-style scan with explicit flags. args is a list like \
         [\"--depth\", \"6\", \"--only\", \"pop|ret\"]. Allowlist: --depth --norop --nojop \
         --nosys --only --filter --re --range --section --base --offset --badbytes --align \
-        --multibr --json; anything else (--string, --dump, --console, ...) is rejected. \
-        Output is always structured JSON."
+        --multibr --json --arch --all --callPreceded; anything else (--string, --dump, \
+        --console, ...) is rejected. --align is ROPgadget's real scan-time alignment \
+        (decimal, as in ROPgadget's argparse; write 0x.. only if you mean hex), not an \
+        address post-filter. --arch names a fat Mach-O slice and is REQUIRED for a \
+        multi-slice binary. Output is always structured JSON."
     )]
     async fn run_ropgadget_command(
         &self,
@@ -1205,7 +1292,6 @@ impl RopFinderMcp {
                 &q.binary_path,
                 PostOpts {
                     re: parsed.re,
-                    align: parsed.align,
                     sort_by: None,
                 },
                 q.max_results,
@@ -1270,6 +1356,10 @@ impl RopFinderMcp {
 
 #[cfg(test)]
 mod tests {
+    // Panicking on a bad index is the desired behaviour in a test; the
+    // crate-level deny exists to keep it out of the server.
+    #![allow(clippy::indexing_slicing)]
+
     use super::*;
 
     /// Unique temp dir per test, cleaned up on drop.
@@ -1294,6 +1384,60 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    // -----------------------------------------------------------------
+    // ANCH-02 - --align is an engine option, parsed as DECIMAL
+    // -----------------------------------------------------------------
+
+    /// ROPgadget's `--align` is argparse `type=int`. rf-mcp parsed it with
+    /// `rf_cli::parse_hex`, which always parses base 16, so `--align 16`
+    /// meant 0x16 = 22 and `--align 10` meant 16. Decimal first; hex only
+    /// with an explicit `0x`.
+    #[test]
+    fn align_is_parsed_as_decimal_first_hex_only_with_a_prefix() {
+        assert_eq!(parse_align("16").unwrap(), 16);
+        assert_eq!(parse_align("0x10").unwrap(), 16);
+        assert_eq!(parse_align("0X10").unwrap(), 16);
+        assert_eq!(parse_align(" 4 ").unwrap(), 4);
+        assert_eq!(parse_align("10").unwrap(), 10);
+        assert_eq!(parse_align("0").unwrap(), 0);
+        for bad in ["", "0x", "-4", "abcd", "0xzz", "4.5"] {
+            assert!(parse_align(bad).is_err(), "{bad:?} must not parse");
+        }
+        // The old behaviour, spelled out so a regression is unmistakable:
+        // parse_hex("16") is 22, and that is what this test forbids.
+        assert_eq!(rf_cli::parse_hex("16", "x").unwrap(), 22);
+        assert_ne!(parse_align("16").unwrap() as u64, 22);
+    }
+
+    /// The parsed value reaches `ScanRequest::align`, i.e. the ENGINE's
+    /// alignment stepping, and no post-filter survives to re-implement it.
+    /// Post-filtering an align=1 depth-10 scan can only ever expose gadgets
+    /// reaching 9 bytes back, which is why it under-reported by ~53%.
+    #[test]
+    fn align_reaches_the_engine_not_a_post_filter() {
+        let p = parse_ropgadget_args(&args(&["--align", "16"])).unwrap();
+        assert_eq!(p.request.align, Some(16));
+        let p = parse_ropgadget_args(&args(&["--align=4"])).unwrap();
+        assert_eq!(p.request.align, Some(4));
+        // A bad value is a usage error, not a silent 0.
+        let e = parse_ropgadget_args(&args(&["--align", "nope"])).unwrap_err();
+        assert_eq!(e.code, "usage_error");
+    }
+
+    /// CORE-03 mirrored onto the MCP surface: `--arch` selects a fat
+    /// Mach-O slice, and the new engine switches are reachable.
+    #[test]
+    fn arch_all_and_call_preceded_are_allowlisted_and_plumbed() {
+        let p =
+            parse_ropgadget_args(&args(&["--arch", "arm64", "--all", "--callPreceded"])).unwrap();
+        assert_eq!(p.request.arch.as_deref(), Some("arm64"));
+        assert!(p.request.all);
+        assert!(p.request.call_preceded);
+        // The MCP server never opts into ROPgadget's fat-Mach-O
+        // concatenation: an agent cannot see that the output is fabricated.
+        assert!(!p.request.compat);
     }
 
     /// MCP-02: the default configuration allows NOTHING. Seeding the
@@ -1418,7 +1562,9 @@ mod tests {
         assert_eq!(p.request.offset.as_deref(), Some("0x1000"));
         assert_eq!(p.request.badbytes.as_deref(), Some("0a|0d"));
         assert_eq!(p.re.as_deref(), Some("pop.*ret"));
-        assert_eq!(p.align, Some(0x10));
+        // ANCH-02: --align is an ENGINE option now, and an explicit 0x
+        // prefix still means hexadecimal.
+        assert_eq!(p.request.align, Some(16));
         // --flag=value form also works
         let p = parse_ropgadget_args(&args(&["--depth=8"])).unwrap();
         assert_eq!(p.request.depth, 8);
@@ -1470,10 +1616,8 @@ mod tests {
             vaddr: vaddr.into(),
             bytes: bytes.into(),
             text: text.into(),
-            arch: None,
-            section: None,
             quality,
-            class: None,
+            ..CachedGadget::default()
         };
         let cached = vec![
             // messy multi-effect gadget: quality 79
@@ -1501,29 +1645,93 @@ mod tests {
         assert_eq!(order, ["0x3000", "0x0500", "0x1000", "0x2000"]);
     }
 
-    #[test]
-    fn cache_roundtrip_mem_and_disk() {
-        let t = TempDir::new("cache");
-        let cache = Cache::new(Some(t.canon().clone()));
-        let scan = CachedScan {
+    fn one_ret() -> CachedScan {
+        CachedScan {
             gadgets: vec![CachedGadget {
                 vaddr: "0x1".into(),
                 bytes: "c3".into(),
                 text: "ret".into(),
-                arch: None,
-                section: None,
-                quality: None,
-                class: None,
+                ..CachedGadget::default()
             }],
-            fallback_names: false,
-        };
-        cache.put("k1", scan);
+            ..CachedScan::default()
+        }
+    }
+
+    #[test]
+    fn cache_roundtrip_mem_and_disk() {
+        let t = TempDir::new("cache");
+        let cache = Cache::new(Some(t.canon().clone()));
+        cache.put("k1", one_ret());
         assert_eq!(cache.get("k1").unwrap().gadgets.len(), 1);
-        // persisted to disk
-        assert!(t.canon().join("k1.json").is_file());
+        // persisted to disk, authenticated
+        assert!(t.canon().join("k1.rfc").is_file());
         // a fresh cache over the same dir reads the disk entry
         let cold = Cache::new(Some(t.canon().clone()));
         assert!(cold.get("k1").is_some());
         assert!(cold.get("absent").is_none());
+        assert_eq!(cold.stats().unwrap().tampered, 0);
+    }
+
+    /// MCP-04. The audit served a fabricated
+    /// `pop rdi ; ret @ 0xdeadbeefcafe0000` through the live server by
+    /// writing one 0644 JSON file. Now: a miss, a counter, no result.
+    #[test]
+    fn a_poisoned_disk_entry_is_a_miss_not_a_result() {
+        let t = TempDir::new("poison");
+        {
+            let cache = Cache::new(Some(t.canon().clone()));
+            cache.put("k1", one_ret());
+        }
+        let fabricated = br#"{"version":2,"gadgets":[{"vaddr":"0xdeadbeefcafe0000","bytes":"5fc3","text":"pop rdi ; ret"}],"fallback_names":false}"#;
+        // Bare JSON, the shape the pre-v0.2 cache accepted...
+        std::fs::write(t.canon().join("k1.rfc"), fabricated).unwrap();
+        let cache = Cache::new(Some(t.canon().clone()));
+        assert!(cache.get("k1").is_none());
+        assert_eq!(cache.stats().unwrap().tampered, 1);
+
+        // ...and framed with a wrong tag, so only the HMAC rejects it.
+        let mut framed = Vec::from(b"RFCACHE\x02".as_slice());
+        framed.extend_from_slice(&[0u8; 32]);
+        framed.extend_from_slice(fabricated);
+        std::fs::write(t.canon().join("k1.rfc"), &framed).unwrap();
+        let cache = Cache::new(Some(t.canon().clone()));
+        assert!(cache.get("k1").is_none());
+        assert_eq!(cache.stats().unwrap().tampered, 1);
+    }
+
+    /// ROB-04 as it reached this crate: `"€€"` in a cached `bytes` field
+    /// panicked the server at `gadget_from_cached`. It is a miss now, and
+    /// the reclassification path that used it cannot panic either.
+    #[test]
+    fn a_non_ascii_bytes_field_never_panics() {
+        let t = TempDir::new("charboundary");
+        {
+            let cache = Cache::new(Some(t.canon().clone()));
+            cache.put("k1", one_ret());
+        }
+        let key = std::fs::read(t.canon().join(".cachekey")).unwrap();
+        let body = r#"{"version":2,"gadgets":[{"vaddr":"0x1","bytes":"€€","text":"ret"}],"fallback_names":false}"#;
+        let mut msg = Vec::from(b"k1\0".as_slice());
+        msg.extend_from_slice(body.as_bytes());
+        let mut framed = Vec::from(b"RFCACHE\x02".as_slice());
+        framed.extend_from_slice(&rf_cache::hmac_sha256(&key, &msg));
+        framed.extend_from_slice(body.as_bytes());
+        std::fs::write(t.canon().join("k1.rfc"), &framed).unwrap();
+
+        let cache = Cache::new(Some(t.canon().clone()));
+        assert!(cache.get("k1").is_none(), "authenticated but unusable");
+        assert_eq!(cache.stats().unwrap().malformed, 1);
+        assert_eq!(cache.stats().unwrap().tampered, 0);
+
+        // The same value straight through the reclassification path.
+        let g = CachedGadget {
+            vaddr: "0x1".into(),
+            bytes: "€€".into(),
+            text: "ret".into(),
+            ..CachedGadget::default()
+        };
+        assert!(g.to_scan_gadget().is_none());
+        let sorted = sort_by_quality(vec![&g], Some(rf_core::Arch::X64));
+        assert_eq!(sorted.len(), 1);
     }
 }

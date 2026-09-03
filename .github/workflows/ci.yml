@@ -191,3 +191,298 @@ jobs:
 
       - name: cargo audit
         run: cargo audit
+
+  # ------------------------------------------------------------------------
+  # CLAIM-04 - PLAN section 9 defines four "continuous" gates (parity harness,
+  # criterion suite frozen in CI, cargo-fuzz "no panic, structured error",
+  # property/schema tests). Before this block none of them ran anywhere: the
+  # parity number in the README was a point-in-time measurement with no
+  # mechanism keeping it true. Everything below is a REQUIRED job, and each one
+  # has a recorded red-run in docs/gate-mutation.md proving it can fail.
+  # ------------------------------------------------------------------------
+
+  parity:
+    name: parity gate (ENG-04)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal --no-self-update
+          cargo --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: parity-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: parity-${{ runner.os }}-cargo-
+
+      # The oracle is pinned to a commit, not a tag or a range: ROPgadget's
+      # gadget set changes between releases, and the committed
+      # tests/parity-baseline/*.json reference digests were frozen against this
+      # exact one. A different commit here surfaces as ORACLE-DRIFT rather than
+      # as a rop-finder regression. capstone is pinned to 5.0.7, the same
+      # generation rf-scan links via capstone = "=0.13.0".
+      - name: Check out the ROPgadget oracle (pinned)
+        run: |
+          set -euo pipefail
+          git clone --no-checkout https://github.com/JonathanSalwan/ROPgadget "$RUNNER_TEMP/ropgadget"
+          git -C "$RUNNER_TEMP/ropgadget" checkout b6e3fe31af46
+
+      - name: Build the oracle venv (capstone 5.0.7)
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/venv-oracle"
+          "$RUNNER_TEMP/venv-oracle/bin/pip" install --disable-pip-version-check capstone==5.0.7
+
+      - name: cargo build --release -p rf-cli
+        run: cargo build --release -p rf-cli
+
+      # The oracle is not bit-identical across platforms: python-capstone ships
+      # a prebuilt libcapstone per wheel, and the macOS and Windows reference
+      # totals already differ by 514 gadgets over the 24-fixture corpus (see
+      # docs/measured-2026-09.md). The committed tests/parity-baseline/ was
+      # frozen on Windows, so gating this Linux runner against it directly would
+      # charge a wheel difference to rop-finder. This runner therefore freezes
+      # its OWN baseline once from the oracle, caches it, and gates every later
+      # run against that - the same shape as the criterion job below.
+      - name: Restore the CI parity baseline
+        id: paritycache
+        uses: actions/cache@v4
+        with:
+          path: ci-parity-baseline
+          key: parity-baseline-${{ runner.os }}-${{ runner.arch }}-rg-b6e3fe31af46-cs5.0.7-v1
+
+      - name: Freeze the CI parity baseline (first run on this runner image)
+        if: steps.paritycache.outputs.cache-hit != 'true'
+        env:
+          ROPGADGET_PATH: ${{ runner.temp }}/ropgadget/ROPgadget.py
+          ROPGADGET_PYTHON: ${{ runner.temp }}/venv-oracle/bin/python
+          RF_NO_BUILD: '1'
+        run: |
+          set -euo pipefail
+          # --seed-reference takes the reference set from the ORACLE, never from
+          # rop-finder output; --update-floor then records the ratchet.
+          python3 tests/parity.py --seed-reference --baseline-dir ci-parity-baseline
+          python3 tests/parity.py --release --top 0 --update-floor --baseline-dir ci-parity-baseline
+
+      # THE GATE. Exits non-zero when any fixture's matched-gadget count falls
+      # below its floor, when gadgets the oracle does not have appear beyond the
+      # recorded allowance, or when the oracle itself stops producing the frozen
+      # reference set (ORACLE DRIFT).
+      - name: tests/parity.py (gate)
+        env:
+          ROPGADGET_PATH: ${{ runner.temp }}/ropgadget/ROPgadget.py
+          ROPGADGET_PYTHON: ${{ runner.temp }}/venv-oracle/bin/python
+          RF_NO_BUILD: '1'
+        run: python3 tests/parity.py --release --top 5 --baseline-dir ci-parity-baseline
+
+      # Reported, never fatal: this is the Windows-frozen baseline, so its
+      # ORACLE DRIFT lines are the cross-platform wheel difference, not a
+      # regression. It is run anyway so the delta stays visible in the log.
+      - name: Report against the committed (Windows) baseline
+        if: always()
+        env:
+          ROPGADGET_PATH: ${{ runner.temp }}/ropgadget/ROPgadget.py
+          ROPGADGET_PYTHON: ${{ runner.temp }}/venv-oracle/bin/python
+          RF_NO_BUILD: '1'
+        run: python3 tests/parity.py --release --top 0 --allow-oracle-drift || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ci-parity-baseline
+          path: ci-parity-baseline
+
+      - name: tests/chain_parity.py
+        env:
+          ROPGADGET_PATH: ${{ runner.temp }}/ropgadget/ROPgadget.py
+          ROPGADGET_PYTHON: ${{ runner.temp }}/venv-oracle/bin/python
+          RF_NO_BUILD: '1'
+        run: python3 tests/chain_parity.py --release
+
+      # CLAIM-08: the harnesses that used to hardcode rop-finder.exe are
+      # exercised here on Linux, the platform they could not run on at all
+      # before this release.
+      - name: tests/analyze_diff.py (CLAIM-08 platform check)
+        env:
+          ROPGADGET_PATH: ${{ runner.temp }}/ropgadget/ROPgadget.py
+          ROPGADGET_PYTHON: ${{ runner.temp }}/venv-oracle/bin/python
+          RF_NO_BUILD: '1'
+        run: python3 tests/analyze_diff.py elf-Linux-x86
+
+      - name: tests/benchmark.py (CLAIM-08 platform check)
+        env:
+          ROPGADGET_PATH: ${{ runner.temp }}/ropgadget/ROPgadget.py
+          ROPGADGET_PYTHON: ${{ runner.temp }}/venv-oracle/bin/python
+          RF_NO_BUILD: '1'
+        run: python3 tests/benchmark.py --runs 1 --case elf-Linux-x86 --no-ropper
+
+      - name: tests/spike_inventory.py (CLAIM-08 platform check)
+        env:
+          RF_NO_BUILD: '1'
+        # --no-write: this step proves the harness RUNS on a non-Windows host
+        # (it could not before v0.2.0). tests/spike-report.md is a generated
+        # artifact whose numbers move with the engine; regenerating it is a
+        # deliberate act, not a CI side effect.
+        run: python3 tests/spike_inventory.py --release --no-write
+
+  doc-claims:
+    name: doc-claims gate
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal --no-self-update
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: docclaims-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: docclaims-${{ runner.os }}-cargo-
+
+      - name: Check out the ROPgadget oracle (pinned)
+        run: |
+          set -euo pipefail
+          git clone --no-checkout https://github.com/JonathanSalwan/ROPgadget "$RUNNER_TEMP/ropgadget"
+          git -C "$RUNNER_TEMP/ropgadget" checkout b6e3fe31af46
+          python3 -m venv "$RUNNER_TEMP/venv-oracle"
+          "$RUNNER_TEMP/venv-oracle/bin/pip" install --disable-pip-version-check capstone==5.0.7
+
+      - name: cargo build --release -p rf-cli
+        run: cargo build --release -p rf-cli
+
+      # Extracts every quantitative claim from README/MANUAL/PLAN and resolves
+      # it against live measurement or the committed parity baseline, so the
+      # v0.1.1 retractions (the >=10x headline, the unsourced ropper figure,
+      # the 25-fixture corpus) cannot silently drift back in. Wall-clock timing
+      # is skipped: a shared runner measures the runner, not the tool.
+      - name: tests/doc_claims.py
+        env:
+          ROPGADGET_PATH: ${{ runner.temp }}/ropgadget/ROPgadget.py
+          ROPGADGET_PYTHON: ${{ runner.temp }}/venv-oracle/bin/python
+          RF_NO_BUILD: '1'
+        run: python3 tests/doc_claims.py --no-timing --json doc-claims.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: doc-claims
+          path: doc-claims.json
+
+  bench:
+    name: criterion regression band (CLAIM-02 / PERF-08)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal --no-self-update
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: bench-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: bench-${{ runner.os }}-cargo-
+
+      # Compiles and runs every bench once. This alone is a gate: benches/ was
+      # an empty directory with no criterion dependency, so a bench that
+      # stopped compiling against the engine API was previously impossible to
+      # notice.
+      - name: cargo bench -p rf-bench -- --test
+        run: cargo bench -p rf-bench -- --test
+
+      - name: Restore the CI bench baseline
+        id: benchcache
+        uses: actions/cache@v4
+        with:
+          path: ci-bench-baseline.json
+          key: bench-baseline-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: cargo bench -p rf-bench
+        run: cargo bench -p rf-bench
+
+      # The committed baseline was recorded on a developer machine, so a
+      # cross-environment comparison would be noise. The gate compares against
+      # a baseline this runner recorded for itself and cached; the band is the
+      # >10% figure REMEDIATION names.
+      - name: Record the CI baseline (first run on this runner image)
+        if: steps.benchcache.outputs.cache-hit != 'true'
+        run: python3 crates/rf-bench/check_regression.py --record --baseline ci-bench-baseline.json
+
+      - name: Regression check against the CI baseline (>10% fails)
+        run: |
+          set -euo pipefail
+          python3 crates/rf-bench/check_regression.py --baseline ci-bench-baseline.json --band 0.10 --cross-environment
+
+      # Reported, never fatal: the committed baseline is a developer machine's.
+      - name: Report against the committed baseline
+        if: always()
+        run: python3 crates/rf-bench/check_regression.py --band 0.10 || true
+
+  fuzz:
+    name: cargo-fuzz smoke (60 s per target)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # ROB-08/CLAIM-03/ENG-10: fuzz/ is created by the hostile-input
+      # workstream. This job is guarded on the directory existing so it is
+      # green-and-skipped until that lands, and becomes a real gate the moment
+      # it does, rather than being a job somebody has to remember to add later.
+      - name: Is there a fuzz/ directory?
+        id: has-fuzz
+        run: |
+          set -euo pipefail
+          if [ -d fuzz ] && [ -f fuzz/Cargo.toml ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "no fuzz/Cargo.toml in this tree - nothing to run"
+          fi
+
+      - name: Install nightly and cargo-fuzz
+        if: steps.has-fuzz.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly --profile minimal --no-self-update
+          cargo install --locked cargo-fuzz
+
+      - name: Run every fuzz target for 60 s
+        if: steps.has-fuzz.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          targets=$(cargo +nightly fuzz list)
+          if [ -z "$targets" ]; then
+            echo "::error::fuzz/ exists but declares no targets" >&2
+            exit 1
+          fi
+          for t in $targets; do
+            echo "=== $t"
+            cargo +nightly fuzz run "$t" -- -max_total_time=60
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: failure() && steps.has-fuzz.outputs.present == 'true'
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts

@@ -1,0 +1,83 @@
+{
+  "$schema-version": 1,
+  "description": [
+    "Machine-readable list of the places where rop-finder DELIBERATELY does",
+    "not reproduce ROPgadget's output, so that the parity harness can hold",
+    "every other fixture to bit-exactness instead of loosening the whole",
+    "gate. A divergence that is not in this file is a regression.",
+    "",
+    "Consumed by tests/parity.py: for each entry whose `fixture` matches the",
+    "fixture under test, the harness must apply `effect` before comparing —",
+    "`extra-gadgets` means our set may be a strict superset restricted to",
+    "gadgets matching `match`, `disjoint-set` means the two sets are not",
+    "comparable at all and only the recorded `expect` is asserted, and",
+    "`text-only` means the (vaddr, bytes) sets must still match exactly while",
+    "the listed gadget texts may differ.",
+    "",
+    "Every `oracle` / `ours` number in this file was measured on 2026-09-03",
+    "against ROPgadget 7.7 (pinned commit b6e3fe31af46) driven by the python",
+    "capstone 5.0.7 binding, at `--depth 10 --dump`."
+  ],
+  "divergences": [
+    {
+      "id": "ANCH-04",
+      "fixture": "elf-Linux-RISCV_32",
+      "kind": "decode-mode",
+      "effect": "text-only",
+      "reason": "ROPgadget opens EVERY RISC-V binary in CS_MODE_RISCV64 | CS_MODE_RISCVC (gadgets.py:202, 392, 479), including ELFCLASS32 ones. RV64-only text (`sd`, `ld`, `addiw`, `c.ldsp`, 64-bit register widths) is then printed for instructions an RV32 target cannot execute. rop-finder selects CS_MODE_RISCV32 for an ELFCLASS32 RISC-V image, so the (vaddr, bytes) set is IDENTICAL and 68 of the 279 gadget texts differ.",
+      "measured": {
+        "oracle_gadgets": 279,
+        "ours_gadgets": 279,
+        "vaddr_bytes_set": "identical",
+        "text_differences": 68
+      },
+      "expect": {
+        "vaddr_bytes_set_equal": true,
+        "max_text_differences": 68
+      }
+    },
+    {
+      "id": "ANCH-06",
+      "fixture": "pe-Windows-ARMv7-Thumb2LE-HelloWorld",
+      "kind": "instruction-set-selection",
+      "effect": "disjoint-set",
+      "reason": "The PE header says IMAGE_FILE_MACHINE_ARMNT, which is Thumb-2 ONLY — an ARMv7-M/ARMv7 Windows image contains no A32 instructions at all. ROPgadget scans it with the A32 anchor tables unless `--thumb` is passed, so its 38 gadgets are A32 misinterpretations of Thumb code. rop-finder routes a Thumb-only image to the Thumb tables automatically, which yields a completely different (and correct) gadget set.",
+      "measured": {
+        "oracle_gadgets": 38,
+        "ours_gadgets": 404,
+        "vaddr_bytes_set": "disjoint (intersection 0)"
+      },
+      "expect": {
+        "ours_gadgets_min": 1,
+        "intersection_may_be_empty": true
+      }
+    },
+    {
+      "id": "ANCH-03",
+      "fixture": "*",
+      "applies_to_arch": ["arm64", "sparc", "sparc64", "sparcv9"],
+      "kind": "extra-anchor-table",
+      "effect": "extra-gadgets",
+      "match": "^(svc|ta)\\b",
+      "reason": "ROPgadget's ARM64 and SPARC SYS anchor tables are literally empty — gadgets.py:443-446 is two `TODO` comments — so `--sys` returns nothing on AArch64, the architecture where a syscall gadget is the entire point of a SYS search. rop-finder populates them: AArch64 `svc #imm16` (0xd4000001 | imm16 << 5) and SPARC `ta %g0 + imm7` (0x91d02000 | imm7). Our gadget set is therefore a superset of the oracle's, and every extra gadget's text starts with `svc` or `ta`.",
+      "measured": {
+        "elf-ARM64-bash": {
+          "oracle_gadgets": 17653,
+          "ours_gadgets": 17653,
+          "extra": 0,
+          "note": "dynamically linked bash contains no inline svc; the syscalls live in libc, so this fixture does not exercise the new table"
+        },
+        "elf-SparcV8-bash": {
+          "oracle_gadgets": 7264,
+          "ours_gadgets": 7264,
+          "extra": 0,
+          "note": "same — no inline `ta` in the scanned segments"
+        }
+      },
+      "expect": {
+        "ours_is_superset": true,
+        "extra_gadgets_must_match": "^(svc|ta)\\b"
+      }
+    }
+  ]
+}

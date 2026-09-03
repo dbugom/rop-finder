@@ -394,6 +394,7 @@ mod tests {
             insns: text.split(" ; ").map(|s| s.to_string()).collect(),
             delay_slot: false,
             prev: None,
+            table: rf_scan::TableKind::Rop,
         }
     }
 

@@ -40,6 +40,54 @@ impl Arch {
     pub fn is_x86_family(self) -> bool {
         matches!(self, Arch::X86 | Arch::X64)
     }
+
+    /// Canonical short name, matching what `lipo -archs` and `otool` print
+    /// for a Mach-O slice. This is the spelling `--arch` should accept and
+    /// echo back when selecting a fat-Mach-O slice (CORE-03).
+    pub fn slice_name(self) -> &'static str {
+        use Arch::*;
+        match self {
+            X86 => "i386",
+            X64 => "x86_64",
+            Arm => "arm",
+            ArmThumb => "thumb",
+            Arm64 => "arm64",
+            Mips32 => "mips",
+            Mips64 => "mips64",
+            Ppc32 => "ppc",
+            Ppc64 => "ppc64",
+            Sparc => "sparc",
+            Sparc64 => "sparc64",
+            SparcV9 => "sparcv9",
+            RiscV32 => "riscv32",
+            RiscV64 => "riscv64",
+        }
+    }
+
+    /// Parse an architecture name for `--arch`. Case-insensitive, and it
+    /// accepts the common aliases as well as [`slice_name`](Self::slice_name)
+    /// (so `arm64`, `aarch64` and `arm64e` all select the ARM64 slice).
+    pub fn from_slice_name(name: &str) -> Option<Arch> {
+        use Arch::*;
+        let n = name.trim().to_ascii_lowercase();
+        Some(match n.as_str() {
+            "x86" | "i386" | "i486" | "i586" | "i686" | "x86_32" | "x86-32" => X86,
+            "x64" | "x86_64" | "x86-64" | "amd64" | "x86_64h" => X64,
+            "arm" | "armv6" | "armv7" | "armv7s" | "armv7k" | "arm32" => Arm,
+            "thumb" | "armv7-thumb" | "thumb2" => ArmThumb,
+            "arm64" | "aarch64" | "arm64e" | "arm64_32" | "armv8" => Arm64,
+            "mips" | "mips32" => Mips32,
+            "mips64" => Mips64,
+            "ppc" | "powerpc" | "ppc32" => Ppc32,
+            "ppc64" | "powerpc64" => Ppc64,
+            "sparc" | "sparc32" => Sparc,
+            "sparc64" => Sparc64,
+            "sparcv9" | "sparc9" => SparcV9,
+            "riscv32" | "riscv-32" | "rv32" => RiscV32,
+            "riscv64" | "riscv-64" | "rv64" => RiscV64,
+            _ => return None,
+        })
+    }
 }
 
 /// Byte order of the target.

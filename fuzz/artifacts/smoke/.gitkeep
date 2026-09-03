@@ -1,0 +1,3 @@
+# Crashers found by rf-smoke and generated ROB-02 witnesses land here.
+# Crashers are committed; amplify-*.bin witnesses are gitignored (regenerate
+# them with `rf-smoke amplify`).

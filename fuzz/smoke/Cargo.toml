@@ -1,0 +1,37 @@
+# Portable hostile-input smoke harness.
+#
+# This exists because cargo-fuzz DOES NOT RUN ON WINDOWS and needs a nightly
+# toolchain, while this repository pins stable 1.89.0 (rust-toolchain.toml)
+# and is developed on Windows. Everything under `fuzz/fuzz_targets/` is dead
+# weight on this machine; this crate is the part that actually executes, and
+# it is what produces the "zero panics on N mutated binaries" artifact that
+# CLAIM-03 says was asserted without one.
+#
+# It is its own workspace (the `[workspace]` stanza below) for the same
+# reason `fuzz/` is: so that neither the root `cargo build --workspace` nor
+# `cargo fuzz build` drags the other one in. Nothing in the root Cargo.toml
+# needs to change.
+
+[package]
+name = "rf-smoke"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "BSD-2-Clause"
+description = "Deterministic mutation smoke harness for rop-finder's hostile-input paths"
+
+[[bin]]
+name = "rf-smoke"
+path = "src/main.rs"
+
+[dependencies]
+rf-core = { path = "../../crates/rf-core" }
+rf-cli = { path = "../../crates/rf-cli" }
+
+[profile.release]
+# Keep the arithmetic checks the fuzzers rely on: a wrapping-vs-panicking
+# difference between the smoke run and CI would make this artifact a lie.
+debug-assertions = true
+overflow-checks = true
+
+[workspace]
