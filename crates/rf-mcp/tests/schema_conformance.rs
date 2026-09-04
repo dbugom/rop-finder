@@ -109,11 +109,18 @@ fn calls(binary: &Value, fixture: &str) -> Vec<(&'static str, Value)> {
             merge(json!({"opcode": "c3", "max_results": 5})),
         ),
         ("get_mitigations", merge(json!({}))),
+        // v0.5, ECO-04. `plan_chain` ALWAYS succeeds, so every fixture --
+        // including the ones where the target is not even dispatchable --
+        // has to produce a schema-valid PlanResponse.
+        (
+            "plan_chain",
+            merge(json!({"depth": 4, "target": "linux-execve"})),
+        ),
     ]
 }
 
 /// How many tools `calls` exercises per fixture.
-const CALLS_PER_FIXTURE: usize = 12;
+const CALLS_PER_FIXTURE: usize = 13;
 
 /// Every fixture × every tool, validated against the declared schema.
 #[tokio::test]
@@ -121,7 +128,7 @@ async fn schema_conformance() {
     let mut mcp = McpChild::spawn().await;
     let list = mcp.rpc(1, "tools/list", json!({})).await;
     let tools = list["result"]["tools"].as_array().expect("tools");
-    assert_eq!(tools.len(), 14, "unexpected tool count");
+    assert_eq!(tools.len(), 15, "unexpected tool count");
 
     // The schemas as the SERVER declares them, not as this test imagines.
     let mut schemas = std::collections::HashMap::new();

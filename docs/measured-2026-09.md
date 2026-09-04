@@ -115,22 +115,156 @@ Reproduce: `python tests/parity.py --release`.
 > macOS figures above are left exactly as they were measured; the Windows
 > re-measurement is a **separate** section below, not a replacement for them.
 
-## Speed vs ROPgadget 7.7
+## Speed vs ROPgadget 7.7 — v0.5.0 (current)
 
-`--depth 10`, both tools' stdout discarded, quiet machine.
-rop-finder best-of-3, ROPgadget best-of-2.
+<!-- speedup-table: current -->
+
+This is the authoritative speed measurement for the current build, and it is
+the one `tests/doc_claims.py` gates. The v0.1.1 macOS table below is kept,
+marked `[superseded]`, for the same reason the v0.1.1 parity numbers are kept:
+deleting the number a claim was retracted against would hide the retraction.
+
+**Environment.** Windows 11 Pro 10.0.26200, 24 logical CPUs, rustc 1.89.0,
+`cargo build --release` (`lto = true`, `codegen-units = 1`). Oracle: ROPgadget
+7.7 @ `b6e3fe31af46` on CPython 3.12.10 with capstone 5.0.7.
+`--depth 10`, both tools' stdout discarded, quiet machine, **best-of-3 on both
+sides**. Reproduce: `python tests/benchmark.py --runs 3 --no-ropper`.
 
 | Fixture | ROPgadget | rop-finder | Speedup |
 |---|---:|---:|---:|
-| elf-Linux-x86 | 0.56 s | 0.09 s | **6.2x** |
-| elf-x64-bash-v4.1.5.1 | 0.57 s | 0.10 s | **5.7x** |
-| elf-ARM64-bash | 0.48 s | 0.23 s | **2.1x** |
-| elf-Mips-Defcon-20-pwn100 | 2.54 s | 1.52 s | **1.7x** |
-| elf-PowerPC-bash | 0.76 s | 0.60 s | **1.3x** |
+| elf-Linux-x86 | 1.411 s | 0.086 s | **16.4x** |
+| elf-x64-bash-v4.1.5.1 | 1.387 s | 0.096 s | **14.5x** |
+| elf-ARM64-bash | 0.949 s | 0.101 s | **9.4x** |
+| elf-Mips-Defcon-20-pwn100 | 5.288 s | 0.542 s | **9.7x** |
+| elf-PowerPC-bash | 1.701 s | 0.232 s | **7.3x** |
+
+Gadget counts are identical to the oracle's on all five (42,508 / 45,377 /
+17,653 / 133,163 / 86,966), so these are like-for-like runs and not a
+comparison of different amounts of work.
+
+PLAN.md's Phase 1 exit criteria were >=10x on x86/x64 and >=4x on the
+capstone-backed architectures. **Both are now met on every architecture
+measured**, and PLAN.md's §3.4 and §7 dispositions are updated to say so. This
+reverses the v0.1.1 retraction; the retraction was correct when it was made
+and the numbers that justified it are still printed below.
+
+### The honest caveat: this machine is not that machine
+
+The v0.1.1 table was taken on macOS/Apple Silicon with CPython 3.11, where the
+oracle ran `elf-Linux-x86` in 0.56 s. Here the same oracle takes 1.411 s. A
+speedup is a ratio between two things and one of them moved, so
+`16.4x vs 6.2x` is **not** a statement that the engine got 2.6x faster.
+
+The controlled statement is the same-machine, same-oracle, same-harness
+comparison of the two builds. `v0.4.0` here is this repository at commit
+`8ee168b` with `crates/rf-scan/` restored from that commit and everything else
+held constant:
+
+| Fixture | v0.4.0 | v0.5.0 | engine speedup | ratio at v0.4.0 | ratio at v0.5.0 |
+|---|---:|---:|---:|---:|---:|
+| elf-Linux-x86 | 0.138 s | 0.086 s | 1.60x | 10.1x | 16.4x |
+| elf-x64-bash-v4.1.5.1 | 0.153 s | 0.096 s | 1.60x | 9.0x | 14.5x |
+| elf-ARM64-bash | 0.493 s | 0.101 s | **4.89x** | 1.9x | 9.4x |
+| elf-Mips-Defcon-20-pwn100 | 2.693 s | 0.542 s | **4.97x** | 2.0x | 9.7x |
+| elf-PowerPC-bash | 0.991 s | 0.232 s | **4.27x** | 1.7x | 7.3x |
+
+Read that way the result is sharper than the headline ratios, not weaker.
+Phase 6's exit criterion was *improvement on every architecture*, and every
+architecture improved on both comparisons — against the v0.1.1 record and
+against a v0.4.0 binary built on this machine an hour earlier. The x86/x64
+gain is 1.6x because iced-x86 was already fast and the work removed there was
+the decode cache; the 4.3–5.0x on the capstone architectures is `PERF-09`, the
+coverage-limited resumable region decode, which is where the audit said the
+non-x86 speedup would have to come from.
+
+### Where the time went — phase measurements
+
+`crates/rf-bench/src/bin/probe.rs`, best-of-5, `--depth 10`. The `scan` phase
+is the decode phase alone, with `post_process` excluded so it cannot move
+underneath the measurement.
+
+| Measurement | v0.4.0 | v0.5.0 | ratio |
+|---|---:|---:|---:|
+| `probe time scan elf-x64-bash-v4.1.5.1` (parallel) | 0.0603 s | 0.0129 s | **4.67x** |
+| `probe time scan elf-x64-bash-v4.1.5.1 --serial` | 0.1474 s | 0.0977 s | **1.51x** |
+
+`PERF-03`'s exit criterion was ">=1.4x on the decode phase of elf-x64-bash
+with a byte-identical gadget set". Both rows clear it, and the gadget set is
+byte-identical: `probe digest` over all 22 scannable fixtures is equal between
+the two builds in **both** modes — the final post-processed stream **and** the
+raw pre-dedup traversal stream, which is order-sensitive and therefore also
+catches a partitioning change that silently reorders dedup survivors.
+
+The per-start decode cache itself is gone. `engine.rs` and `cs.rs` each held a
+`HashMap<usize, Rc<Vec<WinInsn>>>` at v0.4.0; at v0.5.0 the only occurrences
+of the phrase in either file are the two comments that explain the removal.
+
+### Parallel scaling
+
+`PERF-04`'s exit criterion was >=8x against single-threaded on the MIPS
+fixture. This machine has 24 logical CPUs.
+
+| Phase, `elf-Mips-Defcon-20-pwn100` | serial | parallel | scaling |
+|---|---:|---:|---:|
+| `scan` (the parallelised phase) | 1.2997 s | 0.1366 s | **9.51x** |
+| `full` (scan + `post_process`) | 1.5898 s | 0.3242 s | 4.90x |
+
+The `full` row is reported because it is the number a user experiences, and
+the gap between the two is the honest one: `post_process` is largely serial,
+so the pipeline scales at 4.9x even though the phase that was parallelised
+scales at 9.5x. The criterion is stated against the scan phase and is met
+there.
+
+### Allocation, and the trie index
+
+`PERF-10`'s exit criterion was "zero per-gadget temporary String allocations
+remain in `post_process`". Discharged by counting rather than profiling: there
+is no heap profiler on this host, so `cargo run --release -p rf-bench
+--features alloc-count --bin probe -- alloc FIXTURE` installs a counting
+`GlobalAlloc` and reads the delta across `post_process`. The feature is **off
+by default** — two relaxed atomics on every allocation is exactly what must
+not be in a timing run.
+
+| Fixture | gadgets in | v0.4.0 allocs | per gadget | v0.5.0 allocs | per gadget |
+|---|---:|---:|---:|---:|---:|
+| elf-Mips-Defcon-20-pwn100 | 324,286 | 648,592 | 2.0001 | **165** | 0.0005 |
+| elf-x64-bash-v4.1.5.1 | 71,946 | 143,910 | 2.0003 | **76** | 0.0011 |
+
+Two allocations per gadget to none: the old path built a joined `String` key
+per gadget and then cloned it into the `HashSet`. `crates/rf-scan/src/trie.rs`
+(`GadgetTrie`) replaces both — `insert` walks the instruction list the gadget
+already owns and returns "is this text new", which *is* the dedup predicate,
+and `trie::cmp_joined` sorts on the `" ; "`-joined text without ever joining
+it. The 165 and 76 that remain are the trie's own vector growth, which is
+O(log n) in the gadget count and not per-gadget: they do not scale with the
+input, which is what the criterion is about.
+
+The trie also answers `ending_with(tail)` in O(|tail|) plus a subtree walk
+(gadgets are stored reversed, so a tail is a prefix), which is the "all
+gadgets ending in this tail" capability PLAN listed. That capability exists in
+the library and is tested; there is no CLI flag or MCP argument for it yet.
+
+## Speed vs ROPgadget 7.7 — v0.1.1 baseline (macOS) [superseded]
+
+<!-- speedup-table: v0.1.1-superseded -->
+
+`--depth 10`, both tools' stdout discarded, quiet machine.
+rop-finder best-of-3, ROPgadget best-of-2. macOS/Apple Silicon, CPython 3.11.
+
+| Fixture | ROPgadget | rop-finder | Speedup |
+|---|---:|---:|---:|
+| elf-Linux-x86 | 0.56 s | 0.09 s | **6.2x** [superseded] |
+| elf-x64-bash-v4.1.5.1 | 0.57 s | 0.10 s | **5.7x** [superseded] |
+| elf-ARM64-bash | 0.48 s | 0.23 s | **2.1x** [superseded] |
+| elf-Mips-Defcon-20-pwn100 | 2.54 s | 1.52 s | **1.7x** [superseded] |
+| elf-PowerPC-bash | 0.76 s | 0.60 s | **1.3x** [superseded] |
 
 PLAN.md's Phase 1 exit criteria were >=10x on x86/x64 and 4-8x elsewhere.
-**Neither is met.** Phase 1 of the remediation plan retracts the claim; Phase 6
-re-measures against this table and requires improvement on every architecture.
+**Neither was met by these numbers**, and Phase 1 of the remediation plan
+retracted the claim on the strength of this table. Phase 6 re-measured against
+it and required improvement on every architecture; the current section above
+records the result. This table is kept, not edited, because the retraction it
+justified is part of the record.
 
 Small fixtures (raw-x86.raw, the RISC-V pair, pe-ARMv7) show 10-12x, but those
 runs are dominated by CPython interpreter startup rather than scan work and are

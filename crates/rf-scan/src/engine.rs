@@ -1,4 +1,4 @@
-//! The scanning engine: anchor scan → per-start decode cache → clean-decode
+//! The scanning engine: anchor scan → per-candidate decode → clean-decode
 //! validity → passClean → dedup → filters.
 //!
 //! Traversal order (deterministic, matching ROPgadget's pipeline):
@@ -7,26 +7,36 @@
 //! (`i = 0..depth`, i.e. shortest gadget first).
 //!
 //! Output dedup is by gadget **text**, first-occurrence-wins in that order
-//! (ropgadget/rgutils.py:9-18). Because our formatter is iced-x86 rather than
-//! capstone, text — and therefore dedup survivor identity in rare ties — can
-//! differ cosmetically; parity is judged on (vaddr, bytes) sets.
+//! (ropgadget/rgutils.py:9-18) — through [`crate::trie::GadgetTrie`], which
+//! decides it without materialising the text. Because our formatter is
+//! iced-x86 rather than capstone, text — and therefore dedup survivor
+//! identity in rare ties — can differ cosmetically; parity is judged on
+//! (vaddr, bytes) sets.
 //!
-//! Parallelism (Phase 1a): scanning is split into work items of
-//! `(scan region, anchor)` in exactly the traversal order above. `rayon`
-//! maps over the indexed work list and the per-item result vectors are
-//! concatenated in index order, so the merged output — and therefore the
-//! text-dedup survivor — is byte-identical to the serial run regardless of
-//! thread scheduling. `ScanOptions::parallel = false` selects the serial
-//! path (tests).
+//! Parallelism (v0.5.0, PERF-04): each anchor's hit list is found once per
+//! region and CUT into equal slices, and a work item is one such slice —
+//! i.e. an overlapping byte range of the region, sized by where the work
+//! actually is rather than by address. The previous unit was a whole
+//! `(region × anchor)` pair, which on the MIPS fixture put 92% of the work
+//! in one item and capped scaling at 1.09x. Items are enumerated in exactly
+//! the traversal order above and rayon's indexed `map_init` preserves it, so
+//! the merged output — and therefore the text-dedup survivor — is identical
+//! to the serial run regardless of thread scheduling.
+//! `ScanOptions::parallel = false` selects the serial path (tests).
+//!
+//! There is no per-start decode cache: PERF-03 measured a 0.8% hit rate and
+//! a net slowdown, and deleted it. On the fixed-width capstone
+//! architectures its place is taken by [`crate::cs::RegionIndex`], which
+//! decodes each region once (over the slots any candidate can reach) and
+//! answers the whole candidate test — clean decode AND `passClean` — with
+//! one array lookup.
 //!
 //! Output shape (v0.2.0): the scan drives a [`GadgetSink`] rather than
 //! returning a materialized `Vec`, and polls a [`CancelToken`] inside the
 //! loops it already runs. [`scan_binary`] stays as the unbounded,
 //! uncancellable delegate so existing callers are untouched.
 
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::rc::Rc;
+use std::borrow::Cow;
 
 use rayon::prelude::*;
 use regex::Regex;
@@ -37,6 +47,7 @@ use crate::anchors::{self, Anchor, TableKind};
 use crate::cancel::{CancelToken, Error};
 use crate::cs;
 use crate::sink::{BoundedSink, GadgetSink, VecSink};
+use crate::trie::{self, GadgetTrie};
 use crate::x86::{self, GadgetFormatter, WinInsn};
 
 /// Poll the cancel token every this many anchor hits (`gadgets.py:70`'s
@@ -290,14 +301,28 @@ pub fn scan_binary_into<B: Image + ?Sized, S: GadgetSink>(
 
     // Scan ROPgadget-compatible regions (executable program headers for ELF),
     // range-truncated up front (core.py:_sectionInRange).
-    let mut regions: Vec<(Vec<u8>, u64)> = Vec::new();
+    //
+    // PERF-11: with no `--range` the region BORROWS the loader's bytes. The
+    // previous `sec.bytes.clone()` was the third copy of every executable
+    // byte in the process (whole-file buffer → `Section::bytes` → this), and
+    // on the 100 MB targets MANUAL.md recommends it was ~100 MB of memcpy
+    // before a single gadget was found. `--range` still owns, because it
+    // truncates.
+    let mut regions: Vec<Region<'_>> = Vec::new();
     for sec in bin.exec_scan_regions() {
-        let r = match opts.range {
-            None => Some((sec.bytes.clone(), sec.vaddr)),
-            Some(_) => apply_range(sec, opts.range),
-        };
-        if let Some(r) = r {
-            regions.push(r);
+        match opts.range {
+            None => regions.push(Region {
+                code: Cow::Borrowed(&sec.bytes),
+                vaddr: sec.vaddr,
+            }),
+            Some(_) => {
+                if let Some((bytes, vaddr)) = apply_range(sec, opts.range) {
+                    regions.push(Region {
+                        code: Cow::Owned(bytes),
+                        vaddr,
+                    });
+                }
+            }
         }
     }
 
@@ -316,9 +341,27 @@ pub fn scan_binary_into<B: Image + ?Sized, S: GadgetSink>(
     let chunks = if arch.is_x86_family() {
         let bits = if arch == Arch::X64 { 64 } else { 32 };
         let tables = x86_tables(bits, opts);
-        scan_work(&regions, &tables, &ctx, |code, vaddr, anchor, kind, out| {
-            x86_scan_anchor(code, vaddr, bits, &ctx, anchor, kind, out);
-        })
+        let lists = find_hits(&regions, &tables, &ctx);
+        let items = plan_items(&lists, &ctx);
+        run_items(
+            &regions,
+            &items,
+            &ctx,
+            x86::make_formatter,
+            |fmt, region, item, out| {
+                x86_scan_hits(
+                    &region.code,
+                    region.vaddr,
+                    bits,
+                    &ctx,
+                    item.anchor,
+                    item.kind,
+                    item.hits,
+                    fmt,
+                    out,
+                );
+            },
+        )
     } else {
         let spec = cs::spec(arch, endian, thumb)?;
         // Validate the capstone mode once up front so a bad combination is a
@@ -347,18 +390,45 @@ pub fn scan_binary_into<B: Image + ?Sized, S: GadgetSink>(
         .into_iter()
         .flatten()
         .collect();
-        scan_work(&regions, &tables, &ctx, |code, vaddr, anchor, kind, out| {
-            // capstone-rs 0.13 Capstone is !Send/!Sync: one handle per work
-            // item (already validated above; a failure here yields nothing).
-            if let Ok(handle) = cs::open(&spec) {
-                cs::scan_anchor(
-                    &handle, &spec, code, vaddr, anchor, kind, &ctx, delay_slot, out,
-                );
-            }
-        })
+        let lists = find_hits(&regions, &tables, &ctx);
+        let items = plan_items(&lists, &ctx);
+        // PERF-09: one resumable decode of each region, shared by every
+        // anchor and every candidate in it. Fixed-width ISAs only, and only
+        // when the region is probed densely enough to pay for it —
+        // `cs::build_indexes` decides both.
+        let indexes: Vec<Option<cs::RegionIndex>> =
+            cs::build_indexes(&spec, &regions, &lists, &ctx, max_span(&lists, &ctx));
+        run_items(
+            &regions,
+            &items,
+            &ctx,
+            || cs::open(&spec).ok(),
+            |handle, region, item, out| {
+                // capstone-rs Capstone is !Send/!Sync: one handle per rayon
+                // worker (already validated above; a failure yields nothing).
+                if let Some(handle) = handle.as_ref() {
+                    cs::scan_hits(
+                        handle,
+                        &spec,
+                        &region.code,
+                        region.vaddr,
+                        item.anchor,
+                        item.kind,
+                        item.hits,
+                        indexes[item.region].as_ref(),
+                        &ctx,
+                        delay_slot,
+                        out,
+                    );
+                }
+            },
+        )
     };
 
     opts.cancel.check()?;
+    // The whole raw stream is already materialised in the per-item vectors,
+    // so the sink can size itself once instead of regrowing 324k times.
+    sink.reserve(chunks.iter().map(Vec::len).sum());
     for chunk in chunks {
         for g in chunk {
             sink.accept(g)?;
@@ -389,48 +459,237 @@ fn x86_tables(bits: u32, opts: &ScanOptions) -> Vec<(TableKind, Vec<Anchor>)> {
     .collect()
 }
 
-/// One unit of scan work: `((region bytes, region vaddr), anchor, table)`.
-type WorkItem<'a> = (&'a (Vec<u8>, u64), &'a Anchor, TableKind);
+/// One executable buffer to scan — borrowed from the loader unless `--range`
+/// truncated it (PERF-11).
+pub(crate) struct Region<'a> {
+    pub(crate) code: Cow<'a, [u8]>,
+    pub(crate) vaddr: u64,
+}
 
-/// Run the (region × anchor) work list, serially or under rayon.
+/// Every hit of one anchor in one region, in ascending offset order.
+pub(crate) struct AnchorHits<'a> {
+    pub(crate) region: usize,
+    pub(crate) anchor: &'a Anchor,
+    pub(crate) kind: TableKind,
+    pub(crate) hits: Vec<usize>,
+}
+
+/// One unit of scan work: a contiguous SLICE of one anchor's hit list in one
+/// region.
 ///
-/// Work items are enumerated in ROPgadget traversal order (region → table →
-/// anchor); each item's output preserves (anchor-hit, depth) order. Rayon
-/// `collect` over an indexed parallel iterator preserves item order, and the
-/// per-item vectors are concatenated in index order — so the merged stream
-/// is identical to the serial traversal and the text-dedup survivor is
-/// deterministic regardless of thread scheduling (PLAN.md §3.3 invariant).
+/// PERF-04 — the previous unit was a whole `(region × anchor)` pair, and a
+/// region was never split. For an ELF there is effectively one executable
+/// region, so the parallel width was the anchor-table size and the balance
+/// was the hit distribution across anchors, which is extremely skewed: on
+/// `elf-Mips-Defcon-20-pwn100` one anchor (`j addr`) holds 92% of the hits,
+/// pinning the ceiling at 1.09x however many cores are present. Measured
+/// end-to-end scaling was 1.2-1.9x.
 ///
-/// The `run` closure short-circuits to an empty vector once the token is
-/// set, so the residual cost of a cancelled scan is one relaxed atomic load
-/// per remaining work item rather than the contents of those items.
-fn scan_work(
-    regions: &[(Vec<u8>, u64)],
-    tables: &[(TableKind, Vec<Anchor>)],
+/// The hit list is now computed once per (region, anchor) and cut into equal
+/// slices, so the unit of work is an overlapping byte range of the region —
+/// the range those hits span, plus `depth*align` bytes of lead-in and the
+/// anchor's trailing bytes, read straight out of the shared region buffer
+/// rather than copied into a window. Cutting the hit list rather than the
+/// address space is what makes the pieces EQUAL: the hits are the work, and
+/// they are not uniformly distributed over the bytes.
+///
+/// Two invariants make this safe:
+///  * `anchors::find_matches` has Python `re.finditer` semantics — after a
+///    match it resumes at `match_end` — so the hit set is a property of the
+///    WHOLE region and cannot be reconstructed by scanning a sub-range in
+///    isolation. Computing it once and slicing the result keeps it exact;
+///    cutting the bytes would silently change it.
+///  * Items are enumerated region → table → anchor → hit-slice and each item
+///    preserves (hit, depth) order internally, so concatenating item outputs
+///    in index order reproduces the single-threaded traversal order exactly.
+///    That is what keeps the text-dedup survivor — and therefore the emitted
+///    (vaddr, bytes) set — independent of thread scheduling.
+pub(crate) struct WorkItem<'a> {
+    /// Index into the region list; the region is shared, never copied.
+    pub(crate) region: usize,
+    pub(crate) anchor: &'a Anchor,
+    pub(crate) kind: TableKind,
+    /// A slice of this (region, anchor)'s hit list.
+    pub(crate) hits: &'a [usize],
+}
+
+/// Aim for this many work items per worker thread. Oversubscribing lets
+/// rayon smooth over the residual cost differences between anchors (a `ret`
+/// hit and a `jmp rel32` hit do not cost the same) without paying a per-item
+/// setup cost big enough to show in the profile.
+const ITEMS_PER_THREAD: usize = 8;
+
+/// Never cut a hit list finer than this: below it the per-item overhead — a
+/// `Vec` allocation, and on the capstone path the branch that checks for a
+/// per-worker handle — starts to dominate the work inside the item.
+const MIN_HITS_PER_ITEM: usize = 64;
+
+/// Below this many surviving gadgets the alphabetical sort stays serial:
+/// rayon's split and join cost more than the sort does.
+const PARALLEL_SORT_MIN: usize = 8192;
+
+/// Smallest byte range the parallel anchor search will hand to one worker.
+/// Below this the merge pass and the task overhead cost more than the memchr
+/// sweep they split.
+const HIT_SCAN_MIN_CHUNK: usize = 32 * 1024;
+
+/// Find every anchor hit, in traversal order (region → table → anchor).
+///
+/// memchr over a 1.4 MB region for 100k hits is not free and is perfectly
+/// parallel, so this runs across (region × anchor) pairs under rayon before
+/// any decoding starts.
+fn find_hits<'a>(
+    regions: &[Region<'_>],
+    tables: &'a [(TableKind, Vec<Anchor>)],
     ctx: &ScanCtx<'_>,
-    f: impl Fn(&[u8], u64, &Anchor, TableKind, &mut Vec<Gadget>) + Sync,
-) -> Vec<Vec<Gadget>> {
-    let work: Vec<WorkItem<'_>> = regions
-        .iter()
+) -> Vec<AnchorHits<'a>> {
+    let keys: Vec<(usize, TableKind, &'a Anchor)> = (0..regions.len())
         .flat_map(|r| {
             tables
                 .iter()
-                .flat_map(move |(k, t)| t.iter().map(move |a| (r, a, *k)))
+                .flat_map(move |(k, t)| t.iter().map(move |a| (r, *k, a)))
         })
         .collect();
-    let run = |item: &WorkItem<'_>| {
-        let ((bytes, vaddr), anchor, kind) = *item;
+    if !ctx.opts.parallel || keys.len() < 2 {
+        return keys
+            .iter()
+            .map(|&(region, kind, anchor)| AnchorHits {
+                region,
+                anchor,
+                kind,
+                hits: if ctx.opts.cancel.is_cancelled() {
+                    Vec::new()
+                } else {
+                    anchors::find_matches(&regions[region].code, anchor)
+                },
+            })
+            .collect();
+    }
+
+    // Parallelising over anchors alone leaves the same skew that PERF-04 is
+    // about: on the MIPS fixture one anchor holds 92% of the hits, so the
+    // whole search is as slow as that one memchr sweep. Split each key's
+    // region into byte ranges as well, then rebuild `re.finditer`'s stateful
+    // leftmost-greedy selection over the concatenated positions.
+    let cancelled = ctx.opts.cancel.is_cancelled();
+    let chunk = |len: usize| -> usize {
+        let want = rayon::current_num_threads().max(1) * 4;
+        len.div_ceil(want.max(1)).max(HIT_SCAN_MIN_CHUNK)
+    };
+    let mut subkeys: Vec<(usize, usize, usize)> = Vec::new(); // (key, lo, hi)
+    for (ki, &(region, _, _)) in keys.iter().enumerate() {
+        let len = regions[region].code.len();
+        if cancelled || len == 0 {
+            continue;
+        }
+        let step = chunk(len);
+        let mut lo = 0usize;
+        while lo < len {
+            subkeys.push((ki, lo, (lo + step).min(len)));
+            lo += step;
+        }
+    }
+    let parts: Vec<Vec<usize>> = subkeys
+        .par_iter()
+        .map(|&(ki, lo, hi)| {
+            if ctx.opts.cancel.is_cancelled() {
+                return Vec::new();
+            }
+            let (region, _, anchor) = keys[ki];
+            anchors::find_matches_in(&regions[region].code, anchor, lo, hi)
+        })
+        .collect();
+
+    let mut per_key: Vec<Vec<usize>> = vec![Vec::new(); keys.len()];
+    for (&(ki, _, _), part) in subkeys.iter().zip(parts) {
+        per_key[ki].extend(part);
+    }
+    keys.iter()
+        .zip(per_key)
+        .map(|(&(region, kind, anchor), all)| AnchorHits {
+            region,
+            anchor,
+            kind,
+            hits: anchors::merge_finditer(&all, anchor),
+        })
+        .collect()
+}
+
+/// Cut the hit lists into balanced work items, preserving traversal order.
+fn plan_items<'a>(lists: &'a [AnchorHits<'a>], ctx: &ScanCtx<'_>) -> Vec<WorkItem<'a>> {
+    let total: usize = lists.iter().map(|l| l.hits.len()).sum();
+    let threads = if ctx.opts.parallel {
+        rayon::current_num_threads().max(1)
+    } else {
+        1
+    };
+    let per_item = total
+        .div_ceil((threads * ITEMS_PER_THREAD).max(1))
+        .max(MIN_HITS_PER_ITEM);
+    let mut items = Vec::new();
+    for l in lists {
+        for hits in l.hits.chunks(per_item) {
+            items.push(WorkItem {
+                region: l.region,
+                anchor: l.anchor,
+                kind: l.kind,
+                hits,
+            });
+        }
+    }
+    items
+}
+
+/// The longest byte span any candidate of any anchor can cover:
+/// `(depth-1)*align + anchor size`. This is the lead-in the overlapping byte
+/// ranges read, and the cap on the run lengths [`cs::RegionIndex`] stores.
+fn max_span(lists: &[AnchorHits<'_>], ctx: &ScanCtx<'_>) -> usize {
+    lists
+        .iter()
+        .map(|l| {
+            ctx.opts.depth.saturating_sub(1) * ctx.opts.effective_align(l.anchor).max(1)
+                + l.anchor.size()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Run the work list, serially or under rayon, returning the per-item
+/// outputs in item order.
+///
+/// `init` builds whatever per-worker state the decode path needs (an
+/// iced-x86 formatter; a capstone handle, which is `!Send`) once per rayon
+/// worker rather than once per item. Rayon's `map_init` over an indexed
+/// parallel iterator preserves item order, so the merged stream is identical
+/// to the serial traversal (PLAN.md §3.3 invariant).
+///
+/// The closure short-circuits to an empty vector once the token is set, so
+/// the residual cost of a cancelled scan is one relaxed atomic load per
+/// remaining work item rather than the contents of those items.
+fn run_items<'a, T, I, F>(
+    regions: &[Region<'_>],
+    items: &[WorkItem<'a>],
+    ctx: &ScanCtx<'_>,
+    init: I,
+    f: F,
+) -> Vec<Vec<Gadget>>
+where
+    I: Fn() -> T + Sync + Send,
+    F: Fn(&mut T, &Region<'_>, &WorkItem<'a>, &mut Vec<Gadget>) + Sync + Send,
+{
+    let run = |state: &mut T, item: &WorkItem<'a>| {
         let mut out = Vec::new();
         if ctx.opts.cancel.is_cancelled() {
             return out;
         }
-        f(bytes, *vaddr, anchor, kind, &mut out);
+        f(state, &regions[item.region], item, &mut out);
         out
     };
-    if ctx.opts.parallel && work.len() > 1 {
-        work.par_iter().map(run).collect()
+    if ctx.opts.parallel && items.len() > 1 {
+        items.par_iter().map_init(init, run).collect()
     } else {
-        work.iter().map(run).collect()
+        let mut state = init();
+        items.iter().map(|i| run(&mut state, i)).collect()
     }
 }
 
@@ -443,21 +702,35 @@ pub fn post_process(
     addr_size: usize,
 ) -> Result<Vec<Gadget>, Error> {
     opts.cancel.check()?;
-    // Compute the dedup/sort key ONCE per gadget (text() joins strings;
-    // calling it inside sort comparisons is O(n log n) allocations).
-    let mut keyed: Vec<(String, Gadget)> = all.drain(..).map(|g| (g.text(), g)).collect();
 
-    // Dedup by text, first-occurrence-wins in traversal order
-    // (rgutils.deleteDuplicateGadgets). --all and --noinstr both skip it
-    // (core.py:87-88).
+    // PERF-10 / CLAIM-07. This used to open with
+    //     let mut keyed: Vec<(String, Gadget)> = all.drain(..)
+    //         .map(|g| (g.text(), g)).collect();
+    // and then `seen.insert(text.clone())` — a joined `String` per gadget for
+    // the key, a clone of it for the set, and the set's own copy: three heap
+    // strings per gadget beyond the per-instruction ones, 15.9 ms of a
+    // 110.4 ms serial run, and a large share of the 117 B/code-byte
+    // footprint. Nothing is materialised now: [`GadgetTrie`] decides dedup
+    // by walking the instruction list it already has, and [`cmp_joined`]
+    // sorts on the joined text without ever joining it.
     if !opts.all && !opts.noinstr {
-        let mut seen: HashSet<String> = HashSet::new();
-        keyed.retain(|(text, _)| seen.insert(text.clone()));
+        // Dedup by text, first-occurrence-wins in traversal order
+        // (rgutils.deleteDuplicateGadgets). --all and --noinstr both skip it
+        // (core.py:87-88).
+        let mut keep = Vec::with_capacity(all.len());
+        {
+            let mut trie = GadgetTrie::with_capacity(all.len());
+            for (i, g) in all.iter().enumerate() {
+                keep.push(trie.insert(&g.insns, i));
+            }
+        }
+        let mut verdict = keep.into_iter();
+        all.retain(|_| verdict.next().unwrap_or(true));
     }
 
     // Post-dedup filters (ropgadget/options.py), in the oracle's order.
     if let Some(only) = &opts.only {
-        keyed.retain(|(_, g)| {
+        all.retain(|g| {
             g.insns
                 .iter()
                 .all(|ins| only.iter().any(|o| o == first_token(ins)))
@@ -468,11 +741,11 @@ pub fn post_process(
     // "0x0-0x0" means "no range" there, so (0, 0) is a no-op.
     if let Some((lo, hi)) = opts.range {
         if !(lo == 0 && hi == 0) {
-            keyed.retain(|(_, g)| lo <= g.vaddr && g.vaddr <= hi);
+            all.retain(|g| lo <= g.vaddr && g.vaddr <= hi);
         }
     }
     if !opts.badbytes.is_empty() {
-        keyed.retain(|(_, g)| {
+        all.retain(|g| {
             let packed = g.vaddr.to_le_bytes();
             !opts
                 .badbytes
@@ -481,16 +754,45 @@ pub fn post_process(
         });
     }
     if opts.cfg_aware {
-        keyed.retain(|(_, g)| survives_cet(g));
+        all.retain(survives_cet);
     }
 
     opts.cancel.check()?;
     // Alphabetical sort by gadget text (rgutils.alphaSortgadgets) —
     // skipped with --noinstr (core.py:94-95).
+    //
+    // The permutation is sorted, not the gadgets: a `Gadget` is ~80 bytes of
+    // move per comparison swap against 8 for an index, and `sort_by` on the
+    // indices is still the stable sort the oracle's order depends on when
+    // --all leaves equal keys in the list.
     if !opts.noinstr {
-        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut order: Vec<(u128, u32)> = all
+            .iter()
+            .enumerate()
+            .map(|(i, g)| (trie::prefix_key(&g.insns), i as u32))
+            .collect();
+        let by_text = |a: &(u128, u32), b: &(u128, u32)| {
+            a.0.cmp(&b.0)
+                .then_with(|| trie::cmp_joined(&all[a.1 as usize].insns, &all[b.1 as usize].insns))
+        };
+        // rayon's `par_sort_by` is a stable merge sort, so it produces the
+        // same permutation as `sort_by` on equal keys — which matters,
+        // because with `--all` the dedup pass is skipped and equal keys are
+        // ordered by the traversal the whole pipeline depends on. Once the
+        // decode phase stopped dominating, this sort became the largest
+        // single item left on the MIPS fixture.
+        if opts.parallel && order.len() >= PARALLEL_SORT_MIN {
+            order.par_sort_by(by_text);
+        } else {
+            order.sort_by(by_text);
+        }
+        let mut slots: Vec<Option<Gadget>> = all.into_iter().map(Some).collect();
+        all = order
+            .into_iter()
+            .map(|(_, i)| slots[i as usize].take().expect("each index appears once"))
+            .collect();
     }
-    Ok(keyed.into_iter().map(|(_, g)| g).collect())
+    Ok(all)
 }
 
 fn first_token(s: &str) -> &str {
@@ -598,20 +900,33 @@ pub fn scan_section(
         item_cap: opts.max_gadgets,
         item_byte_cap: opts.max_memory,
     };
+    let mut fmt = x86::make_formatter();
     for (kind, table) in x86_tables(bits, opts) {
         for anchor in &table {
-            x86_scan_anchor(code, sec_vaddr, bits, &ctx, anchor, kind, out);
+            let hits = anchors::find_matches(code, anchor);
+            x86_scan_hits(
+                code, sec_vaddr, bits, &ctx, anchor, kind, &hits, &mut fmt, out,
+            );
         }
     }
 }
 
 /// Scan one x86 anchor over one buffer.
 ///
-/// Per-start decode cache: decode each candidate start position ONCE
-/// through the maximal window; all anchor-terminated candidates from that
-/// start are derived from the recorded instruction-boundary list
-/// (PLAN.md §3.4). The cache is pure memoization — serial and parallel
-/// runs produce identical output.
+/// PERF-03 — there is deliberately no per-start decode cache here any more.
+/// The one that used to live at this line keyed `HashMap<usize, Rc<Vec<
+/// WinInsn>>>` on the candidate start, and because every candidate start is
+/// `anchor_pos - i*align` and anchor hits are far apart relative to `depth`,
+/// the starts were almost all distinct: 171,648 distinct starts against
+/// 173,100 lookups on `elf-x64-bash-v4.1.5.1`, a 0.8% hit rate. The map and
+/// `Rc` bookkeeping cost strictly more than the decode they avoided, and the
+/// retained windows were the project's largest single memory consumer. The
+/// window is now decoded per candidate and, more importantly, only as far as
+/// `end` instead of `start + depth*align + MAX_ANCHOR_SIZE`: the candidate
+/// test only ever reads the boundary that lands exactly on `end` and the
+/// prefix before it, and iced-x86 stops at the first instruction that does
+/// not fit, so truncating the window at `end` is provably the same decision
+/// on the same bytes — while decoding on average half as many.
 ///
 /// Alignment (ANCH-01/SCAN-05/CLI-10): the candidate-start loop STEPS by
 /// `align` — `ref - i*align` when that lands on an aligned virtual address,
@@ -620,25 +935,25 @@ pub fn scan_section(
 /// default scan is byte-identical to before; with `--align 4` it reaches
 /// `depth * 4` bytes back instead of filtering `depth` byte-steps down to
 /// the two or three that happen to be aligned.
-fn x86_scan_anchor(
+#[allow(clippy::too_many_arguments)]
+fn x86_scan_hits(
     code: &[u8],
     sec_vaddr: u64,
     bits: u32,
     ctx: &ScanCtx<'_>,
     anchor: &Anchor,
     kind: TableKind,
+    hit_list: &[usize],
+    fmt: &mut GadgetFormatter,
     out: &mut Vec<Gadget>,
 ) {
     let opts = ctx.opts;
     let align = opts.effective_align(anchor);
-    let mut cache: HashMap<usize, Rc<Vec<WinInsn>>> = HashMap::new();
-    let mut fmt = x86::make_formatter();
-    let window = opts.depth.saturating_sub(1) * align.max(1) + anchors::MAX_ANCHOR_SIZE;
     let mut hits = 0usize;
     let mut candidates = 0usize;
     let mut item_bytes = 0usize;
 
-    for ref_pos in anchors::find_matches(code, anchor) {
+    for &ref_pos in hit_list {
         hits += 1;
         if hits % CANCEL_CHECK_HITS == 0 && opts.cancel.is_cancelled() {
             return;
@@ -662,21 +977,10 @@ fn x86_scan_anchor(
             let Some(start) = step_back(ref_pos, i, align, sec_vaddr, code.len()) else {
                 continue;
             };
-            let insns = cache
-                .entry(start)
-                .or_insert_with(|| {
-                    Rc::new(x86::decode_window(
-                        code,
-                        start,
-                        sec_vaddr,
-                        bits,
-                        start + window,
-                    ))
-                })
-                .clone();
-            if let Some(g) = try_candidate(
-                code, sec_vaddr, bits, start, end, &insns, ctx, kind, &mut fmt,
-            ) {
+            let insns = x86::decode_window(code, start, sec_vaddr, bits, end);
+            if let Some(g) =
+                try_candidate(code, sec_vaddr, bits, start, end, &insns, ctx, kind, fmt)
+            {
                 if let Some(cap) = ctx.item_byte_cap {
                     item_bytes += crate::sink::gadget_bytes(&g);
                     if item_bytes > cap {

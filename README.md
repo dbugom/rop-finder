@@ -4,28 +4,41 @@ A Rust rewrite of [ROPgadget](https://github.com/JonathanSalwan/ROPgadget) —
 a memory-safe ROP/JOP/SYS gadget finder with structured internals, aiming
 for output parity with the original Python tool.
 
-**Measured speed vs ROPgadget 7.7** (`--depth 10`, macOS/Apple Silicon,
-rustc 1.89.0, ROPgadget on CPython 3.11 + capstone 5.0.7; rop-finder
-best-of-3, ROPgadget best-of-2 — full method and raw timings in
+**Measured speed vs ROPgadget 7.7** (`--depth 10`, Windows 11 / 24 logical
+CPUs, rustc 1.89.0, ROPgadget 7.7 on CPython 3.12.10 + capstone 5.0.7;
+best-of-3 on both sides — full method, raw timings and the same-machine
+v0.4.0 control in
 [`docs/measured-2026-09.md`](docs/measured-2026-09.md)):
+
+<!-- speedup-table: current -->
 
 | Fixture | ROPgadget | rop-finder | Speedup |
 |---|---:|---:|---:|
-| elf-Linux-x86 | 0.56 s | 0.09 s | 6.2x |
-| elf-x64-bash-v4.1.5.1 | 0.57 s | 0.10 s | 5.7x |
-| elf-ARM64-bash | 0.48 s | 0.23 s | 2.1x |
-| elf-Mips-Defcon-20-pwn100 | 2.54 s | 1.52 s | 1.7x |
-| elf-PowerPC-bash | 0.76 s | 0.60 s | 1.3x |
+| elf-Linux-x86 | 1.411 s | 0.086 s | 16.4x |
+| elf-x64-bash-v4.1.5.1 | 1.387 s | 0.096 s | 14.5x |
+| elf-ARM64-bash | 0.949 s | 0.101 s | 9.4x |
+| elf-Mips-Defcon-20-pwn100 | 5.288 s | 0.542 s | 9.7x |
+| elf-PowerPC-bash | 1.701 s | 0.232 s | 7.3x |
 
-So: roughly 6x on x86/x64, and between 1.3x and 2.1x on the
-capstone-backed architectures. PLAN.md's Phase-1 exit criterion asked for a
-tenfold speedup on x86/x64 and a fourfold one elsewhere; **neither is met**,
-and PLAN.md now records that criterion as NOT MET. Earlier revisions of this README
-advertised "an order of magnitude faster on x86/x64" — that sentence was
-not supported by any measurement and has been removed. The small fixtures
-(raw-x86.raw, the RISC-V pair, pe-ARMv7) do show 10-12x, but those runs are
-dominated by CPython's interpreter startup rather than scan work and are
-not evidence for a headline claim.
+PLAN.md's Phase-1 exit criterion asked for a tenfold speedup on x86/x64 and a
+fourfold one elsewhere. At v0.1.1 **neither was met** (6.2x / 5.7x on x86/x64
+and 1.3–2.1x elsewhere), the claim was retracted, and PLAN.md recorded the
+criterion as NOT MET. Phase 6 re-measured against that table and **both lines
+are met now, on every architecture**.
+
+Two caveats, because a speedup is a ratio and both sides of it moved. The
+v0.1.1 figures were taken on macOS/Apple Silicon with CPython 3.11, where the
+oracle was roughly 2.5x faster than it is here, so `16.4x vs 6.2x` overstates
+what the engine gained. The controlled number is a v0.4.0 build of this
+repository measured on this machine an hour earlier: the engine itself got
+**1.6x faster on x86/x64 and 4.3–5.0x faster on the capstone-backed
+architectures**, and the ratio against the oracle went 10.1x → 16.4x (x86),
+9.0x → 14.5x (x64), 1.9x → 9.4x (ARM64), 2.0x → 9.7x (MIPS), 1.7x → 7.3x
+(PPC). The gadget set is byte-identical across that change, on all 22
+scannable fixtures, in the raw pre-dedup stream as well as the final one.
+Second caveat, unchanged from v0.1.1: the small fixtures (raw-x86.raw, the
+RISC-V pair, pe-ARMv7) show 10-12x, but those runs are dominated by CPython's
+interpreter startup rather than scan work and are not evidence for anything.
 
 The full design rationale lives in [`../PLAN.md`](../PLAN.md). ROPgadget
 remains the parity oracle; its source is cloned at `../ropgadget`.
@@ -41,7 +54,7 @@ the [list of known divergences](MANUAL.md#known-divergences) from the oracle.
 ```
 crates/
   rf-core/      # binary loaders (goblin): ELF, PE, Mach-O, Universal, Raw
-  rf-scan/      # anchor tables, per-start decode cache, filters, dedup,
+  rf-scan/      # anchor tables, resumable region decode, trie-indexed dedup,
                 # iced-x86 (x86/x64) + capstone-rs (all other arches), rayon
   rf-classify/  # (Phase 5) semantic classification of gadgets
   rf-chain/     # Chain IR + Linux execve chain builders (x86 int 0x80,
@@ -59,12 +72,12 @@ tests/
 
 | Phase | Deliverable | Status |
 |---|---|---|
-| **0. Spike** | `rf-core` + `rf-scan` MVP: x86/x64 ELF only, memchr anchors, per-start decode cache, JSON out; parity harness | done |
-| **1. Engine** | All ROPgadget arches (capstone-rs), PE/Mach-O/Universal/Raw loaders, rayon parallelism | **partial** — engine and parity done (99.995% over 24 fixtures); the perf exit criterion is NOT MET (see the table above), and the trie index and fuzz corpus are not built |
+| **0. Spike** | `rf-core` + `rf-scan` MVP: x86/x64 ELF only, memchr anchors, per-start decode cache, JSON out; parity harness | done — though the decode cache it shipped was measured at a 0.8% hit rate and deleted in v0.5 (`PERF-03`) |
+| **1. Engine** | All ROPgadget arches (capstone-rs), PE/Mach-O/Universal/Raw loaders, rayon parallelism, trie index | **done** — parity 99.995% over 24 fixtures; the perf exit criterion is MET as of v0.5 (>=10x on x86/x64, >=4x elsewhere — see the table above); the suffix-trie index ships as `rf_scan::trie` and is what dedup runs on. The fuzz corpus and the 10K-mutation criterion are still not built |
 | 2. Features | `--section`, `--base` hardening, `--info` structured binary info | **done** |
 | 3. MCP server | `rf-mcp` stdio tools | **done** |
 | 4a. Chains | Chain IR, Linux execve chains (x86 int 0x80, x64 syscall) | **done** |
-| 4b. Chains | Windows VirtualProtect chains (x64 register ABI + x86 stdcall), anchor/IAT API resolution, alignment invariant, `--cfg-aware` | **partial** — the builder and the spike report exist, but two of the three PLAN exit criteria have no artifact: there is no emulator harness (no generated Windows chain has ever been executed against a CPU) and no CET-marked PE fixture, so `--cfg-aware` is untested against a real hardened binary. The harness lands in v0.5, the fixture in v0.2 |
+| 4b. Chains | Windows VirtualProtect chains (x64 register ABI + x86 stdcall), anchor/IAT/export API resolution, alignment invariant, stack pivots, shellcode staging, multi-call composition, `--cfg-aware` | **partial** — 2 of 3 PLAN exit criteria met. The emulator harness lands in v0.5 (`tests/emulate.py`): every advertised Windows chain is now generated by the real CLI and *executed*, with VirtualProtect's four arguments and the shellcode's first four bytes asserted, and `CHWIN-01/-02/-03/-07` each have a failing-before and passing-after run in [`docs/chain-regressions.md`](docs/chain-regressions.md). Still no CET-marked PE fixture, so `--cfg-aware` remains untested against a real hardened binary |
 | 5. Differentiators | Semantic classification + ranking (`rf-classify`, `--classify`/`--rank`), JOP dispatcher analysis, scan cache (`--cache`, MCP `sort_by`) | **partial** — classification, ranking, dispatcher analysis and the cache ship; the chain DSL and ARM64 PAC awareness do not, and both have been dropped from the roadmap rather than left as silent debt |
 
 ## Building
@@ -280,13 +293,25 @@ and "can't find a suitable gadget" situations are structured errors
 rather than best-effort output.
 
 Parity vs `ROPgadget.py --ropchain` across the eight x86/x64 ELF fixtures
-(`python tests/chain_parity.py`): 2 byte-identical scripts
-(elf-Linux-x86, elf-Linux-x86-NDH-chall), 2 payload-identical
-(elf-Linux-x64, Linux_lib64.so — every `pack()` word identical, only the
-iced-vs-capstone comment text differs: `add rax, 0x1` vs `add rax, 1`),
-and 4 where both tools fail to find the required gadgets (error parity).
-Windows chains have no ROPgadget oracle; they are covered by unit and
-integration tests instead.
+(`python tests/chain_parity.py`) is **deliberately gone as of v0.5, on the
+default flag set.** Until v0.4 the harness recorded 2 byte-identical scripts
+(elf-Linux-x86, elf-Linux-x86-NDH-chall) and 2 payload-identical
+(elf-Linux-x64, Linux_lib64.so). It now records 0 of each, because
+reproducing ROPgadget's script byte for byte means reproducing its
+59-instruction `inc eax` ladder for the `execve` syscall number: on
+elf-Linux-x64 the chain is **19 words where the oracle emits 76**. You cannot
+keep byte parity and cut the payload 4x, and the shorter chain is the point.
+
+What the harness gates instead: every one of the 56 (fixture, flag-set) cells
+has a recorded verdict, an unrecorded change fails the build, and
+`BADBYTE-LEAK` — a word rop-finder emits that contains a byte the user said it
+must not — is unconditionally fatal. Whether an emitted chain actually *runs*
+moved to a stronger check: `tests/emulate.py` executes it under unicorn and
+asserts the syscall and its arguments. 13 cells that were error-parity at
+v0.4.0 are now chains the oracle still cannot build.
+
+Windows chains have no ROPgadget oracle; they are covered by the emulator
+harness and by unit and integration tests.
 
 ## Phase 5: classification, ranking, scan cache
 

@@ -22,18 +22,17 @@
 //! Text is `"{mnemonic} {op_str}"` per instruction (gadgets.py:118-119),
 //! including ROPgadget's single-pass `.replace("  ", " ")`.
 //!
-//! capstone-rs 0.13 `Capstone` is `!Send`/`!Sync`, so every work item
-//! constructs its own handle (cheap: one `cs_open` per anchor scan).
-
-use std::collections::HashMap;
-use std::rc::Rc;
+//! capstone-rs `Capstone` is `!Send`/`!Sync`, so a handle is built per rayon
+//! worker (`map_init`) rather than per work item, and the region-index
+//! builder makes one per slot chunk.
 
 use capstone::{Arch as CsArch, Capstone, Endian as CsEndian, ExtraMode, Mode};
+use rayon::prelude::*;
 use regex::Regex;
 
 use rf_core::{Arch, Endianness, Error};
 
-use crate::anchors::{self, Anchor, TableKind};
+use crate::anchors::{Anchor, TableKind};
 use crate::engine::{
     step_back, Gadget, ScanCtx, CANCEL_CHECK_CANDIDATES, CANCEL_CHECK_HITS, PREV_BYTES,
 };
@@ -296,6 +295,334 @@ pub fn pass_clean(
     false
 }
 
+// ---------------------------------------------------------------------------
+// PERF-09: one resumable decode per region, instead of one per (hit, depth)
+// ---------------------------------------------------------------------------
+
+/// Instruction width in bytes for the ISAs whose instruction boundaries do
+/// NOT depend on where the decode started, or `None` when the mode is
+/// variable-length.
+///
+/// This is the precondition for [`RegionIndex`]: on A64, A32, MIPS, PowerPC
+/// and SPARC every instruction is exactly 4 bytes, so the boundary set of a
+/// decode is a property of the region and the alignment phase alone, and a
+/// single pass over the region answers every candidate. Thumb (2 or 4) and
+/// RISC-V with the C extension (2 or 4) are excluded: there the boundaries
+/// really do move with the start, and each candidate has to be decoded.
+pub fn fixed_width(spec: &CsSpec) -> Option<usize> {
+    match spec.arch {
+        CsArch::ARM64 => Some(4),
+        CsArch::ARM => (spec.mode == Mode::Arm).then_some(4),
+        CsArch::MIPS => matches!(spec.mode, Mode::Mips32 | Mode::Mips64).then_some(4),
+        CsArch::PPC => matches!(spec.mode, Mode::Mode32 | Mode::Mode64).then_some(4),
+        CsArch::SPARC => matches!(spec.mode, Mode::Default | Mode::V9).then_some(4),
+        _ => None,
+    }
+}
+
+/// Slots decoded per capstone call while building an index. Bounds the peak
+/// memory of the C-side instruction array (capstone materialises the whole
+/// run it decodes) without materially changing the per-call amortisation:
+/// 4096 slots is 16 KB of code and one `cs_disasm` per 4096 instructions,
+/// against one per candidate before.
+const INDEX_CHUNK_SLOTS: usize = 4096;
+
+/// Build the index only when the region is probed at least this densely —
+/// `candidate starts >= region slots / INDEX_DENSITY`. A whole-region decode
+/// costs one instruction per slot whether or not anything looks at it, so on
+/// a large region with almost no anchor hits (a 100 MB blob with one `ret`)
+/// decoding per candidate is genuinely cheaper. Every fixture in the corpus
+/// is far above this line; the constant exists to stop a pathological input
+/// from paying for an index it never reads.
+const INDEX_DENSITY: usize = 32;
+
+/// A start-independent decode of one region, for a fixed-width ISA.
+///
+/// PERF-09 — `cs::scan_anchor` used to call `cs_disasm` once per (anchor hit,
+/// depth index): 47,030 C calls on `elf-ARM64-bash` and 973,944 on
+/// `elf-Mips-Defcon-20-pwn100`, each with its own allocation, each redoing
+/// work the previous call had already done, and each followed by a
+/// `cs.insn_name()` per instruction that returns an owned `String`. Because
+/// the boundaries are start-independent here, one resumable pass over the
+/// region answers all of them.
+///
+/// What is stored is not the instruction list but the only question the scan
+/// ever asks of it: **how many consecutive slots from here are acceptable**,
+/// where acceptable means "decodes" AND "is not rejected by `passClean`'s
+/// mnemonic filter". A candidate `[start, end)` is then accepted iff
+/// `run[slot(start)] >= (end - start) / width` — one load and one compare,
+/// with no decode and no string.
+///
+/// Resumable is the operative word: `cs_disasm` stops at the first
+/// undecodable instruction, so the builder marks that slot unacceptable and
+/// restarts one slot later, which is what makes a single pass equivalent to
+/// the per-candidate decodes it replaces.
+pub struct RegionIndex {
+    /// Instruction width; every slot is this many bytes.
+    width: usize,
+    /// Byte offset of slot 0: the first offset whose VIRTUAL address is
+    /// `width`-aligned, which is the only phase `step_back` can produce when
+    /// the anchor's align is a multiple of the width.
+    base: usize,
+    /// Run lengths are saturated here; no candidate can span more slots.
+    cap: u32,
+    run: Vec<u32>,
+}
+
+impl RegionIndex {
+    /// `Some(true)`/`Some(false)`: the candidate is accepted/rejected.
+    /// `None`: this candidate is outside the index's alignment phase or
+    /// longer than its saturation cap — decode it instead.
+    pub fn decide(&self, start: usize, end: usize) -> Option<bool> {
+        if start < self.base || (start - self.base) % self.width != 0 {
+            return None; // a phase this index does not cover
+        }
+        if end <= start {
+            return Some(false);
+        }
+        let span = end - start;
+        if span % self.width != 0 {
+            // From a width-aligned start every boundary is width-aligned, so
+            // no instruction can end exactly on `end`: the clean-decode rule
+            // fails without decoding anything.
+            return Some(false);
+        }
+        let need = span / self.width;
+        if need > self.cap as usize {
+            return None;
+        }
+        let k = (start - self.base) / self.width;
+        match self.run.get(k) {
+            None => Some(false),
+            Some(&r) => Some(r as usize >= need),
+        }
+    }
+
+    /// Slots in the index (test/diagnostic accessor).
+    pub fn len(&self) -> usize {
+        self.run.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.run.is_empty()
+    }
+}
+
+/// Decide whether each region gets an index, and build the ones that do.
+pub(crate) fn build_indexes(
+    spec: &CsSpec,
+    regions: &[crate::engine::Region<'_>],
+    lists: &[crate::engine::AnchorHits<'_>],
+    ctx: &ScanCtx<'_>,
+    max_span: usize,
+) -> Vec<Option<RegionIndex>> {
+    let parallel = ctx.opts.parallel;
+    let Some(width) = fixed_width(spec) else {
+        return regions.iter().map(|_| None).collect();
+    };
+    let build = |(i, r): (usize, &crate::engine::Region<'_>)| -> Option<RegionIndex> {
+        let code: &[u8] = &r.code;
+        let base = ((width - (r.vaddr % width as u64) as usize) % width).min(code.len());
+        let slots = code.len().saturating_sub(base) / width;
+        if slots == 0 {
+            return None;
+        }
+        // Which slots will anyone actually ask about? A whole-region decode
+        // is the wrong shape for a large region with a handful of anchor
+        // hits — 854 KB of SPARC `.text` for 8,960 raw gadgets is the corpus
+        // case, and a 100 MB firmware image is the real one. Marking the
+        // slots each hit can reach turns "decode the region" into "decode
+        // the parts of it the scan reads", which is never more work than the
+        // per-candidate decodes it replaces: each covered slot is decoded
+        // once instead of once per candidate that spans it.
+        let mut needed = vec![false; slots];
+        let mut covered = 0usize;
+        for l in lists.iter().filter(|l| l.region == i) {
+            if ctx.opts.cancel.is_cancelled() {
+                return None;
+            }
+            let span = ctx.opts.depth.saturating_sub(1) * ctx.opts.effective_align(l.anchor).max(1);
+            for h in l.hits.iter().copied() {
+                let end = h + l.anchor.size();
+                if end > code.len() {
+                    continue;
+                }
+                let lo = h.saturating_sub(span).max(base);
+                let lo_slot = (lo - base) / width;
+                let hi_slot = ((end - base).div_ceil(width)).min(slots);
+                for slot in needed.iter_mut().take(hi_slot).skip(lo_slot) {
+                    if !*slot {
+                        *slot = true;
+                        covered += 1;
+                    }
+                }
+            }
+        }
+        if covered == 0 {
+            return None;
+        }
+        // Memory backstop, not a time one: `run` costs 4 bytes per slot of
+        // the WHOLE region even when the covered part is a sliver, so a
+        // region that is almost entirely unreachable keeps the per-candidate
+        // path rather than allocating an index it barely reads.
+        if covered.saturating_mul(INDEX_DENSITY) < slots {
+            return None;
+        }
+        let cap = u32::try_from(max_span / width + 1).ok()?;
+        build_index(
+            spec, code, r.vaddr, width, base, &needed, cap, ctx, parallel,
+        )
+    };
+    // The index build IS the region decode, so it must not become the serial
+    // prologue that caps the scan's scaling (Amdahl: on the MIPS fixture it
+    // is a large fraction of the remaining work). Regions are walked in order
+    // — there are one or two of them — and the parallelism is inside, across
+    // the slot chunks of a single region.
+    regions.iter().enumerate().map(build).collect()
+}
+
+/// Decode `code` once and record, per slot, how many consecutive slots from
+/// there are acceptable.
+#[allow(clippy::too_many_arguments)]
+fn build_index(
+    spec: &CsSpec,
+    code: &[u8],
+    vaddr: u64,
+    width: usize,
+    base: usize,
+    needed: &[bool],
+    cap: u32,
+    ctx: &ScanCtx<'_>,
+    parallel: bool,
+) -> Option<RegionIndex> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let filter = ctx.filter.as_ref();
+    let slots = needed.len();
+    // Set if capstone ever returns an instruction that is not `width` bytes.
+    // That would falsify the start-independence this whole structure rests
+    // on, so the index is discarded and every candidate is decoded instead.
+    let mismatch = AtomicBool::new(false);
+    let mut ok: Vec<bool> = vec![false; slots];
+    let filtering = !spec.builtin_filter.is_empty() || filter.is_some();
+
+    let fill = |cs: &mut Option<Capstone>, ((ci, out), want): ((usize, &mut [bool]), &[bool])| {
+        let Some(cs) = cs.as_ref() else {
+            mismatch.store(true, Ordering::Relaxed);
+            return;
+        };
+        // The region decode is the one phase with no per-candidate loop to
+        // hang a cancellation check on, and on a big MIPS image it is long
+        // enough to dominate the observed cancel latency. One relaxed load
+        // per 16 KB chunk fixes that; a cancelled build is discarded whole.
+        if ctx.opts.cancel.is_cancelled() {
+            mismatch.store(true, Ordering::Relaxed);
+            return;
+        }
+        // Per-chunk mnemonic verdict memo: `insn_name` returns an owned
+        // String, and there are a few hundred distinct ids against thousands
+        // of instructions. 0 = unknown, 1 = acceptable, 2 = filtered out.
+        let mut verdict: Vec<u8> = Vec::new();
+        let chunk_base = base + ci * INDEX_CHUNK_SLOTS * width;
+        let mut slot = 0usize;
+        while slot < want.len() {
+            if !want[slot] {
+                slot += 1;
+                continue;
+            }
+            // One decode per maximal covered run, resumed past every word
+            // capstone cannot decode.
+            let run_end = want[slot..]
+                .iter()
+                .position(|w| !w)
+                .map_or(want.len(), |n| slot + n);
+            let lo = chunk_base + slot * width;
+            let hi = chunk_base + run_end * width;
+            let mut off = lo;
+            while off < hi {
+                let insns = match cs.disasm_all(&code[off..hi], vaddr.wrapping_add(off as u64)) {
+                    Ok(i) => i,
+                    Err(_) => {
+                        off += width;
+                        continue;
+                    }
+                };
+                let mut consumed = 0usize;
+                for insn in insns.iter() {
+                    if insn.len() != width {
+                        mismatch.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    let acceptable = if !filtering {
+                        true
+                    } else {
+                        let id = insn.id().0 as usize;
+                        if verdict.len() <= id {
+                            verdict.resize(id + 1, 0);
+                        }
+                        if verdict[id] == 0 {
+                            let rejected = match cs.insn_name(insn.id()) {
+                                Some(m) => {
+                                    spec.builtin_filter.contains(&m.as_str())
+                                        || filter.is_some_and(|re| re.is_match(&m))
+                                }
+                                None => false,
+                            };
+                            verdict[id] = if rejected { 2 } else { 1 };
+                        }
+                        verdict[id] == 1
+                    };
+                    out[(off + consumed - chunk_base) / width] = acceptable;
+                    consumed += width;
+                }
+                // `ok` starts false, so the slot `cs_disasm` stopped on is
+                // already marked unacceptable; RESUME one slot past it —
+                // that is what makes one pass equal to the per-candidate
+                // decodes it replaces.
+                off += consumed + if consumed < hi - off { width } else { 0 };
+            }
+            slot = run_end;
+        }
+    };
+
+    if parallel && slots > INDEX_CHUNK_SLOTS {
+        ok.par_chunks_mut(INDEX_CHUNK_SLOTS)
+            .enumerate()
+            .zip(needed.par_chunks(INDEX_CHUNK_SLOTS))
+            .for_each_init(|| open(spec).ok(), fill);
+    } else {
+        let mut handle = open(spec).ok();
+        for ((ci, chunk), want) in ok
+            .chunks_mut(INDEX_CHUNK_SLOTS)
+            .enumerate()
+            .zip(needed.chunks(INDEX_CHUNK_SLOTS))
+        {
+            fill(&mut handle, ((ci, chunk), want));
+        }
+    }
+    if mismatch.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    // Backward pass: run[k] = min(cap, ok[k] ? 1 + run[k+1] : 0). Slots
+    // outside the covered set are `ok == false`, which is correct rather
+    // than merely safe: no candidate's byte range can leave the coverage of
+    // the hit that produced it, so a run is never truncated by a slot
+    // someone was going to ask about.
+    let mut run = vec![0u32; slots];
+    let mut acc = 0u32;
+    for k in (0..slots).rev() {
+        acc = if ok[k] { (acc + 1).min(cap) } else { 0 };
+        run[k] = acc;
+    }
+    Some(RegionIndex {
+        width,
+        base,
+        cap,
+        run,
+    })
+}
+
 /// Scan one anchor over one buffer, appending accepted gadgets in traversal
 /// order (anchor-hit offset order → depth order, shortest first).
 ///
@@ -305,28 +632,26 @@ pub fn pass_clean(
 /// address space; otherwise the byte-stepped `ref - i` is used when in
 /// bounds and aligned; otherwise the candidate is skipped.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn scan_anchor(
+pub(crate) fn scan_hits(
     cs: &Capstone,
     spec: &CsSpec,
     code: &[u8],
     sec_vaddr: u64,
     anchor: &Anchor,
     kind: TableKind,
+    hit_list: &[usize],
+    index: Option<&RegionIndex>,
     ctx: &ScanCtx<'_>,
     delay_slot: bool,
     out: &mut Vec<Gadget>,
 ) {
     let opts = ctx.opts;
     let align = opts.effective_align(anchor);
-    // Max decode window: from the deepest candidate start to the gadget end.
-    let window = opts.depth.saturating_sub(1) * align.max(1) + anchor.size();
-    // Per-start decode cache (memoization only — does not affect output).
-    let mut cache: HashMap<usize, Rc<Vec<WinInsn>>> = HashMap::new();
     let mut hits = 0usize;
     let mut candidates = 0usize;
     let mut item_bytes = 0usize;
 
-    for ref_pos in anchors::find_matches(code, anchor) {
+    for &ref_pos in hit_list {
         hits += 1;
         if hits % CANCEL_CHECK_HITS == 0 && opts.cancel.is_cancelled() {
             return;
@@ -351,24 +676,30 @@ pub(crate) fn scan_anchor(
             let Some(start) = step_back(ref_pos, i, align, sec_vaddr, code.len()) else {
                 continue;
             };
-            let insns = cache
-                .entry(start)
-                .or_insert_with(|| {
-                    Rc::new(decode_window(cs, code, start, sec_vaddr, start + window))
-                })
-                .clone();
-            // Clean-decode rule ⇔ an instruction boundary lands exactly on
-            // `end` (see module docs).
-            let n = insns.partition_point(|r| r.end < end);
-            if n >= insns.len() || insns[n].end != end {
-                continue;
-            }
-            let decodes = &insns[..=n];
-            if spec.is_riscv && decodes[decodes.len() - 1].size != anchor.size() {
-                continue; // gadgets.py:109-112
-            }
-            if pass_clean(cs, decodes, spec.builtin_filter, ctx.filter.as_ref()) {
-                continue;
+            // PERF-09: on a fixed-width ISA the whole candidate test — the
+            // clean-decode rule AND `passClean` — is one array lookup in the
+            // region index. `decide` returns `None` only for a candidate the
+            // index cannot express (a start off the index's alignment phase,
+            // reachable via `--align 1`), which falls through to the decode.
+            match index.and_then(|ix| ix.decide(start, end)) {
+                Some(false) => continue,
+                Some(true) => {}
+                None => {
+                    let insns = decode_window(cs, code, start, sec_vaddr, end);
+                    // Clean-decode rule ⇔ an instruction boundary lands
+                    // exactly on `end` (see module docs).
+                    let n = insns.partition_point(|r| r.end < end);
+                    if n >= insns.len() || insns[n].end != end {
+                        continue;
+                    }
+                    let decodes = &insns[..=n];
+                    if spec.is_riscv && decodes[decodes.len() - 1].size != anchor.size() {
+                        continue; // gadgets.py:109-112
+                    }
+                    if pass_clean(cs, decodes, spec.builtin_filter, ctx.filter.as_ref()) {
+                        continue;
+                    }
+                }
             }
             let g = Gadget {
                 vaddr: opts
@@ -398,6 +729,7 @@ pub(crate) fn scan_anchor(
 /// Scan a buffer for one arch (test helper and serial driver): all enabled
 /// tables in ROP/JOP/SYS order, anchors in table order.
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_buffer(
     spec: &CsSpec,
     code: &[u8],
@@ -405,6 +737,7 @@ pub(crate) fn scan_buffer(
     tables: &[(TableKind, Vec<Anchor>)],
     opts: &crate::engine::ScanOptions,
     delay_slot: bool,
+    use_index: bool,
     out: &mut Vec<Gadget>,
 ) -> Result<(), Error> {
     let cs = open(spec)?;
@@ -414,10 +747,57 @@ pub(crate) fn scan_buffer(
         item_cap: opts.max_gadgets,
         item_byte_cap: opts.max_memory,
     };
+    // `index = None` forces the per-candidate decode path; the paired test
+    // `region_index_agrees_with_per_candidate_decode` runs the same buffer
+    // both ways and asserts the two agree gadget for gadget.
+    let index = if use_index {
+        match fixed_width(spec) {
+            None => None,
+            Some(width) => {
+                let base = ((width - (sec_vaddr % width as u64) as usize) % width).min(code.len());
+                let slots = code.len().saturating_sub(base) / width;
+                let span = tables
+                    .iter()
+                    .flat_map(|(_, t)| t.iter())
+                    .map(|a| {
+                        opts.depth.saturating_sub(1) * opts.effective_align(a).max(1) + a.size()
+                    })
+                    .max()
+                    .unwrap_or(0);
+                // Whole buffer covered: the point of the test helper is to
+                // exercise the index everywhere, not to reproduce the
+                // coverage heuristic.
+                build_index(
+                    spec,
+                    code,
+                    sec_vaddr,
+                    width,
+                    base,
+                    &vec![true; slots],
+                    (span / width + 1) as u32,
+                    &ctx,
+                    false,
+                )
+            }
+        }
+    } else {
+        None
+    };
     for (kind, table) in tables {
         for anchor in table {
-            scan_anchor(
-                &cs, spec, code, sec_vaddr, anchor, *kind, &ctx, delay_slot, out,
+            let hits = crate::anchors::find_matches(code, anchor);
+            scan_hits(
+                &cs,
+                spec,
+                code,
+                sec_vaddr,
+                anchor,
+                *kind,
+                &hits,
+                index.as_ref(),
+                &ctx,
+                delay_slot,
+                out,
             );
         }
     }
@@ -479,8 +859,34 @@ mod tests {
             Arch::Mips32 | Arch::Mips64 | Arch::Sparc | Arch::Sparc64 | Arch::SparcV9
         );
         let tables = tables_for((o.rop, o.jop, o.sys), arch, endian, thumb);
+        // PERF-09: every capstone unit test runs BOTH decision paths — the
+        // per-candidate decode and the whole-region index — and asserts they
+        // agree gadget for gadget. On a variable-width mode (Thumb, RISC-V C)
+        // `fixed_width` is `None` and the two are the same path.
         let mut out = Vec::new();
-        scan_buffer(&spec, code, vaddr, &tables, o, delay_slot, &mut out).unwrap();
+        scan_buffer(&spec, code, vaddr, &tables, o, delay_slot, false, &mut out).unwrap();
+        let mut indexed = Vec::new();
+        scan_buffer(
+            &spec,
+            code,
+            vaddr,
+            &tables,
+            o,
+            delay_slot,
+            true,
+            &mut indexed,
+        )
+        .unwrap();
+        assert_eq!(
+            out.iter()
+                .map(|g| (g.vaddr, g.bytes.clone(), g.text()))
+                .collect::<Vec<_>>(),
+            indexed
+                .iter()
+                .map(|g| (g.vaddr, g.bytes.clone(), g.text()))
+                .collect::<Vec<_>>(),
+            "region index disagrees with the per-candidate decode"
+        );
         out
     }
 

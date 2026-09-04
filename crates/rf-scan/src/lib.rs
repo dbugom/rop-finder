@@ -1,18 +1,26 @@
-//! rf-scan — the gadget scanning engine (Phase 1a: multi-arch + parallel).
+//! rf-scan — the gadget scanning engine (multi-arch, parallel).
 //!
 //! Pipeline: memchr-accelerated anchor scan (tables ported from ROPgadget's
-//! `gadgets.py`) → per-start decode cache → clean-decode validity
-//! (`total decoded size == end - start`) → passClean port → output dedup by
-//! gadget text (first-occurrence-wins in deterministic traversal order:
-//! section → table (ROP/JOP/SYS) → anchor pattern → anchor-hit offset →
-//! depth) → post-dedup filters (`--only`, `--badbytes`) → alphabetical
-//! sort. `--range` truncates sections pre-scan; `--offset` slides vaddrs at
-//! emission without affecting disassembly.
+//! `gadgets.py`) → clean-decode validity (`total decoded size == end -
+//! start`) → passClean port → output dedup by gadget text
+//! (first-occurrence-wins in deterministic traversal order: section → table
+//! (ROP/JOP/SYS) → anchor pattern → anchor-hit offset → depth, decided by
+//! the [`trie`] index) → post-dedup filters (`--only`, `--badbytes`) →
+//! alphabetical sort. `--range` truncates sections pre-scan; `--offset`
+//! slides vaddrs at emission without affecting disassembly.
 //!
 //! Dispatch (`scan_binary` over `impl rf_core::Image`): x86/x64 → iced-x86
 //! ([`x86`]); all other architectures → capstone ([`cs`]). Scanning runs
-//! over (region × anchor) work items, optionally under rayon with
-//! deterministic output (`ScanOptions::parallel`).
+//! over slices of each anchor's hit list — overlapping byte ranges of the
+//! region — optionally under rayon with deterministic output
+//! (`ScanOptions::parallel`).
+//!
+//! The "per-start decode cache" this crate was once described by is gone
+//! (PERF-03): it had a 0.8% hit rate and cost more than the decodes it
+//! avoided. On the fixed-width architectures a single resumable region
+//! decode ([`cs::RegionIndex`]) replaces it and answers each candidate with
+//! an array lookup; on x86/x64 each candidate is simply decoded, over
+//! exactly its own bytes.
 
 #![forbid(unsafe_code)]
 
@@ -22,6 +30,7 @@ pub mod cs;
 pub mod detail;
 mod engine;
 pub mod sink;
+pub mod trie;
 pub mod x86;
 
 pub use anchors::TableKind;
@@ -32,6 +41,7 @@ pub use engine::{
     scan_section, Gadget, ScanOptions, PREV_BYTES,
 };
 pub use sink::{BoundedSink, GadgetSink, VecSink};
+pub use trie::GadgetTrie;
 
 /// The capstone C library this build is linked against, as `"major.minor"`.
 ///

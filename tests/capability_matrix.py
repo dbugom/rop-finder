@@ -153,6 +153,37 @@ PAIRS = [
     {"cli": "api-addr", "mcp": "api_addr"},
     {"cli": "shellcode-addr", "mcp": "shellcode_addr"},
     {"cli": "shellcode-size", "mcp": "shellcode_size"},
+    # v0.5 Windows chain parameters (CHWIN-04 / CHWIN-06 / CHWIN-08).
+    # Both surfaces validate them through the SAME function
+    # (`rf_cli::win_opts`), so the accepted value sets cannot drift: an
+    # unknown --api-name or --chain-base is a usage error naming the
+    # accepted set on either side. `--chain-base` takes "aligned" or
+    # "return-address"/"return_address" (both spellings, both surfaces);
+    # the value is echoed back as `assumptions.chain_base_parity`.
+    {"cli": "api-name", "mcp": "api_name"},
+    {"cli": "chain-base", "mcp": "chain_base"},
+    {"cli": "prot", "mcp": "prot"},
+    # v0.5 synthesis + the remaining CHWIN-08 knobs (ECO-04 / CHLX-07).
+    # `--chain`'s value set now includes linux-mprotect / linux-syscall /
+    # linux-ret2libc / linux-srop and is probed below, so a target that
+    # exists on one surface only is a divergence.
+    {
+        "cli": "plan-chain",
+        "mcp": "tool:plan_chain",
+        "spelling": "a mode flag on the CLI, a tool on MCP -- the same "
+        "asymmetry as --ropchain / build_rop_chain.",
+    },
+    {"cli": "syscall", "mcp": "syscall"},
+    {"cli": "syscall-args", "mcp": "syscall_args"},
+    {
+        "cli": "chain-pivot",
+        "mcp": "chain_pivot",
+        "spelling": "the CLI cannot spell it `--pivot`: that is already the "
+        "v0.4 stack-pivot gadget-query preset (ECO-12), and taking the name "
+        "would silently change what an existing command means. Both surfaces "
+        "therefore say `chain-pivot`/`chain_pivot`.",
+    },
+    {"cli": "stage", "mcp": "stage"},
     {
         "cli": "nojop",
         "mcp": "tool:find_jop_gadgets",

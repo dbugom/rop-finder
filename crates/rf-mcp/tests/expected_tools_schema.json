@@ -1,11 +1,18 @@
 [
   {
-    "description": "Build a ROP chain. target must be \"linux-execve\" (ELF x86/x64 only, ported from ROPgadget's ropmaker: x86 int 0x80 / x64 syscall, \"/bin//sh\" written to a writable section) or \"windows-virtualprotect\". Returns the chain IR as JSON (words with kinds gadget_addr / immediate / data_addr / code_addr / padding plus the referenced gadget table, each entry carrying the same stable id find_gadgets returns), the equivalent python exploit script, arch, description and word_count. A binary that lacks a required gadget fails with not_found. Chain builds bypass the gadget cache.",
+    "description": "Build a ROP chain. target must be \"linux-execve\" (ELF x86/x64 only, ported from ROPgadget's ropmaker: x86 int 0x80 / x64 syscall, \"/bin//sh\" written to a writable section), \"linux-mprotect\" (the NX answer: page-aligns the region and calls mprotect), \"linux-syscall\" (any syscall -- pass `syscall` and `syscall_args`), \"linux-ret2libc\" (calls `api_addr` with \"/bin//sh\": SysV arg1 in rdi on x64, cdecl stack argument on x86), \"linux-srop\" (x86-64: rt_sigreturn plus a sigcontext frame, so only `pop rax` and a trap are needed) or \"windows-virtualprotect\". Every one of those has been EXECUTED under the emulator harness on a shipped fixture; call plan_chain first to find out whether THIS binary can host the one you want. Returns the chain IR as JSON (words with kinds gadget_addr / immediate / data_addr / code_addr / padding plus the referenced gadget table, each entry carrying the same stable id find_gadgets returns), the equivalent python exploit script, arch, description and word_count. A binary that lacks a required gadget fails with not_found. Chain builds bypass the gadget cache.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "api_addr": {
           "description": "windows-virtualprotect: runtime address of the API (hex). Primary\nresolution path; without it the PE must import the API (IAT).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "api_name": {
+          "description": "windows-virtualprotect: which API to call — \"VirtualProtect\"\n(default) or \"VirtualAlloc\". Picks the IAT import to resolve and\nthe argument recipe; the two do not take the same four arguments.",
           "type": [
             "string",
             "null"
@@ -43,6 +50,20 @@
             "null"
           ]
         },
+        "chain_base": {
+          "description": "windows-virtualprotect (x64): what the alignment invariant may\nassume about the chain's first word — \"return_address\" (default)\nor \"aligned\". Echoed back in `assumptions`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "chain_pivot": {
+          "description": "CHWIN-08: pivot the stack pointer here before the chain body runs\n(hex). The chain is then in two pieces — `assumptions.pivot_words`\nleading words go at the overflow point, the rest at this address.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "depth": {
           "description": "Search depth (default 10).",
           "format": "uint",
@@ -59,6 +80,13 @@
             "null"
           ]
         },
+        "prot": {
+          "description": "flNewProtect / flProtect (hex; default 0x40 =\nPAGE_EXECUTE_READWRITE) for windows-virtualprotect, or\nlinux-mprotect's `prot` (default 7 = PROT_READ|WRITE|EXEC).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "shellcode_addr": {
           "description": "windows-virtualprotect: runtime shellcode address (hex; default:\nthe binary's writable .data section).",
           "type": [
@@ -68,6 +96,27 @@
         },
         "shellcode_size": {
           "description": "windows-virtualprotect: dwSize argument (hex; default 0x1000).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stage": {
+          "description": "CHWIN-08: shellcode bytes (hex, e.g. \"9090cc\") to WRITE into the\nregion at shellcode_addr with write-what-where gadgets instead of\nassuming they are already there.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "syscall": {
+          "description": "linux-syscall: the syscall number to invoke, and the syscall the\nlinux-srop frame carries. Decimal, or hex with an explicit \"0x\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "syscall_args": {
+          "description": "linux-syscall / linux-srop: argument registers, e.g.\n\"rdi=0x404000,rsi=0x1000,rdx=7\" (values are hex).",
           "type": [
             "string",
             "null"
@@ -96,6 +145,57 @@
     "name": "build_rop_chain",
     "outputSchema": {
       "$defs": {
+        "ChainAssumptions": {
+          "additionalProperties": false,
+          "description": "What a Windows chain assumed about the world it will run in (CHWIN-04).\n\nThe alignment model used to be an unstated constant in the builder's\nsource, and the out-parameter address was silently the shellcode's own\n(CHWIN-02). Both are decisions made *for* the caller, so both are\nreported back to it.",
+          "properties": {
+            "api_name": {
+              "description": "The API whose four-argument recipe was used: \"VirtualProtect\" or\n\"VirtualAlloc\". They do not take the same four arguments.",
+              "type": "string"
+            },
+            "chain_base_mod16": {
+              "description": "The `chain base mod 16` that spelling implies (8 or 0).",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "chain_base_parity": {
+              "description": "Where the chain's own first word is assumed to sit relative to a\n16-byte boundary: \"return_address\" (the default: the chain\noverwrites a saved return address) or \"aligned\".",
+              "type": "string"
+            },
+            "old_protect_addr": {
+              "description": "The writable DWORD the API writes its out-parameter through (hex).\n`null` for VirtualAlloc, which has no out-parameter. Never equal to\n`shellcode_addr` (CHWIN-02).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pivot_addr": {
+              "description": "CHWIN-08: where the chain BODY must be placed when `chain_pivot`\nwas requested (hex), and how many leading words go at the overflow\npoint instead. `null` / `0` when the chain is one contiguous piece.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pivot_words": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "shellcode_addr": {
+              "description": "Where the chain believes the shellcode will be (hex).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "api_name",
+            "chain_base_parity",
+            "chain_base_mod16",
+            "shellcode_addr",
+            "pivot_words"
+          ],
+          "type": "object"
+        },
         "ChainGadgetRef": {
           "additionalProperties": false,
           "properties": {
@@ -253,6 +353,17 @@
       "properties": {
         "arch": {
           "type": "string"
+        },
+        "assumptions": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChainAssumptions"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Windows-chain assumptions; `null` for a Linux chain, which makes\nnone of them."
         },
         "binary_label": {
           "type": "string"
@@ -4569,6 +4680,422 @@
         "inflight",
         "probing_suspected",
         "cache"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Ask whether this binary can host a ROP chain for `target`, and if not,         exactly why. ALWAYS succeeds: infeasibility is a result. Returns {feasible,         requirements[{id, description, satisfied, strategies_tried[{pattern, candidates}],         relaxations[{param, from, to, would_help}]}], satisfied_requirements[{id, gadget_id,         vaddr}], assumptions{chain_base_parity, write_target, needs_leak}}. Requirement ids         are stable (set_rdx, write_primitive, api_transfer, syscall_trap, stack_align).         `candidates` counts the gadgets the builder could actually USE for that strategy         (clean-tailed, and modelled by the constraint layer), so 0 means the strategy had         nothing to work with, while a non-zero count with satisfied:false means something         else rejected them. `would_help` is         MEASURED, not guessed: the server re-scans at double depth and with multibr and         re-runs the same probe. Every gadget_id resolves through get_gadgets.         build_rop_chain returns this same document in its error details when it refuses.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "api_addr": {
+          "description": "windows-virtualprotect: runtime address of the API (hex). Primary\nresolution path; without it the PE must import the API (IAT).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "api_name": {
+          "description": "windows-virtualprotect: which API to call — \"VirtualProtect\"\n(default) or \"VirtualAlloc\". Picks the IAT import to resolve and\nthe argument recipe; the two do not take the same four arguments.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "arch": {
+          "description": "Architecture slice for a fat (Universal) Mach-O, e.g. \"x86_64\",\n\"arm64\", \"i386\". REQUIRED for a multi-slice container: without it\nthe scan is refused rather than concatenating slices whose virtual\naddress ranges overlap (CORE-03).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "badbytes": {
+          "description": "Reject chain words whose packed value contains these bytes\n(e.g. \"0a|0d\" or \"00-1f\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base": {
+          "description": "Rebase the image base at load time (hex string, e.g. \"0x400000\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "binary_path": {
+          "description": "Absolute path to the binary; must be inside one of the server's\nallow_roots (get_server_config lists them).",
+          "type": "string"
+        },
+        "cfg_aware": {
+          "description": "CFG/CET-aware scan: keep only endbr64/endbr32-entering gadgets.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "chain_base": {
+          "description": "windows-virtualprotect (x64): what the alignment invariant may\nassume about the chain's first word — \"return_address\" (default)\nor \"aligned\". Echoed back in `assumptions`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "chain_pivot": {
+          "description": "CHWIN-08: pivot the stack pointer here before the chain body runs\n(hex). The chain is then in two pieces — `assumptions.pivot_words`\nleading words go at the overflow point, the rest at this address.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "depth": {
+          "description": "Search depth (default 10).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Offset added to gadget and data-section addresses (hex string).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "prot": {
+          "description": "flNewProtect / flProtect (hex; default 0x40 =\nPAGE_EXECUTE_READWRITE) for windows-virtualprotect, or\nlinux-mprotect's `prot` (default 7 = PROT_READ|WRITE|EXEC).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "shellcode_addr": {
+          "description": "windows-virtualprotect: runtime shellcode address (hex; default:\nthe binary's writable .data section).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "shellcode_size": {
+          "description": "windows-virtualprotect: dwSize argument (hex; default 0x1000).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stage": {
+          "description": "CHWIN-08: shellcode bytes (hex, e.g. \"9090cc\") to WRITE into the\nregion at shellcode_addr with write-what-where gadgets instead of\nassuming they are already there.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "syscall": {
+          "description": "linux-syscall: the syscall number to invoke, and the syscall the\nlinux-srop frame carries. Decimal, or hex with an explicit \"0x\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "syscall_args": {
+          "description": "linux-syscall / linux-srop: argument registers, e.g.\n\"rdi=0x404000,rsi=0x1000,rdx=7\" (values are hex).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target": {
+          "description": "Chain target: \"linux-execve\" (ELF x86/x64) or\n\"windows-virtualprotect\" (PE x86/x64).",
+          "type": "string"
+        },
+        "timeout_secs": {
+          "description": "Per-request timeout in seconds (default 60, max 300).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "binary_path",
+        "target"
+      ],
+      "type": "object"
+    },
+    "name": "plan_chain",
+    "outputSchema": {
+      "$defs": {
+        "PlanAssumptions": {
+          "additionalProperties": false,
+          "description": "What the plan took for granted.",
+          "properties": {
+            "chain_base_parity": {
+              "description": "Windows x64 only: \"aligned\" / \"return_address\". `null` elsewhere.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "needs_leak": {
+              "description": "Does this chain need a runtime address the tool cannot compute from\nthe file alone (an ASLR leak, a libc base, an `api_addr`)?",
+              "type": "boolean"
+            },
+            "write_target": {
+              "description": "The address the chain writes into, and the section it belongs to.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "needs_leak"
+          ],
+          "type": "object"
+        },
+        "PlanRelaxation": {
+          "additionalProperties": false,
+          "description": "A parameter change and whether it would satisfy an unmet requirement.\n`would_help` is MEASURED: the server re-scanned with that parameter and\nre-ran the same probe.",
+          "properties": {
+            "from": {
+              "type": "string"
+            },
+            "param": {
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            },
+            "would_help": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "param",
+            "from",
+            "to",
+            "would_help"
+          ],
+          "type": "object"
+        },
+        "PlanRequirement": {
+          "additionalProperties": false,
+          "description": "One thing the chain needs, and what was tried to get it.",
+          "properties": {
+            "description": {
+              "type": "string"
+            },
+            "id": {
+              "description": "Stable and machine-friendly: `set_rdx`, `write_primitive`,\n`api_transfer`, `syscall_trap`.",
+              "type": "string"
+            },
+            "relaxations": {
+              "description": "Empty for a satisfied requirement.",
+              "items": {
+                "$ref": "#/$defs/PlanRelaxation"
+              },
+              "type": "array"
+            },
+            "satisfied": {
+              "type": "boolean"
+            },
+            "strategies_tried": {
+              "items": {
+                "$ref": "#/$defs/PlanStrategy"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "id",
+            "description",
+            "satisfied",
+            "strategies_tried",
+            "relaxations"
+          ],
+          "type": "object"
+        },
+        "PlanSatisfied": {
+          "additionalProperties": false,
+          "description": "A requirement that IS met, and the gadget that meets it.",
+          "properties": {
+            "gadget_id": {
+              "description": "The same stable id `find_gadgets` hands out; pass it to\n`get_gadgets` to see the gadget in full. `null` when the\nrequirement is met by something that is not a gadget (a writable\nsection, an explicit `api_addr`).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "vaddr": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "vaddr",
+            "text"
+          ],
+          "type": "object"
+        },
+        "PlanStrategy": {
+          "additionalProperties": false,
+          "description": "One gadget shape the synthesizer asked for, and how many gadgets in this\nscan answered it.",
+          "properties": {
+            "candidates": {
+              "description": "Gadgets the builder could actually USE for this strategy — clean\ntail, modelled by the constraint layer. NOT a text-match count, so\n`search_gadgets_by_pattern` may return more.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "description": {
+              "type": "string"
+            },
+            "pattern": {
+              "description": "Written in the `search_gadgets_by_pattern` vocabulary, so the caller\ncan re-run the query and look at the candidates itself.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "pattern",
+            "candidates",
+            "description"
+          ],
+          "type": "object"
+        },
+        "Warning": {
+          "additionalProperties": false,
+          "description": "A non-fatal fact the agent has to know to read the result correctly\n(CRIT-03 item 4).\n\n`fallback_section_names` used to be a bare boolean with no explanation,\nand truncation was announced nowhere at all. Every entry has a stable\n`code` to branch on and a `message` to show a human.",
+          "properties": {
+            "code": {
+              "description": "Stable machine-readable tag: `low_confidence_classification`,\n`fallback_section_names`, `universal_slice_selected`, `truncated`,\n`sections_truncated`, `imports_truncated`, `ids_not_found`,\n`unmapped_info_fields`.",
+              "type": "string"
+            },
+            "detail": {
+              "description": "Free-form detail (the slice name, the architecture, …).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "field": {
+              "description": "The response field the warning is about, when it is about one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "Human-readable explanation.",
+              "type": "string"
+            },
+            "returned": {
+              "description": "Entries returned in that field.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "total": {
+              "description": "Entries that exist.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "arch": {
+          "type": "string"
+        },
+        "assumptions": {
+          "$ref": "#/$defs/PlanAssumptions"
+        },
+        "binary_label": {
+          "type": "string"
+        },
+        "binary_sha256": {
+          "type": "string"
+        },
+        "error": {
+          "description": "The builder's structured refusal, when there was one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "feasible": {
+          "description": "Ground truth: the real builder was run and it succeeded.",
+          "type": "boolean"
+        },
+        "format": {
+          "type": "string"
+        },
+        "requirements": {
+          "items": {
+            "$ref": "#/$defs/PlanRequirement"
+          },
+          "type": "array"
+        },
+        "satisfied_requirements": {
+          "items": {
+            "$ref": "#/$defs/PlanSatisfied"
+          },
+          "type": "array"
+        },
+        "target": {
+          "type": "string"
+        },
+        "warnings": {
+          "items": {
+            "$ref": "#/$defs/Warning"
+          },
+          "type": "array"
+        },
+        "word_count": {
+          "description": "Words in the chain when `feasible`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "target",
+        "arch",
+        "format",
+        "feasible",
+        "requirements",
+        "satisfied_requirements",
+        "assumptions",
+        "binary_sha256",
+        "binary_label",
+        "warnings"
       ],
       "type": "object"
     }

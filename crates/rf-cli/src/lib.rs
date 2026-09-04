@@ -28,6 +28,8 @@ mod console;
 mod format;
 mod info;
 mod out;
+// CHWIN-08 #3: the export directory rf-core does not parse.
+pub mod pe_exports;
 mod query;
 mod search;
 
@@ -162,16 +164,73 @@ pub struct Cli {
     #[arg(long)]
     pub ropchain: bool,
 
-    /// Chain target for --ropchain: linux-execve (ELF x86/x64, default) or
-    /// windows-virtualprotect (PE x86/x64)
+    /// Machine-readable feasibility report for the --chain target instead
+    /// of a chain: which requirements this binary meets, which it does not,
+    /// what was tried, and which parameter changes would help (measured, by
+    /// re-scanning). Always succeeds; always JSON (ECO-04)
+    #[arg(long)]
+    pub plan_chain: bool,
+
+    /// Chain target for --ropchain / --plan-chain: linux-execve (default),
+    /// linux-mprotect, linux-syscall, linux-ret2libc, linux-srop (ELF
+    /// x86/x64) or windows-virtualprotect (PE x86/x64)
     #[arg(long, default_value = "linux-execve")]
     pub chain: String,
 
-    /// Runtime address of the target API for windows-virtualprotect (hex).
-    /// Primary resolution path; without it the PE must import the API
-    /// (IAT dereference)
+    /// Syscall number for --chain linux-syscall, and the syscall the
+    /// linux-srop frame invokes (decimal, or hex with 0x)
+    #[arg(long, value_name = "<n>")]
+    pub syscall: Option<String>,
+
+    /// Argument registers for --chain linux-syscall / linux-srop, e.g.
+    /// "rdi=0x404000,rsi=0x1000,rdx=7" (hex values)
+    #[arg(long, value_name = "<reg=val,...>")]
+    pub syscall_args: Option<String>,
+
+    /// Pivot the stack pointer to this address before the chain body runs
+    /// (hex). The emitted chain is then in two pieces: the leading
+    /// `pivot_words` go at the overflow point, the rest go here (CHWIN-08).
+    /// Spelled `--chain-pivot` because `--pivot` is the v0.4 gadget-query
+    /// preset (ECO-12) and taking that name would silently change what an
+    /// existing command means
+    #[arg(long = "chain-pivot", value_name = "<addr>")]
+    pub chain_pivot: Option<String>,
+
+    /// Shellcode bytes (hex, e.g. "9090cc") for windows-virtualprotect to
+    /// WRITE into the region at --shellcode-addr with write-what-where
+    /// gadgets, instead of assuming it is already there (CHWIN-08)
+    #[arg(long, value_name = "<hex>")]
+    pub stage: Option<String>,
+
+    /// Runtime address of the target API for windows-virtualprotect (hex),
+    /// or the function linux-ret2libc calls. Primary resolution path;
+    /// without it a PE must import the API (IAT dereference). A
+    /// comma-separated list supplies one address per --api-name
     #[arg(long)]
     pub api_addr: Option<String>,
+
+    /// API windows-virtualprotect targets: VirtualProtect (default) or
+    /// VirtualAlloc. Selects the IAT import to resolve AND the argument
+    /// recipe — the two do not take the same four arguments (CHWIN-06).
+    /// A comma-separated list composes several calls into one chain, each
+    /// returning into the next through a stack-adjust gadget (CHWIN-08)
+    #[arg(long)]
+    pub api_name: Option<String>,
+
+    /// What the windows-virtualprotect x64 alignment invariant may assume
+    /// about the chain's first word: return-address (default, the chain
+    /// overwrites a saved return address, so its base is 8 mod 16) or
+    /// aligned (the base is 16-byte aligned)
+    #[arg(long)]
+    pub chain_base: Option<String>,
+
+    /// Protection constant (hex). For windows-virtualprotect it is
+    /// flNewProtect / flProtect and defaults to 0x40 =
+    /// PAGE_EXECUTE_READWRITE; for linux-mprotect it is mprotect's `prot`
+    /// and defaults to 7 = PROT_READ|PROT_WRITE|PROT_EXEC. The default
+    /// follows the target because the two constant spaces are unrelated
+    #[arg(long)]
+    pub prot: Option<String>,
 
     /// Runtime address the shellcode will occupy for windows-virtualprotect
     /// (hex; default: the binary's writable .data section)
@@ -1539,14 +1598,32 @@ pub fn target_format(target: &Target) -> &'static str {
 }
 
 /// Chain target + Windows parameters (the CLI's `--chain`, `--api-addr`,
-/// `--shellcode-addr`, `--shellcode-size`; MCP passes the same).
+/// `--api-name`, `--shellcode-addr`, `--shellcode-size`, `--chain-base`,
+/// `--prot`; MCP passes the same).
 #[derive(Debug, Clone, Default)]
 pub struct ChainSpec {
     /// "linux-execve" (default) or "windows-virtualprotect".
     pub target: String,
     pub api_addr: Option<String>,
+    /// CHWIN-06: which API to resolve and whose argument recipe to use.
+    /// `None` = the builder's default, VirtualProtect.
+    pub api_name: Option<String>,
     pub shellcode_addr: Option<String>,
     pub shellcode_size: Option<String>,
+    /// CHWIN-04: "aligned" or "return-address"/"return_address".
+    /// `None` = the builder's default, return_address.
+    pub chain_base: Option<String>,
+    /// flNewProtect / flProtect (hex). `None` = 0x40 on Windows, 7
+    /// (PROT_READ|WRITE|EXEC) for `linux-mprotect`.
+    pub prot: Option<String>,
+    /// `--syscall <n>`: decimal, or hex with an explicit `0x`.
+    pub syscall: Option<String>,
+    /// `--syscall-args rdi=..,rsi=..`.
+    pub syscall_args: Option<String>,
+    /// `--chain-pivot <addr>` (CHWIN-08).
+    pub pivot: Option<String>,
+    /// `--stage <hex>` (CHWIN-08).
+    pub stage: Option<String>,
 }
 
 impl ChainSpec {
@@ -1563,20 +1640,100 @@ impl ChainSpec {
 pub struct ChainOutcome {
     pub chain: rf_chain::RopChain,
     pub outcome: ScanOutcome,
+    /// CHWIN-04: what the Windows builder assumed about the world the
+    /// chain will run in — the chain-base parity, the API recipe, and the
+    /// two addresses CHWIN-02 keeps apart. `None` for a Linux chain, which
+    /// makes none of these assumptions.
+    pub assumptions: Option<rf_chain::windows::WinAssumptions>,
 }
 
-fn chain_err(e: rf_chain::ChainError) -> ScanError {
-    match e {
-        rf_chain::ChainError::Unsupported { .. } => ScanError::Usage(e.to_string()),
-        other => ScanError::Chain(other.to_string()),
+/// The Chain IR as JSON, plus the `assumptions` object a Windows chain
+/// carries (CHWIN-04). The IR itself is `rf_chain`'s serialisation,
+/// untouched; the assumptions sit beside it as their own key so a reader
+/// gets the layout AND what the layout took for granted from one document.
+/// ECO-04: parse `--syscall-args rdi=0x1000,rsi=8` into `(reg, value)`
+/// pairs. Register names are validated by the builder against the ABI, so
+/// the error here is only about the SHAPE.
+pub fn parse_syscall_args(spec: &str) -> Result<Vec<(String, u64)>, String> {
+    let mut out = Vec::new();
+    for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (reg, value) = item.split_once('=').ok_or_else(|| {
+            format!("invalid --syscall-args item {item:?}: expected <reg>=<value>")
+        })?;
+        let reg = reg.trim().to_ascii_lowercase();
+        if reg.is_empty() {
+            return Err(format!(
+                "invalid --syscall-args item {item:?}: empty register name"
+            ));
+        }
+        let value = parse_hex(value.trim(), "--syscall-args")?;
+        out.push((reg, value));
     }
+    Ok(out)
 }
 
-/// Parse the Windows chain parameters (hex strings → WinChainOpts).
-fn win_opts(spec: &ChainSpec) -> Result<rf_chain::WinChainOpts, ScanError> {
-    let usage = |e: String| ScanError::Usage(e);
-    Ok(rf_chain::WinChainOpts {
-        api_addr: spec
+/// `--syscall <n>`: DECIMAL by default (a syscall number is written in
+/// decimal everywhere from the kernel table to strace), hexadecimal only
+/// with an explicit `0x` — the same rule `parse_align` applies for the same
+/// reason (ANCH-02).
+pub fn parse_syscall_nr(v: &str) -> Result<u64, String> {
+    let t = v.trim();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        return u64::from_str_radix(hex, 16).map_err(|e| format!("invalid --syscall {v:?}: {e}"));
+    }
+    t.parse::<u64>()
+        .map_err(|e| format!("invalid --syscall {v:?}: {e}"))
+}
+
+/// `--stage 9090cc` -> the bytes to write.
+pub fn parse_hex_bytes(v: &str, flag: &str) -> Result<Vec<u8>, String> {
+    let t: String = v
+        .trim()
+        .trim_start_matches("0x")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if t.is_empty() {
+        return Err(format!("{flag}: no bytes given"));
+    }
+    if t.len() % 2 != 0 {
+        return Err(format!(
+            "{flag} {v:?}: hex byte string has an odd number of digits"
+        ));
+    }
+    (0..t.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&t[i..i + 2], 16).map_err(|e| format!("{flag} {v:?}: {e}")))
+        .collect()
+}
+
+/// Parse the Linux chain parameters (`ECO-04` / `CHLX-07`).
+pub fn linux_opts(spec: &ChainSpec) -> Result<rf_chain::LinuxChainOpts, ScanError> {
+    use rf_chain::LinuxTarget;
+    let usage = ScanError::Usage;
+    let target = LinuxTarget::parse(&spec.target).ok_or_else(|| {
+        ScanError::Usage(format!(
+            "unknown Linux chain target {:?}; supported: {}",
+            spec.target,
+            LinuxTarget::NAMES.join(", ")
+        ))
+    })?;
+    Ok(rf_chain::LinuxChainOpts {
+        target,
+        syscall_nr: spec
+            .syscall
+            .as_deref()
+            .map(parse_syscall_nr)
+            .transpose()
+            .map_err(usage)?,
+        syscall_args: spec
+            .syscall_args
+            .as_deref()
+            .map(parse_syscall_args)
+            .transpose()
+            .map_err(usage)?
+            .unwrap_or_default(),
+        func_addr: spec
             .api_addr
             .as_deref()
             .map(|a| parse_hex(a, "--api-addr"))
@@ -1590,10 +1747,376 @@ fn win_opts(spec: &ChainSpec) -> Result<rf_chain::WinChainOpts, ScanError> {
             .map_err(usage)?,
         shellcode_size: match &spec.shellcode_size {
             Some(s) => parse_hex(s, "--shellcode-size").map_err(usage)?,
+            None => rf_chain::linux::DEFAULT_LINUX_LEN,
+        },
+        prot: match &spec.prot {
+            Some(s) => parse_hex(s, "--prot").map_err(usage)?,
+            None => rf_chain::linux::DEFAULT_LINUX_PROT,
+        },
+    })
+}
+
+pub fn chain_json(outcome: &ChainOutcome) -> String {
+    let mut value = outcome.chain.to_json();
+    if let Some(obj) = value.as_object_mut() {
+        // Always present, `null` when the target makes no such assumptions
+        // — the same rule rf-mcp's schema.rs states, so a parser written
+        // against one surface does not break on the other.
+        obj.insert(
+            "assumptions".to_string(),
+            match outcome.assumptions.as_ref() {
+                Some(a) => serde_json::to_value(a).unwrap_or(serde_json::Value::Null),
+                None => serde_json::Value::Null,
+            },
+        );
+    }
+    serde_json::to_string_pretty(&value).unwrap()
+}
+
+fn chain_err(e: rf_chain::ChainError) -> ScanError {
+    match e {
+        rf_chain::ChainError::Unsupported { .. } => ScanError::Usage(e.to_string()),
+        other => ScanError::Chain(other.to_string()),
+    }
+}
+
+/// Parse the Windows chain parameters (hex strings → WinChainOpts).
+///
+/// `--api-name` and `--chain-base` are validated HERE rather than deep in
+/// the builder so a typo is a usage error naming the accepted values, and
+/// so the MCP (which calls the same function through `chain_bytes`) rejects
+/// the same set the CLI does — the ECO-02 property `capability_matrix.py`
+/// gates.
+pub fn win_opts(spec: &ChainSpec) -> Result<rf_chain::WinChainOpts, ScanError> {
+    use rf_chain::windows::{ApiRecipe, ChainBaseParity};
+    let usage = ScanError::Usage;
+    // CHWIN-08 #2: `--api-name A,B` composes two calls into one chain, and
+    // `--api-addr` then takes one address per name. One name and one
+    // address is the ordinary single-call case, unchanged.
+    let raw_names: Vec<&str> = match spec.api_name.as_deref().map(str::trim) {
+        None | Some("") => vec![],
+        Some(v) => v
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect(),
+    };
+    let canonical = |name: &str| -> Result<String, ScanError> {
+        ApiRecipe::NAMES
+            .iter()
+            .find(|n| n.eq_ignore_ascii_case(name))
+            .map(|n| (*n).to_string())
+            .ok_or_else(|| {
+                ScanError::Usage(format!(
+                    "--api-name {name:?}: supported values are {} (their argument recipes                      differ, so an unmodelled API cannot be called correctly)",
+                    ApiRecipe::NAMES.join(", ")
+                ))
+            })
+    };
+    let names: Vec<String> = if raw_names.is_empty() {
+        vec![rf_chain::WinChainOpts::default().api_name]
+    } else {
+        raw_names
+            .iter()
+            .map(|n| canonical(n))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let addrs: Vec<u64> = match spec.api_addr.as_deref().map(str::trim) {
+        None | Some("") => Vec::new(),
+        Some(v) => v
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|a| parse_hex(a, "--api-addr"))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(usage)?,
+    };
+    if !addrs.is_empty() && addrs.len() != names.len() {
+        return Err(ScanError::Usage(format!(
+            "--api-addr has {} address(es) but --api-name names {} API(s): a composed chain              needs one runtime address per call, or none at all (IAT resolution)",
+            addrs.len(),
+            names.len()
+        )));
+    }
+    let addr_of = |i: usize| addrs.get(i).copied();
+
+    let chain_base = match spec.chain_base.as_deref().map(str::trim) {
+        None | Some("") => ChainBaseParity::default(),
+        Some(v) => ChainBaseParity::parse(v).ok_or_else(|| {
+            ScanError::Usage(format!(
+                "--chain-base {v:?}: supported values are {}",
+                ChainBaseParity::VALUES.join(", ")
+            ))
+        })?,
+    };
+    Ok(rf_chain::WinChainOpts {
+        api_name: names[0].clone(),
+        api_addr: addr_of(0),
+        extra_calls: names
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(i, n)| (n.clone(), addr_of(i)))
+            .collect(),
+        shellcode_addr: spec
+            .shellcode_addr
+            .as_deref()
+            .map(|a| parse_hex(a, "--shellcode-addr"))
+            .transpose()
+            .map_err(usage)?,
+        shellcode_size: match &spec.shellcode_size {
+            Some(s) => parse_hex(s, "--shellcode-size").map_err(usage)?,
             None => rf_chain::windows::DEFAULT_SHELLCODE_SIZE,
         },
-        ..rf_chain::WinChainOpts::default()
+        new_protect: match &spec.prot {
+            Some(s) => parse_hex(s, "--prot").map_err(usage)?,
+            None => rf_chain::windows::DEFAULT_PROTECT,
+        },
+        chain_base,
+        pivot: spec
+            .pivot
+            .as_deref()
+            .map(|a| parse_hex(a, "--chain-pivot"))
+            .transpose()
+            .map_err(usage)?,
+        stage: spec
+            .stage
+            .as_deref()
+            .map(|h| parse_hex_bytes(h, "--stage"))
+            .transpose()
+            .map_err(usage)?
+            .unwrap_or_default(),
+        // Image data, not a flag: `chain_bytes` / `plan_once` fill it in
+        // from the file they already hold (CHWIN-08 #3).
+        exports: Vec::new(),
     })
+}
+
+/// Every `--chain` value, in help order. `linux-*` need an ELF x86/x64,
+/// `windows-virtualprotect` a PE x86/x64.
+pub fn chain_targets() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = rf_chain::LinuxTarget::NAMES.to_vec();
+    v.push("windows-virtualprotect");
+    v
+}
+
+/// Format/arch gate for a chain target. Shared by `chain_bytes` and
+/// `plan_chain_bytes` so the two cannot disagree about what is dispatchable.
+fn check_chain_target(
+    name: &str,
+    target: &Target,
+    arch: Arch,
+    format: &str,
+) -> Result<(), ScanError> {
+    let unsupported = || {
+        Err(chain_err(rf_chain::ChainError::Unsupported {
+            arch: rf_chain::arch_name(arch),
+            format: format.to_string(),
+        }))
+    };
+    match name {
+        t if rf_chain::LinuxTarget::parse(t).is_some() => {
+            if !matches!(target, Target::Elf(_)) || !matches!(arch, Arch::X86 | Arch::X64) {
+                return unsupported();
+            }
+        }
+        "windows-virtualprotect" => {
+            if !matches!(target, Target::Pe(_)) || !matches!(arch, Arch::X86 | Arch::X64) {
+                return unsupported();
+            }
+        }
+        other => {
+            return Err(ScanError::Usage(format!(
+                "unknown chain target {other:?}; supported: {}",
+                chain_targets().join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `ECO-04`: one probe run — load, scan, and ask the target's planner.
+///
+/// Separate from [`plan_chain_bytes`] because the relaxation search runs it
+/// several times with different scan parameters and compares the answers.
+fn plan_once(
+    bytes: &[u8],
+    raw: Option<RawSpec>,
+    req: &ScanRequest,
+    spec: &ChainSpec,
+) -> Result<(rf_chain::ChainPlan, Vec<rf_scan::Gadget>, u64), ScanError> {
+    let opts = request_options(req, raw)?;
+    let mut target = load_target(bytes, raw)?;
+    let format = target_format(&target);
+    let arch = match &target {
+        Target::Elf(b) => Image::arch(b),
+        Target::Pe(b) => Image::arch(b),
+        t => Image::arch(&build_view(t)),
+    };
+    // ECO-04: `plan_chain` ALWAYS succeeds, so the format/arch gate that
+    // `chain_bytes` applies is NOT applied here — "this builder does not
+    // cover PE x64 / linux-execve" is a REQUIREMENT the probe reports
+    // (`target_supported`), not an error the caller has to parse. Only an
+    // unknown target NAME is a usage error, because there is then nothing
+    // to plan for.
+    if !chain_targets().contains(&spec.target.as_str()) {
+        return Err(ScanError::Usage(format!(
+            "unknown chain target {:?}; supported: {}",
+            spec.target,
+            chain_targets().join(", ")
+        )));
+    }
+
+    let base = req
+        .base
+        .as_deref()
+        .map(|b| parse_hex(b, "--base"))
+        .transpose()
+        .map_err(ScanError::Usage)?;
+    match &mut target {
+        Target::Elf(b) => {
+            if let Some(base) = base {
+                b.rebase(base);
+            }
+        }
+        Target::Pe(b) => {
+            if let Some(base) = base {
+                b.rebase(base);
+            }
+        }
+        _ => {}
+    }
+    let prepared = prepare_view(&target, None, &req.section, req.arch.as_deref(), req.compat)?;
+    let gadgets = rf_scan::scan_binary(&prepared.view, &opts)
+        .map_err(|e| ScanError::Binary(e.to_string()))?;
+    let sections: &[rf_core::Section] = match &target {
+        Target::Elf(b) => b.sections(),
+        Target::Pe(b) => b.sections(),
+        // A Mach-O or raw target hosts neither chain family; the probe
+        // says so through `target_supported` and needs no sections.
+        _ => &[],
+    };
+    let data_sections: Vec<rf_chain::DataSection> = sections
+        .iter()
+        .filter(|s| !s.executable)
+        .map(|s| rf_chain::DataSection {
+            name: s.name.clone(),
+            vaddr: s.vaddr.wrapping_add(opts.offset),
+            writable: s.writable,
+        })
+        .collect();
+
+    let plan = match (&target, spec.target.as_str()) {
+        (_, "windows-virtualprotect") => {
+            let mut wopts = win_opts(spec)?;
+            if let Target::Pe(pe) = &target {
+                wopts.exports = pe_exports::parse_pe_exports(bytes, pe.image_base());
+            }
+            rf_chain::plan_windows(
+                &gadgets,
+                &data_sections,
+                match &target {
+                    Target::Pe(pe) => pe.imports(),
+                    _ => &[],
+                },
+                arch,
+                format,
+                &wopts,
+                &opts.badbytes,
+            )
+        }
+        _ => {
+            let lopts = linux_opts(spec)?;
+            rf_chain::plan_linux(
+                &gadgets,
+                &data_sections,
+                arch,
+                format,
+                &opts.badbytes,
+                &lopts,
+            )
+        }
+    };
+    Ok((plan, gadgets, opts.offset))
+}
+
+/// `ECO-04`: the feasibility report, with COMPUTED relaxations.
+///
+/// The relaxation loop is the point. For every requirement the base scan
+/// could not satisfy, the same probe is re-run against a scan taken with one
+/// parameter changed — `depth` doubled, then `--multibr` on — and
+/// `would_help` records what that re-run actually measured. Nothing here
+/// predicts; a `would_help: true` means a scan was taken and the gadget was
+/// there.
+///
+/// The re-scans are skipped entirely when the base plan is already feasible,
+/// which is the common case and the one where they would cost the most.
+pub fn plan_chain_bytes(
+    bytes: &[u8],
+    raw: Option<RawSpec>,
+    req: &ScanRequest,
+    spec: &ChainSpec,
+) -> Result<ChainPlanOutcome, ScanError> {
+    let (mut plan, gadgets, offset) = plan_once(bytes, raw, req, spec)?;
+    if plan.requirements.iter().any(|r| !r.satisfied) {
+        let deeper = ScanRequest {
+            depth: req.depth.saturating_mul(2),
+            ..req.clone()
+        };
+        if let Ok((v, _, _)) = plan_once(bytes, raw, &deeper, spec) {
+            plan.merge_relaxation(
+                &v,
+                "depth",
+                &req.depth.to_string(),
+                &deeper.depth.to_string(),
+            );
+        }
+        let multibr = ScanRequest {
+            multibr: true,
+            ..req.clone()
+        };
+        if !req.multibr {
+            if let Ok((v, _, _)) = plan_once(bytes, raw, &multibr, spec) {
+                plan.merge_relaxation(&v, "multibr", "false", "true");
+            }
+        }
+    }
+    Ok(ChainPlanOutcome {
+        plan,
+        gadgets,
+        offset,
+    })
+}
+
+/// `--plan-chain`'s document.
+///
+/// `gadget_id` stays `null` on the CLI: the stable id is the MCP's handle
+/// for referring to a gadget across tool calls, and a shell's handle is the
+/// address (the same asymmetry `tests/capability_matrix.py` records for the
+/// `ids` parameter). `vaddr` and `text` are here, which is what a shell
+/// pipeline needs.
+pub fn plan_json(outcome: &ChainPlanOutcome) -> String {
+    serde_json::to_string_pretty(&outcome.plan.to_json()).unwrap()
+}
+
+/// A plan plus the scan it was measured on, so a front end can turn the
+/// satisfying gadgets into the stable ids `get_gadgets` resolves.
+pub struct ChainPlanOutcome {
+    pub plan: rf_chain::ChainPlan,
+    pub gadgets: Vec<rf_scan::Gadget>,
+    /// `--offset` applied to the scan; ids are keyed on the UNSLID vaddr.
+    pub offset: u64,
+}
+
+impl ChainPlanOutcome {
+    /// The bytes of the gadget at `vaddr`, for a caller computing ids.
+    pub fn gadget_bytes(&self, vaddr: u64) -> Option<&[u8]> {
+        self.gadgets
+            .iter()
+            .find(|g| g.vaddr == vaddr)
+            .map(|g| g.bytes.as_slice())
+    }
 }
 
 /// `--ropchain` pipeline: options → load → dispatch on `--chain` target →
@@ -1618,29 +2141,7 @@ pub fn chain_bytes(
     };
 
     // Target dispatch: format gates the chain family.
-    match spec.target.as_str() {
-        "linux-execve" => {
-            if !matches!(&target, Target::Elf(_)) || !matches!(arch, Arch::X86 | Arch::X64) {
-                return Err(chain_err(rf_chain::ChainError::Unsupported {
-                    arch: rf_chain::arch_name(arch),
-                    format: format.to_string(),
-                }));
-            }
-        }
-        "windows-virtualprotect" => {
-            if !matches!(&target, Target::Pe(_)) || !matches!(arch, Arch::X86 | Arch::X64) {
-                return Err(chain_err(rf_chain::ChainError::Unsupported {
-                    arch: rf_chain::arch_name(arch),
-                    format: format.to_string(),
-                }));
-            }
-        }
-        other => {
-            return Err(ScanError::Usage(format!(
-                "unknown chain target {other:?}; supported: linux-execve, windows-virtualprotect"
-            )));
-        }
-    }
+    check_chain_target(&spec.target, &target, arch, format)?;
 
     // Rebase the TARGET (not just the view) so the writable sections used
     // for the string write / lpflOldProtect carry the rebased vaddrs too.
@@ -1699,31 +2200,68 @@ pub fn chain_bytes(
         })
         .collect();
 
+    // CHLX-08: the symmetric warning to the PE GUARD_CF one. Every address
+    // in a chain built against an ET_DYN image is a LINK-TIME offset, and
+    // the tool already knows both facts it needs to say so.
+    if let Target::Elf(b) = &target {
+        // ET_DYN is exactly what rf-core's `pie` mitigation decides, and it
+        // decides it from `e_type` — so the warning and `--info` /
+        // get_mitigations cannot disagree about whether a target is PIE.
+        let is_dyn = b.mitigations().enabled(rf_core::mitigations::PIE)
+            == rf_core::mitigations::Enabled::Yes;
+        if let Some(w) = rf_chain::linux::pie_chain_warning(is_dyn, b.image_base(), opts.offset) {
+            eprintln!("[Warning] {w}");
+        }
+    }
+
+    let mut assumptions = None;
     let chain = match spec.target.as_str() {
-        "linux-execve" => {
-            rf_chain::build_linux_execve(&gadgets, &data_sections, arch, format, &opts.badbytes)
-                .map_err(chain_err)?
+        t if rf_chain::LinuxTarget::parse(t).is_some() => {
+            let lopts = linux_opts(spec)?;
+            rf_chain::build_linux(
+                &gadgets,
+                &data_sections,
+                arch,
+                format,
+                &opts.badbytes,
+                &lopts,
+            )
+            .map_err(chain_err)?
         }
         "windows-virtualprotect" => {
             let Target::Pe(pe) = &target else {
                 unreachable!("dispatched above")
             };
-            rf_chain::build_windows_virtualprotect(
+            let mut wopts = win_opts(spec)?;
+            // CHWIN-08 #3: strategy (c). Parsed from the bytes we already
+            // hold, and rebased with the image, so an export resolves to
+            // the same address the rest of the chain uses.
+            wopts.exports = pe_exports::parse_pe_exports(bytes, pe.image_base());
+            let chain = rf_chain::build_windows_virtualprotect(
                 &gadgets,
                 &data_sections,
                 pe.imports(),
                 arch,
                 format,
-                &win_opts(spec)?,
+                &wopts,
                 &opts.badbytes,
             )
-            .map_err(chain_err)?
+            .map_err(chain_err)?;
+            // CHWIN-04: the same computation the builder ran, reported back
+            // so the assumption is in the artefact rather than only in the
+            // source. Never a second, drifting derivation.
+            assumptions = Some(
+                rf_chain::windows::windows_assumptions(&data_sections, arch, &wopts)
+                    .map_err(chain_err)?,
+            );
+            chain
         }
         _ => unreachable!("validated above"),
     };
 
     Ok(ChainOutcome {
         chain,
+        assumptions,
         outcome: ScanOutcome {
             result: ScanResult {
                 gadgets,
@@ -1918,7 +2456,7 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
     // --ropchain: chain generation (--chain selects the target). Unlike
     // ROPgadget, which dumps the gadget list and step logs first, we print
     // only the exploit script (or the JSON Chain IR with --json).
-    if cli.ropchain {
+    if cli.ropchain || cli.plan_chain {
         // CHWIN-09: warn before doing the work, not after printing a
         // chain that looks authoritative.
         if let Some(warning) = chain_experimental_warning(&cli.chain) {
@@ -1927,12 +2465,46 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
         let spec = ChainSpec {
             target: cli.chain.clone(),
             api_addr: cli.api_addr.clone(),
+            api_name: cli.api_name.clone(),
             shellcode_addr: cli.shellcode_addr.clone(),
             shellcode_size: cli.shellcode_size.clone(),
+            chain_base: cli.chain_base.clone(),
+            prot: cli.prot.clone(),
+            syscall: cli.syscall.clone(),
+            syscall_args: cli.syscall_args.clone(),
+            pivot: cli.chain_pivot.clone(),
+            stage: cli.stage.clone(),
         };
+        // ECO-04: `--plan-chain` ALWAYS succeeds. Infeasibility is a
+        // result, and it is the same document `--ropchain --json` prints
+        // when it has to refuse, so an agent parses one shape either way.
+        if cli.plan_chain {
+            let outcome = match plan_chain_bytes(&bytes, raw, &req, &spec) {
+                Ok(o) => o,
+                Err(ScanError::Usage(e)) | Err(ScanError::Chain(e)) => return Err(e),
+                Err(ScanError::Binary(e)) => {
+                    eprintln!("[Error] {e}");
+                    return Ok(2);
+                }
+            };
+            let _ = writeln!(out, "{}", plan_json(&outcome));
+            return Ok(0);
+        }
         let outcome = match chain_bytes(&bytes, raw, &req, &spec) {
             Ok(o) => o,
-            Err(ScanError::Usage(e)) | Err(ScanError::Chain(e)) => return Err(e),
+            Err(ScanError::Usage(e)) | Err(ScanError::Chain(e)) => {
+                // ECO-04: on the JSON surface a refusal is a DOCUMENT, not
+                // a sentence. `--ropchain --json` that cannot build prints
+                // the same ChainPlan `--plan-chain` prints (feasible:false,
+                // with the requirement that failed), and still exits
+                // non-zero. The human/python surface is untouched.
+                if chain_format == format::ChainFormat::Json {
+                    if let Ok(o) = plan_chain_bytes(&bytes, raw, &req, &spec) {
+                        let _ = writeln!(out, "{}", plan_json(&o));
+                    }
+                }
+                return Err(e);
+            }
             Err(ScanError::Binary(e)) => {
                 eprintln!("[Error] {e}");
                 return Ok(2);
@@ -1945,11 +2517,7 @@ fn run(cli: Cli, out: &mut dyn std::io::Write) -> Result<i32, String> {
         }
         match chain_format {
             format::ChainFormat::Json => {
-                let _ = writeln!(
-                    out,
-                    "{}",
-                    serde_json::to_string_pretty(&outcome.chain.to_json()).unwrap()
-                );
+                let _ = writeln!(out, "{}", chain_json(&outcome));
             }
             // ECO-09 part 2: MANUAL.md has advertised "raw bytes" chain
             // output since v0.1 and `RopChain::to_bytes` was called only
@@ -2680,12 +3248,14 @@ fn run_cache_purge(out: &mut dyn std::io::Write) -> i32 {
 /// Returns the warning for a target that has one, `None` otherwise.
 fn chain_experimental_warning(target: &str) -> Option<&'static str> {
     (target == "windows-virtualprotect").then_some(
-        "[Warning] --chain windows-virtualprotect is EXPERIMENTAL and is known NOT to \
-         execute correctly.\n\
-         [Warning] The script it prints is not a working exploit: see CHWIN-01, CHWIN-02 \
-         and CHWIN-03.\n\
-         [Warning] Fixed in v0.5; until then treat the output as a gadget-selection \
-         sketch only.\n",
+        "[Warning] --chain windows-virtualprotect is EXPERIMENTAL: the chain it emits \
+         executes under this project's emulator (tests/emulate.py), not on Windows.\n\
+         [Warning] The four layout defects this warning used to name — CHWIN-01, \
+         CHWIN-02, CHWIN-03, CHWIN-07 — are fixed in v0.5, each with a failing-before \
+         and a passing-after run recorded in docs/chain-regressions.md.\n\
+         [Warning] What the emulator cannot check is still yours: that --api-addr is \
+         the runtime address, that rsp really is --chain-base mod 16 at entry, and that \
+         CFG/CET is not enforced on the target.\n",
     )
 }
 
@@ -2784,10 +3354,18 @@ mod tests {
             base: None,
             info: false,
             ropchain: false,
+            plan_chain: false,
+            syscall: None,
+            syscall_args: None,
+            chain_pivot: None,
+            stage: None,
             chain: "linux-execve".into(),
             api_addr: None,
+            api_name: None,
             shellcode_addr: None,
             shellcode_size: None,
+            chain_base: None,
+            prot: None,
             cfg_aware: false,
             section: Vec::new(),
             thumb,
@@ -3517,7 +4095,18 @@ mod tests {
         assert!(w.contains("CHWIN-01"), "{w}");
         assert!(w.contains("CHWIN-02"), "{w}");
         assert!(w.contains("CHWIN-03"), "{w}");
+        assert!(w.contains("CHWIN-07"), "{w}");
         assert!(w.contains("v0.5"), "{w}");
+        // v0.5: the warning still fires, but it may no longer say the chain
+        // cannot run. CHWIN-01/-02/-03/-07 are fixed and every one of them
+        // has a recorded run under tests/emulate.py, so this sentence would
+        // now be a false statement about the tool's own output. It is
+        // asserted absent so it cannot be reinstated by a copy-paste.
+        assert!(
+            !w.contains("known NOT to execute"),
+            "the pre-v0.5 retraction text is back: {w}"
+        );
+        assert!(w.contains("docs/chain-regressions.md"), "{w}");
         assert!(w.ends_with('\n'), "{w:?}");
         assert!(chain_experimental_warning("linux-execve").is_none());
     }
@@ -4060,6 +4649,243 @@ mod tests {
             .collect()
     }
 
+    // -- ECO-04 / CHLX-07 / CHLX-08 -------------------------------------------
+
+    #[test]
+    fn syscall_number_is_decimal_unless_it_says_0x() {
+        assert_eq!(parse_syscall_nr("59").unwrap(), 59);
+        assert_eq!(parse_syscall_nr(" 10 ").unwrap(), 10);
+        // ANCH-02's rule, for the same reason: a syscall number is written
+        // in decimal everywhere from the kernel table to strace.
+        assert_eq!(parse_syscall_nr("0x3b").unwrap(), 59);
+        assert!(parse_syscall_nr("zz").is_err());
+    }
+
+    #[test]
+    fn syscall_args_parse_into_register_value_pairs() {
+        let got = parse_syscall_args("rdi=0x1000,rsi=8, RDX =7").unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("rdi".to_string(), 0x1000),
+                ("rsi".to_string(), 8),
+                ("rdx".to_string(), 7),
+            ]
+        );
+        assert!(parse_syscall_args("rdi")
+            .unwrap_err()
+            .contains("<reg>=<value>"));
+        assert!(parse_syscall_args("=1")
+            .unwrap_err()
+            .contains("empty register"));
+        assert!(parse_syscall_args("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn stage_bytes_parse_as_hex() {
+        assert_eq!(
+            parse_hex_bytes("9090cc", "--stage").unwrap(),
+            vec![0x90, 0x90, 0xcc]
+        );
+        assert_eq!(
+            parse_hex_bytes("0x90 90", "--stage").unwrap(),
+            vec![0x90, 0x90]
+        );
+        assert!(parse_hex_bytes("909", "--stage")
+            .unwrap_err()
+            .contains("odd number"));
+        assert!(parse_hex_bytes("", "--stage")
+            .unwrap_err()
+            .contains("no bytes"));
+    }
+
+    /// CHWIN-08 #2: `--api-name A,B` composes two calls; `--api-addr` then
+    /// needs one address per call or none.
+    #[test]
+    fn api_name_list_composes_calls_and_pairs_with_api_addr() {
+        let spec = ChainSpec {
+            target: "windows-virtualprotect".into(),
+            api_name: Some("VirtualAlloc,virtualprotect".into()),
+            api_addr: Some("0x1000,0x2000".into()),
+            ..ChainSpec::default()
+        };
+        let o = win_opts(&spec).unwrap();
+        assert_eq!(o.api_name, "VirtualAlloc");
+        assert_eq!(o.api_addr, Some(0x1000));
+        // canonical casing, so the IAT lookup and the description agree
+        assert_eq!(
+            o.extra_calls,
+            vec![("VirtualProtect".to_string(), Some(0x2000))]
+        );
+
+        let mismatched = ChainSpec {
+            api_addr: Some("0x1000".into()),
+            ..spec.clone()
+        };
+        let err = win_opts(&mismatched).unwrap_err().to_string();
+        assert!(err.contains("one runtime address per call"), "{err}");
+
+        let unknown = ChainSpec {
+            api_name: Some("VirtualAlloc,LoadLibraryA".into()),
+            api_addr: None,
+            ..spec
+        };
+        let err = win_opts(&unknown).unwrap_err().to_string();
+        assert!(err.contains("LoadLibraryA"), "{err}");
+    }
+
+    /// ECO-04: `--plan-chain` always succeeds and names the requirement
+    /// that failed. This is the exit criterion's fixture.
+    #[test]
+    fn plan_chain_on_pe_x64_cmd_reports_set_rdx_with_computed_relaxations() {
+        let bytes = fixture_bytes("pe-x64-cmd-v6.1.7601");
+        let spec = ChainSpec {
+            target: "windows-virtualprotect".into(),
+            ..ChainSpec::default()
+        };
+        let out = plan_chain_bytes(&bytes, None, &ScanRequest::default(), &spec).unwrap();
+        let plan = &out.plan;
+        assert!(!plan.feasible);
+        let rdx = plan.requirement("set_rdx").expect("set_rdx");
+        assert!(!rdx.satisfied);
+        assert!(
+            !rdx.strategies_tried.is_empty(),
+            "strategies_tried must not be empty"
+        );
+        // Computed, not guessed: each relaxation is a real re-scan.
+        assert!(
+            !rdx.relaxations.is_empty(),
+            "at least one computed relaxation"
+        );
+        assert!(rdx.relaxations.iter().any(|r| r.param == "depth"));
+        assert!(rdx.relaxations.iter().any(|r| r.param == "multibr"));
+        // ...and the requirements this binary DOES meet are listed, with a
+        // vaddr that is a real gadget of the scan.
+        assert!(!plan.satisfied_requirements.is_empty());
+        let rcx = plan
+            .satisfied_requirements
+            .iter()
+            .find(|s| s.id == "set_rcx")
+            .expect("set_rcx is satisfied on cmd.exe");
+        assert!(
+            out.gadget_bytes(rcx.vaddr).is_some(),
+            "the vaddr resolves in the scan"
+        );
+    }
+
+    /// ECO-04: `--plan-chain` on a target it cannot even dispatch is still
+    /// a document, not an error.
+    #[test]
+    fn plan_chain_never_fails_for_a_feasible_target() {
+        let bytes = fixture_bytes("elf-Linux-x64");
+        for target in ["linux-execve", "linux-mprotect", "linux-srop"] {
+            let spec = ChainSpec {
+                target: target.to_string(),
+                ..ChainSpec::default()
+            };
+            let out = plan_chain_bytes(&bytes, None, &ScanRequest::default(), &spec).unwrap();
+            assert!(out.plan.feasible, "{target}: {:?}", out.plan.error);
+            assert!(
+                out.plan.requirements.iter().all(|r| r.satisfied),
+                "{target}"
+            );
+            // A feasible plan does no relaxation re-scans at all.
+            assert!(out
+                .plan
+                .requirements
+                .iter()
+                .all(|r| r.relaxations.is_empty()));
+        }
+    }
+
+    /// ECO-04: `--plan-chain` is a DOCUMENT even when the target is not
+    /// dispatchable at all. `--ropchain --json` prints the same document
+    /// when it has to refuse, which is the one-contract rule.
+    #[test]
+    fn plan_chain_reports_an_undispatchable_target_as_a_requirement() {
+        let bytes = fixture_bytes("pe-x64-cmd-v6.1.7601");
+        let spec = ChainSpec::linux();
+        let out = plan_chain_bytes(&bytes, None, &ScanRequest::default(), &spec).unwrap();
+        assert!(!out.plan.feasible);
+        assert_eq!(
+            out.plan
+                .requirements
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["target_supported"]
+        );
+        assert!(out.plan.error.unwrap().contains("not supported yet"));
+        // ...and a target name that does not exist at all IS a usage error,
+        // because there is then nothing to plan for.
+        let spec = ChainSpec {
+            target: "linux-nonsense".into(),
+            ..ChainSpec::default()
+        };
+        let err = match plan_chain_bytes(&bytes, None, &ScanRequest::default(), &spec) {
+            Ok(_) => panic!("an unknown target name must be a usage error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("unknown chain target"), "{err}");
+    }
+
+    /// CHLX-07: every advertised chain target is dispatchable on both
+    /// surfaces, and an unknown one names the accepted set.
+    #[test]
+    fn chain_targets_are_the_advertised_set() {
+        assert_eq!(
+            chain_targets(),
+            vec![
+                "linux-execve",
+                "linux-mprotect",
+                "linux-syscall",
+                "linux-ret2libc",
+                "linux-srop",
+                "windows-virtualprotect",
+            ]
+        );
+        let bytes = fixture_bytes("elf-Linux-x64");
+        let spec = ChainSpec {
+            target: "linux-nonsense".into(),
+            ..ChainSpec::default()
+        };
+        let m = match chain_bytes(&bytes, None, &ScanRequest::default(), &spec) {
+            Ok(_) => panic!("an unknown target must not build"),
+            Err(e) => e.to_string(),
+        };
+        assert!(m.contains("linux-srop"), "{m}");
+        assert!(m.contains("windows-virtualprotect"), "{m}");
+    }
+
+    /// CHLX-08: the symmetric warning to the PE GUARD_CF one. It fires for
+    /// an ET_DYN target with no `--offset`, and not otherwise.
+    #[test]
+    fn chlx08_pie_targets_are_warned_about() {
+        assert!(rf_chain::linux::pie_chain_warning(true, 0, 0)
+            .unwrap()
+            .contains("--offset"));
+        assert!(rf_chain::linux::pie_chain_warning(true, 0, 0x7ffff7a00000).is_none());
+        assert!(rf_chain::linux::pie_chain_warning(false, 0x400000, 0).is_none());
+        // ...and rf-core agrees the shipped shared object IS ET_DYN, which
+        // is what the CLI branches on.
+        let bytes = fixture_bytes("Linux_lib64.so");
+        let Target::Elf(b) = load_target(&bytes) else {
+            panic!("not an ELF");
+        };
+        assert_eq!(
+            b.mitigations().enabled(rf_core::mitigations::PIE),
+            rf_core::mitigations::Enabled::Yes
+        );
+        let bytes = fixture_bytes("elf-Linux-x64");
+        let Target::Elf(b) = load_target(&bytes) else {
+            panic!("not an ELF");
+        };
+        assert_ne!(
+            b.mitigations().enabled(rf_core::mitigations::PIE),
+            rf_core::mitigations::Enabled::Yes
+        );
+    }
+
     #[test]
     fn chain_builds_on_linux_x64() {
         let out = chain_fixture("elf-Linux-x64");
@@ -4151,19 +4977,36 @@ mod tests {
 
     #[test]
     fn chain_missing_gadgets_is_structured_error() {
-        // elf-x64-bash lacks a "mov qword ptr [r64], r64" gadget — ROPgadget
-        // prints "Can't find ..." and gives up; we return ScanError::Chain.
+        // A gadget the recipe needs and the scan does not hold is a
+        // ScanError::Chain naming it — ROPgadget prints "Can't find ..."
+        // and gives up.
+        //
+        // The scan is pinned to `depth: 2` deliberately. This used to run
+        // at the default depth against elf-x64-bash, but CHLX-01's
+        // fallback strategies now build a chain there, and pinning a
+        // *shortage* test to a fixture that has since grown a route makes
+        // the assertion about the fixture rather than about the error
+        // shape. A two-instruction gadget budget is a shortage no
+        // fallback can search its way out of; the assertion below is on
+        // the shape and on the message naming a gadget, not on which one.
+        let req = ScanRequest {
+            depth: 2,
+            ..ScanRequest::default()
+        };
         let err = match chain_bytes(
             &fixture_bytes("elf-x64-bash-v4.1.5.1"),
             None,
-            &ScanRequest::default(),
+            &req,
             &ChainSpec::linux(),
         ) {
             Err(e) => e,
-            Ok(_) => panic!("bash chain build unexpectedly succeeded"),
+            Ok(_) => panic!("bash chain build at depth 2 unexpectedly succeeded"),
         };
         match err {
-            ScanError::Chain(m) => assert!(m.contains("mov qword ptr"), "{m}"),
+            ScanError::Chain(m) => {
+                assert!(m.contains("can't find a suitable gadget"), "{m}");
+                assert!(m.len() > "can't find a suitable gadget: ".len(), "{m}");
+            }
             other => panic!("expected Chain, got {other:?}"),
         }
     }
@@ -4192,8 +5035,7 @@ mod tests {
         ChainSpec {
             target: "windows-virtualprotect".into(),
             api_addr: Some("0x7fff12340000".into()),
-            shellcode_addr: None,
-            shellcode_size: None,
+            ..ChainSpec::default()
         }
     }
 
@@ -4228,6 +5070,153 @@ mod tests {
             .unwrap();
         // python renderer: 6 pack('<I') words
         assert_eq!(chain.to_python().matches("pack('<I',").count(), 6);
+    }
+
+    /// CHWIN-02, on a binary the project ships. `build_win32` used to pass
+    /// the writable section's vaddr for BOTH the shellcode home and
+    /// `&lpflOldProtect`, so VirtualProtect wrote the previous-protection
+    /// DWORD over the first four bytes of the buffer it had just made RWX,
+    /// and the `ret 0x10` then landed on it. The emulator saw
+    /// `90909090 -> 04000000` (docs/chain-regressions.md, CHWIN-02-x86).
+    #[test]
+    fn chain_windows_x86_out_parameter_does_not_alias_the_shellcode() {
+        let out = chain_bytes(
+            &fixture_bytes("pe-x86-cmd-v6.1.7600"),
+            None,
+            &ScanRequest::default(),
+            &win_spec(),
+        )
+        .unwrap();
+        let values: Vec<u64> = out.chain.words.iter().map(|w| w.value).collect();
+        let shellcode = values[2];
+        let old = values[5];
+        assert_eq!(shellcode, 0x4ad24000, "the .data vaddr --info reports");
+        assert_ne!(old, shellcode, "CHWIN-02: the out-parameter aliases arg1");
+        assert!(
+            old < shellcode || old >= shellcode + 4,
+            "{old:#x} lands in the shellcode's first DWORD"
+        );
+        let a = out.assumptions.as_ref().unwrap();
+        assert_eq!(a.shellcode_addr, shellcode);
+        assert_eq!(a.old_protect_addr, Some(old));
+        assert!(out.chain.words[5].comment.contains("NOT the shellcode"));
+    }
+
+    /// CHWIN-06 on the shipped fixture: cmd.exe imports VirtualAlloc, not
+    /// VirtualProtect (measured with `--info`: VirtualAlloc, VirtualFree,
+    /// VirtualQuery). `--api-name` selects both the symbol and the argument
+    /// recipe, so arg3 becomes MEM_COMMIT and arg4 the protection.
+    #[test]
+    fn chain_windows_api_name_selects_the_recipe() {
+        let out = chain_bytes(
+            &fixture_bytes("pe-x86-cmd-v6.1.7600"),
+            None,
+            &ScanRequest::default(),
+            &ChainSpec {
+                api_name: Some("virtualalloc".into()), // case-insensitive
+                ..win_spec()
+            },
+        )
+        .unwrap();
+        let values: Vec<u64> = out.chain.words.iter().map(|w| w.value).collect();
+        assert_eq!(values[4], rf_chain::windows::MEM_COMMIT, "flAllocationType");
+        assert_eq!(values[5], 0x40, "flProtect");
+        assert!(out.chain.description.contains("VirtualAlloc"));
+        assert!(out.chain.description.contains("MEM_COMMIT"));
+        // No out-parameter, so nothing for CHWIN-02 to alias.
+        assert_eq!(out.assumptions.as_ref().unwrap().old_protect_addr, None);
+        assert_eq!(out.assumptions.as_ref().unwrap().api_name, "VirtualAlloc");
+    }
+
+    /// CHWIN-04: `--chain-base` changes the layout the invariant enforces,
+    /// and `--prot` reaches flNewProtect. Both are usage-validated.
+    #[test]
+    fn chain_base_and_prot_flags_are_parsed_and_validated() {
+        let spec = ChainSpec {
+            chain_base: Some("aligned".into()),
+            prot: Some("0x20".into()),
+            ..win_spec()
+        };
+        let o = win_opts(&spec).unwrap();
+        assert_eq!(o.chain_base, rf_chain::windows::ChainBaseParity::Aligned);
+        assert_eq!(o.new_protect, 0x20);
+        // Defaults, when the flags are absent.
+        let d = win_opts(&win_spec()).unwrap();
+        assert_eq!(
+            d.chain_base,
+            rf_chain::windows::ChainBaseParity::ReturnAddress
+        );
+        assert_eq!(d.new_protect, 0x40);
+        assert_eq!(d.api_name, "VirtualProtect");
+        // The MCP passes snake_case; both surfaces accept both spellings.
+        for v in ["return-address", "return_address"] {
+            let o = win_opts(&ChainSpec {
+                chain_base: Some(v.into()),
+                ..win_spec()
+            })
+            .unwrap();
+            assert_eq!(
+                o.chain_base,
+                rf_chain::windows::ChainBaseParity::ReturnAddress
+            );
+        }
+        // Bad values are usage errors that name the accepted set.
+        let err = win_opts(&ChainSpec {
+            chain_base: Some("stack".into()),
+            ..win_spec()
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&err, ScanError::Usage(m) if m.contains("aligned")),
+            "{err:?}"
+        );
+        let err = win_opts(&ChainSpec {
+            api_name: Some("VirtualProtectEx".into()),
+            ..win_spec()
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&err, ScanError::Usage(m) if m.contains("VirtualProtect, VirtualAlloc")),
+            "{err:?}"
+        );
+        assert!(win_opts(&ChainSpec {
+            prot: Some("zz".into()),
+            ..win_spec()
+        })
+        .is_err());
+    }
+
+    /// CHWIN-04's disclosure half on the CLI: `--ropchain --json` carries
+    /// the assumption the layout was built on, next to the layout.
+    #[test]
+    fn chain_json_carries_the_windows_assumptions() {
+        let out = chain_bytes(
+            &fixture_bytes("pe-x86-cmd-v6.1.7600"),
+            None,
+            &ScanRequest::default(),
+            &win_spec(),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&chain_json(&out)).unwrap();
+        let a = &v["assumptions"];
+        assert_eq!(a["chain_base_parity"], "return_address");
+        assert_eq!(a["chain_base_mod16"], 8);
+        assert_eq!(a["api_name"], "VirtualProtect");
+        assert_eq!(a["shellcode_addr"], "0x4ad24000");
+        assert_ne!(a["old_protect_addr"], a["shellcode_addr"]);
+        // The IR itself is untouched: same words, same order.
+        assert_eq!(v["words"].as_array().unwrap().len(), out.chain.words.len());
+        // A Linux chain makes none of these assumptions and says nothing.
+        let lin = chain_bytes(
+            &fixture_bytes("elf-Linux-x64"),
+            None,
+            &ScanRequest::default(),
+            &ChainSpec::linux(),
+        )
+        .unwrap();
+        assert!(lin.assumptions.is_none());
+        let lv: serde_json::Value = serde_json::from_str(&chain_json(&lin)).unwrap();
+        assert_eq!(lv["assumptions"], serde_json::Value::Null);
     }
 
     #[test]
@@ -4270,14 +5259,15 @@ mod tests {
         assert_eq!(chain.arch, "x64");
         assert_eq!(chain.word_size, 8);
 
-        // Structure: 4×(pop gadget + arg word), transfer at an EVEN index
-        // (alignment invariant), then return-to-shellcode + 4 shadow words.
+        // Structure: 4×(pop gadget + arg word), transfer at an ODD index
+        // under the DEFAULT chain base (`return_address`, CHWIN-04), then
+        // return-to-shellcode + 4 shadow words.
         let call_idx = chain
             .words
             .iter()
             .position(|w| w.comment.contains("--api-addr"))
             .unwrap();
-        assert_eq!(call_idx % 2, 0, "alignment invariant");
+        assert_eq!(call_idx % 2, 1, "alignment invariant (return_address base)");
         assert_eq!(chain.words.len(), call_idx + 1 + 1 + 4);
         assert_eq!(chain.words[call_idx].value, 0x7fff12340000);
         assert_eq!(
@@ -4288,6 +5278,38 @@ mod tests {
         assert!(chain.words[call_idx + 2..]
             .iter()
             .all(|w| w.kind == rf_chain::WordKind::Padding));
+
+        // CHWIN-01, on a real 20 MB PE: whatever word the API transfer is
+        // reached through, it is never an inert data word — the preceding
+        // gadget's `ret` loads it into rip.
+        let before = &chain.words[call_idx - 1];
+        assert!(
+            matches!(
+                before.kind,
+                rf_chain::WordKind::GadgetAddr | rf_chain::WordKind::Padding
+            ),
+            "{before:?}"
+        );
+        if before.kind == rf_chain::WordKind::GadgetAddr {
+            let g = &chain.gadgets[before.source_gadget.unwrap()];
+            assert_eq!(g.text, "ret", "the alignment slide must consume itself");
+        }
+        chain.verify_stack_accounting().unwrap();
+
+        // CHWIN-02: &lpflOldProtect is arg4 (word 7) and must not alias the
+        // shellcode, which is arg1 (word 1).
+        let assumptions = out.assumptions.as_ref().expect("windows assumptions");
+        assert_eq!(assumptions.chain_base_parity, "return_address");
+        assert_eq!(assumptions.shellcode_addr, chain.words[1].value);
+        let old = assumptions
+            .old_protect_addr
+            .expect("VirtualProtect out-param");
+        assert_eq!(chain.words[7].value, old);
+        assert!(
+            old < chain.words[1].value || old >= chain.words[1].value + 4,
+            "{old:#x} aliases the shellcode at {:#x}",
+            chain.words[1].value
+        );
 
         // Property: every gadget word references a real scan gadget.
         let universe: std::collections::HashSet<u64> = out

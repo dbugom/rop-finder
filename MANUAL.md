@@ -41,10 +41,10 @@ rop-finder is a rewrite of [ROPgadget](https://github.com/jonathansalwan/ROPgadg
 | **Gadget discovery** | ROP, JOP, and syscall gadgets; 99.995% parity with ROPgadget across 24 reference binaries — measured on post-dedup `(address, bytes)` sets, **not** on instruction text (see [§10, "Different output from ROPgadget?"](#10-troubleshooting--faq)) |
 | **Formats** | ELF, PE (.exe/.dll), Mach-O, fat/Universal Mach-O, raw blobs |
 | **Architectures** | x86, x64, ARM, Thumb, ARM64, MIPS 32/64, PowerPC 32/64, SPARC, RISC-V 32/64 |
-| **Chain generation** | Linux `execve("/bin//sh")` (x86/x64), emitted as a Python exploit script or JSON IR. Windows `VirtualProtect` (x86/x64) is **experimental** and prints a warning — see [UC6](#uc6--auto-generating-a-windows-virtualprotect-chain) |
+| **Chain generation** | Linux `execve("/bin//sh")`, `mprotect`, a generic `syscall`, `ret2libc` and `SROP` (x86/x64), emitted as a Python exploit script or JSON IR. Windows `VirtualProtect` (x86/x64) is **experimental** — every target listed here is executed under the project's emulator harness before it is advertised (`tests/emulate.py`), but the emulator is not Windows; see [UC6](#uc6--auto-generating-a-windows-virtualprotect-chain) |
 | **Address control** | `--base` rebase (RVA/ASLR workflows), `--offset` slide, `--section` filtering, `--range` trimming |
 | **Intelligence** | Semantic classification (reg-write, stack-pivot, …), quality ranking, JOP dispatcher detection — classification measured against a hand-labeled corpus (x86-64 macro-P 0.9959); ranking is an unevaluated heuristic (see [§8](#8-semantic-classification-and-quality-ranking)) |
-| **AI integration** | MCP server (`rop-finder-mcp`) exposing 14 tools to AI agents over stdio |
+| **AI integration** | MCP server (`rop-finder-mcp`) exposing 15 tools to AI agents over stdio |
 | **Speed** | ~6× faster than ROPgadget on x86/x64; 1.3–2.1× on ARM64/MIPS/PowerPC. Per-fixture timings and method: [`docs/measured-2026-09.md`](docs/measured-2026-09.md) |
 | **Robustness** | Structured errors with exit codes on malformed/corrupt binaries |
 
@@ -235,10 +235,18 @@ to ROPgadget's; under `--format json|jsonl|csv` each hit is
 |---|---|
 | `--ropchain` | Generate a chain |
 | `--chain-format <fmt>` | `python` (default, the exploit script), `json` (the Chain IR), or `raw` — the packed little-endian payload, written to stdout as **bytes** for a non-Python harness. Redirect it: `--chain-format raw > chain.bin` |
-| `--chain <target>` | `linux-execve` (default) or `windows-virtualprotect` (**experimental**, prints a stderr warning — see [UC6](#uc6--auto-generating-a-windows-virtualprotect-chain)) |
-| `--api-addr <hex>` | Runtime address of the target API (Windows) |
+| `--chain <target>` | `linux-execve` (default), `linux-mprotect`, `linux-syscall`, `linux-ret2libc`, `linux-srop` (ELF x86/x64) or `windows-virtualprotect` (PE x86/x64; **experimental**, prints a stderr warning — see [UC6](#uc6--auto-generating-a-windows-virtualprotect-chain)) |
+| `--plan-chain` | Print a machine-readable feasibility report for `--chain` instead of a chain: which requirements this binary meets, which it does not, what was tried, and which parameter changes would help (measured, by re-scanning). Always succeeds; always JSON |
+| `--api-addr <hex>` | Runtime address of the target API (Windows). A comma-separated list supplies one address per `--api-name` |
+| `--api-name <name>` | Which API `windows-virtualprotect` targets: `VirtualProtect` (default) or `VirtualAlloc`. Selects the IAT import to resolve **and** the argument recipe — the two do not take the same four arguments. A comma-separated list composes several calls into one chain |
 | `--shellcode-addr <hex>` | Where your shellcode will live (default: writable `.data`) |
-| `--shellcode-size <hex>` | `dwSize` for VirtualProtect (default `0x1000`) |
+| `--shellcode-size <hex>` | `dwSize` for VirtualProtect / length for `linux-mprotect` (default `0x1000`) |
+| `--prot <hex>` | Protection constant. `flNewProtect` for `windows-virtualprotect`, default `0x40` (`PAGE_EXECUTE_READWRITE`); `prot` for `linux-mprotect`, default `7` (`PROT_READ\|WRITE\|EXEC`). The default follows the target because the two constant spaces are unrelated |
+| `--chain-base <parity>` | What the Win64 alignment invariant may assume about the chain's first word: `return-address` (default — the chain overwrites a saved return address, so its base is 8 mod 16) or `aligned`. Echoed back in the chain's `assumptions` block so you can check it against your overflow |
+| `--chain-pivot <hex>` | Pivot `rsp` here before the chain body runs. The emitted chain is then two pieces: the leading `pivot_words` go at the overflow point, the rest go here. Spelled `--chain-pivot` because `--pivot` is the v0.4 gadget-query preset |
+| `--stage <hex>` | Shellcode bytes (e.g. `9090cc`) for `windows-virtualprotect` to **write** into the region at `--shellcode-addr` with write-what-where gadgets, instead of assuming it is already there |
+| `--syscall <n>` | Syscall number for `--chain linux-syscall`, and the syscall the `linux-srop` frame invokes (decimal, or hex with `0x`) |
+| `--syscall-args <reg=val,...>` | Argument registers for `linux-syscall` / `linux-srop`, e.g. `rdi=0x404000,rsi=0x1000,rdx=7` (hex values) |
 
 **Exit codes:** `0` success · `1` usage error (bad flags, unknown section, missing gadgets) · `2` malformed/unreadable binary.
 
@@ -618,19 +626,28 @@ Paste your padding into `p = b''` and you have a working exploit skeleton. Notes
 
 ### UC6 — Auto-generating a Windows VirtualProtect chain
 
-> **Experimental. The chain this produces is not known to execute.**
-> `--chain windows-virtualprotect` prints a warning to stderr for this
-> reason. No generated Windows chain has ever been run against a CPU or an
-> emulator — the "verify the layout in an emulator harness" exit criterion
-> for this feature has no artifact — and three concrete layout defects are
-> recorded in [`docs/AUDIT-FINDINGS.md`](docs/AUDIT-FINDINGS.md): the
-> stack-alignment pad is an inert data word that the preceding gadget's
-> `ret` lands on (`CHWIN-01`), `lpflOldProtect` defaults to the shellcode
-> address so `VirtualProtect` overwrites the first four bytes of the buffer
-> it just made RWX (`CHWIN-02`), and the IAT path uses the
-> `IMAGE_IMPORT_BY_NAME` record rather than the `FirstThunk` slot
-> (`CHWIN-03`). Read the output as a layout sketch to check by hand. Fixes
-> are scheduled for v0.5.
+> **Experimental — but no longer unverified.** As of v0.5 the emulator
+> harness exists ([`tests/emulate.py`](tests/emulate.py)), and every Windows
+> chain this section describes is generated by the real CLI and then
+> *executed* under unicorn before the feature is advertised: VirtualProtect
+> must be entered with the right `lpAddress`/`dwSize`/`flNewProtect`/
+> `lpflOldProtect`, and control must reach shellcode whose first four bytes
+> are still intact. The four layout defects the previous revision of this
+> box described are fixed, and each has a recorded failing-before and
+> passing-after run in
+> [`docs/chain-regressions.md`](docs/chain-regressions.md): the
+> stack-alignment pad is now the address of a real bare `ret` gadget rather
+> than an inert data word the preceding `ret` lands on (`CHWIN-01`),
+> `lpflOldProtect` is a distinct writable DWORD instead of aliasing the
+> shellcode (`CHWIN-02`), the IAT path reads the `FirstThunk` slot rather
+> than the `IMAGE_IMPORT_BY_NAME` record (`CHWIN-03`), and the argument
+> registers survive the IAT gadgets' extra pops (`CHWIN-07`).
+>
+> What the harness cannot check is still yours to check. The emulator is
+> not Windows: it does not enforce CFG/CET, it does not model the real
+> loader, and it takes `--api-addr` on trust. `--chain-base` is an
+> *assumption* about `rsp % 16` at the call, echoed back in the chain's
+> `assumptions` block precisely so you can check it against your overflow.
 
 Bypassing DEP on Windows by calling `VirtualProtect` on your shellcode:
 
@@ -679,7 +696,7 @@ Claude Desktop, is a directory you did not choose and cannot see.
 <!-- BEGIN GENERATED: mcp-surface -->
 <!-- Generated by `cargo test -p rf-mcp --test manual_schema`. Do not edit by hand: the test regenerates it from the server's own tools/list and outputSchema and fails if this block has drifted. -->
 
-**The 14 tools:**
+**The 15 tools:**
 
 | Tool | Required parameters | What it does |
 |---|---|---|
@@ -695,6 +712,7 @@ Claude Desktop, is a directory you did not choose and cannot see.
 | `get_mitigations` | `binary_path` | Report the binary's exploit mitigations, so an agent can decide whether ROP is even the right technique before it scans. |
 | `get_server_config` | (none) | Report the server's effective configuration: allow_roots (the only directories binary_path may name), max_depth, max_file_bytes, max_results, max_conc… |
 | `get_server_stats` | (none) | Report this session's counters: requests_total and requests_by_tool, ok/denied/timeout/cancelled/error totals, denied_consecutive and probing_suspecte… |
+| `plan_chain` | `binary_path`, `target` | Ask whether this binary can host a ROP chain for `target`, and if not, exactly why. |
 | `run_ropgadget_command` | `binary_path`, `args` | Run a ROPgadget-style scan with explicit flags. |
 | `search_gadgets_by_pattern` | `binary_path`, `pattern` | Search gadgets by pattern: regex matched against gadget text (e.g. |
 

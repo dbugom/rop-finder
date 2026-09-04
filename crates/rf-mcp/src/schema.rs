@@ -855,10 +855,203 @@ pub struct ChainIr {
     pub gadgets: Vec<ChainGadgetRef>,
 }
 
+/// What a Windows chain assumed about the world it will run in (CHWIN-04).
+///
+/// The alignment model used to be an unstated constant in the builder's
+/// source, and the out-parameter address was silently the shellcode's own
+/// (CHWIN-02). Both are decisions made *for* the caller, so both are
+/// reported back to it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChainAssumptions {
+    /// The API whose four-argument recipe was used: "VirtualProtect" or
+    /// "VirtualAlloc". They do not take the same four arguments.
+    pub api_name: String,
+    /// Where the chain's own first word is assumed to sit relative to a
+    /// 16-byte boundary: "return_address" (the default: the chain
+    /// overwrites a saved return address) or "aligned".
+    pub chain_base_parity: String,
+    /// The `chain base mod 16` that spelling implies (8 or 0).
+    pub chain_base_mod16: u64,
+    /// Where the chain believes the shellcode will be (hex).
+    pub shellcode_addr: String,
+    /// The writable DWORD the API writes its out-parameter through (hex).
+    /// `null` for VirtualAlloc, which has no out-parameter. Never equal to
+    /// `shellcode_addr` (CHWIN-02).
+    pub old_protect_addr: Option<String>,
+    /// CHWIN-08: where the chain BODY must be placed when `chain_pivot`
+    /// was requested (hex), and how many leading words go at the overflow
+    /// point instead. `null` / `0` when the chain is one contiguous piece.
+    pub pivot_addr: Option<String>,
+    pub pivot_words: u64,
+}
+
+// ---------------------------------------------------------------------------
+// plan_chain (ECO-04)
+// ---------------------------------------------------------------------------
+
+/// One gadget shape the synthesizer asked for, and how many gadgets in this
+/// scan answered it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlanStrategy {
+    /// Written in the `search_gadgets_by_pattern` vocabulary, so the caller
+    /// can re-run the query and look at the candidates itself.
+    pub pattern: String,
+    /// Gadgets the builder could actually USE for this strategy — clean
+    /// tail, modelled by the constraint layer. NOT a text-match count, so
+    /// `search_gadgets_by_pattern` may return more.
+    pub candidates: u64,
+    pub description: String,
+}
+
+/// A parameter change and whether it would satisfy an unmet requirement.
+/// `would_help` is MEASURED: the server re-scanned with that parameter and
+/// re-ran the same probe.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlanRelaxation {
+    pub param: String,
+    pub from: String,
+    pub to: String,
+    pub would_help: bool,
+}
+
+/// One thing the chain needs, and what was tried to get it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlanRequirement {
+    /// Stable and machine-friendly: `set_rdx`, `write_primitive`,
+    /// `api_transfer`, `syscall_trap`.
+    pub id: String,
+    pub description: String,
+    pub satisfied: bool,
+    pub strategies_tried: Vec<PlanStrategy>,
+    /// Empty for a satisfied requirement.
+    pub relaxations: Vec<PlanRelaxation>,
+}
+
+/// A requirement that IS met, and the gadget that meets it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlanSatisfied {
+    pub id: String,
+    /// The same stable id `find_gadgets` hands out; pass it to
+    /// `get_gadgets` to see the gadget in full. `null` when the
+    /// requirement is met by something that is not a gadget (a writable
+    /// section, an explicit `api_addr`).
+    pub gadget_id: Option<String>,
+    pub vaddr: String,
+    pub text: String,
+}
+
+/// What the plan took for granted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlanAssumptions {
+    /// Windows x64 only: "aligned" / "return_address". `null` elsewhere.
+    pub chain_base_parity: Option<String>,
+    /// The address the chain writes into, and the section it belongs to.
+    pub write_target: Option<String>,
+    /// Does this chain need a runtime address the tool cannot compute from
+    /// the file alone (an ASLR leak, a libc base, an `api_addr`)?
+    pub needs_leak: bool,
+}
+
+/// `plan_chain`'s answer. ALWAYS returned: infeasibility is a result, not
+/// an error, and `build_rop_chain` returns this same document in its error
+/// `details` when it has to refuse, so there is one contract (ECO-04).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlanResponse {
+    pub target: String,
+    pub arch: String,
+    pub format: String,
+    /// Ground truth: the real builder was run and it succeeded.
+    pub feasible: bool,
+    pub requirements: Vec<PlanRequirement>,
+    pub satisfied_requirements: Vec<PlanSatisfied>,
+    pub assumptions: PlanAssumptions,
+    /// The builder's structured refusal, when there was one.
+    pub error: Option<String>,
+    /// Words in the chain when `feasible`.
+    pub word_count: Option<u64>,
+    pub binary_sha256: String,
+    pub binary_label: String,
+    pub warnings: Vec<Warning>,
+}
+
+impl PlanResponse {
+    /// Convert rf-chain's plan, attaching the stable gadget ids.
+    pub fn from_plan(
+        plan: &rf_chain::ChainPlan,
+        binary_sha256: String,
+        binary_label: String,
+    ) -> Self {
+        PlanResponse {
+            target: plan.target.clone(),
+            arch: plan.arch.clone(),
+            format: plan.format.clone(),
+            feasible: plan.feasible,
+            requirements: plan
+                .requirements
+                .iter()
+                .map(|r| PlanRequirement {
+                    id: r.id.clone(),
+                    description: r.description.clone(),
+                    satisfied: r.satisfied,
+                    strategies_tried: r
+                        .strategies_tried
+                        .iter()
+                        .map(|s| PlanStrategy {
+                            pattern: s.pattern.clone(),
+                            candidates: s.candidates as u64,
+                            description: s.description.clone(),
+                        })
+                        .collect(),
+                    relaxations: r
+                        .relaxations
+                        .iter()
+                        .map(|x| PlanRelaxation {
+                            param: x.param.clone(),
+                            from: x.from.clone(),
+                            to: x.to.clone(),
+                            would_help: x.would_help,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            satisfied_requirements: plan
+                .satisfied_requirements
+                .iter()
+                .map(|s| PlanSatisfied {
+                    id: s.id.clone(),
+                    gadget_id: s.gadget_id.clone(),
+                    vaddr: format!("0x{:x}", s.vaddr),
+                    text: s.text.clone(),
+                })
+                .collect(),
+            assumptions: PlanAssumptions {
+                chain_base_parity: plan.assumptions.chain_base_parity.clone(),
+                write_target: plan.assumptions.write_target.clone(),
+                needs_leak: plan.assumptions.needs_leak,
+            },
+            error: plan.error.clone(),
+            word_count: plan.word_count.map(|w| w as u64),
+            binary_sha256,
+            binary_label,
+            warnings: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChainResponse {
     pub chain: ChainIr,
+    /// Windows-chain assumptions; `null` for a Linux chain, which makes
+    /// none of them.
+    pub assumptions: Option<ChainAssumptions>,
     /// The equivalent python exploit script.
     pub python: String,
     pub arch: String,
@@ -943,6 +1136,12 @@ pub fn info_output_schema() -> Arc<JsonObject> {
 #[must_use]
 pub fn chain_output_schema() -> Arc<JsonObject> {
     rmcp::handler::server::common::schema_for_output::<ChainResponse>()
+}
+
+/// `outputSchema` for `plan_chain` (ECO-04).
+#[must_use]
+pub fn plan_output_schema() -> Arc<JsonObject> {
+    rmcp::handler::server::common::schema_for_output::<PlanResponse>()
 }
 
 #[must_use]

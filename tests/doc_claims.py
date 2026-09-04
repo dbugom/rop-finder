@@ -18,11 +18,16 @@ Severity
           checks records a figure measured on a different platform.  ``--strict``
           promotes every warn to a fail.
 
-Why wall-clock speedup is a warn: README's table is explicitly labelled
-"macOS/Apple Silicon".  Re-measuring it on a shared CI runner tests the runner,
-not the tool.  What IS hard-gated is the *direction* the retraction asserts —
-the numbers written in the table must stay below PLAN's unmet 10x/4x criteria,
-so editing the table back to "12x" turns the gate red without any timing run.
+Why wall-clock speedup is a warn: re-measuring a ratio on a shared CI runner
+tests the runner, not the tool.  What IS hard-gated is the *direction* the
+documents assert.  Until v0.4 that direction was a retraction — the numbers in
+the table had to stay BELOW PLAN's unmet 10x/4x criteria, so editing the table
+back to "12x" turned the gate red.  v0.5 met both criteria, so `SPEEDUP-MET`
+now runs the other way: every figure in the table marked
+`<!-- speedup-table: current -->` must REACH its threshold, and a regression
+papered over by editing the table down fails without any timing run.  The
+v0.1.1 figures stay in both documents, outside that marker, as the record of
+the retraction.
 
 Usage
 -----
@@ -79,10 +84,29 @@ X86_FIXTURES = {
     "raw-x86.raw",
 }
 
-# Rows of README's speedup table, split by decode path, for the retraction
-# guard: PLAN asked for >=10x on x86/x64 and >=4x elsewhere and records both as
-# NOT MET, so no number in that table may reach its threshold.
+# PLAN's Phase-1 exit criteria: >=10x on the iced-x86 path, >=4x on the
+# capstone-backed architectures.
+#
+# v0.5 INVERTED THIS CHECK, and that is the whole point of the change. Until
+# v0.4 both criteria were NOT MET, so the guard was a RETRACTION guard: no
+# number in the documented table was allowed to REACH its threshold, because a
+# passing number would have contradicted PLAN's own disposition. Phase 6 met
+# both criteria on every architecture, PLAN and README now say so, and the
+# guard therefore has to run the other way: every documented figure must be AT
+# OR ABOVE its threshold, so that a performance regression which someone
+# "fixes" by editing the table back down fails here.
+#
+# The v0.1.1 figures are still in both documents and must NOT be checked
+# against this — they are the record of the retraction. Which table is which
+# is declared in the documents themselves with an HTML marker
+# (`<!-- speedup-table: current -->`), not inferred from the numbers, so that
+# a superseded table can never be silently promoted by editing a digit.
 SPEEDUP_LIMITS = {"x86": 10.0, "capstone": 4.0}
+
+#: The marker line that precedes the table under test in README.md and
+#: docs/measured-2026-09.md. Everything before the next `##` heading after it
+#: is the current table.
+CURRENT_TABLE_MARKER = "<!-- speedup-table: current -->"
 
 
 class Result:
@@ -292,48 +316,79 @@ def claim_bit_exact(docs, base, _args):
     )
 
 
-def claim_speedup_table_stays_retracted(docs, base, _args):
-    """No number in README's speedup table may reach PLAN's unmet thresholds.
+def _current_speedup_rows(docs, doc):
+    """(fixture, speedup) rows of the table marked `speedup-table: current`.
 
-    This is the retraction guard and it needs no timing run: PLAN records
-    ">=10x on x86/x64, >=4x on capstone arches" as NOT MET, so if someone edits
-    the table back to a passing number the two documents contradict each other
-    and this goes red.
+    Scoped to the marker so the v0.1.1 table both documents still carry — the
+    record of the retraction — is not read as a claim about this build.
     """
-    rows = []
+    text = docs.get(doc)
+    i = text.find(CURRENT_TABLE_MARKER)
+    if i < 0:
+        return None
+    rest = text[i + len(CURRENT_TABLE_MARKER):]
+    # Stop at the next heading of ANY level. docs/measured-2026-09.md puts the
+    # v0.4.0-vs-v0.5.0 engine control under a `###` immediately after the
+    # headline table, and one of its numeric columns is an ENGINE ratio
+    # (1.60x), not a ratio against the oracle -- reading it as one made this
+    # check demand that a 1.6x engine speedup be >= 10x.
+    m = re.search(r"^#{1,6} ", rest, re.M)
+    if m:
+        rest = rest[: m.start()]
+    return re.findall(
+        r"^\|\s*([A-Za-z0-9_.\-]+)\s*\|[^|]*\|[^|]*\|\s*\**([\d.]+)x\**\s*\|",
+        rest,
+        re.M,
+    )
+
+
+def claim_speedup_table_meets_the_criteria(docs, base, _args):
+    """Every documented speedup must REACH PLAN's thresholds.
+
+    The inverse of the v0.1.1-v0.4 retraction guard, and inverted deliberately
+    (see SPEEDUP_LIMITS). PLAN now records >=10x on x86/x64 and >=4x on the
+    capstone arches as MET, so a table row below its threshold means either a
+    performance regression or a document that has drifted from the code.
+    Needs no timing run: it is a consistency check between two documents.
+    """
+    rows, missing = [], []
     for doc in ("README.md", "docs/measured-2026-09.md"):
-        rows += re.findall(
-            r"^\|\s*([A-Za-z0-9_.\-]+)\s*\|[^|]*\|[^|]*\|\s*\**([\d.]+)x\**\s*\|",
-            docs.get(doc),
-            re.M,
-        )
-    if not rows:
-        return Result(
-            "SPEEDUP-RETRACTED", "fail", "README.md",
-            "README carries a per-fixture speedup table", False, "a table", "none parsed",
-        )
-    bad = []
+        found = _current_speedup_rows(docs, doc)
+        if found is None:
+            missing.append(f"{doc} has no {CURRENT_TABLE_MARKER}")
+        elif not found:
+            missing.append(f"{doc}'s current speedup table has no rows")
+        else:
+            rows += found
+    bad = list(missing)
     for fixture, value in rows:
         limit = SPEEDUP_LIMITS["x86" if fixture in X86_FIXTURES else "capstone"]
-        if float(value) >= limit:
-            bad.append(f"{fixture} {value}x >= {limit}x")
+        if float(value) < limit:
+            bad.append(f"{fixture} {value}x < {limit}x")
     return Result(
-        "SPEEDUP-RETRACTED",
+        "SPEEDUP-MET",
         "fail",
-        "README.md + PLAN.md",
-        "every documented speedup stays below the 10x/4x criteria PLAN records as NOT MET",
+        "README.md + docs/measured-2026-09.md + PLAN.md",
+        "every documented speedup reaches the 10x/4x criteria PLAN records as MET",
         not bad,
-        "x86/x64 < 10.0x, capstone arches < 4.0x",
-        ", ".join(f"{f}={v}x" for f, v in rows),
+        "x86/x64 >= 10.0x, capstone arches >= 4.0x",
+        ", ".join(f"{f}={v}x" for f, v in rows) or "none parsed",
         "; ".join(bad),
     )
 
 
 def claim_retraction_markers(docs, base, _args):
-    """The sentences that record the v0.1.1 retractions must still be there."""
+    """The sentences that record the v0.1.1 retractions must still be there.
+
+    v0.5 met the performance criterion, so the two speed markers changed
+    TENSE, not presence. They are still checked, because the point of a
+    retraction record is that it survives the good news: a reader has to be
+    able to see that this project once claimed a speedup it could not
+    support, and what the measurement actually was when it was withdrawn.
+    """
     required = [
-        ("PLAN.md", r"NOT MET", "PLAN records the >=10x/>=4x criterion as unmet"),
-        ("README.md", r"neither is met", "README records the perf criterion as unmet"),
+        ("PLAN.md", r"NOT MET", "PLAN still records what the >=10x/>=4x criterion measured when it was unmet"),
+        ("README.md", r"neither was met", "README still records that the perf criterion was unmet at v0.1.1"),
         (
             "MANUAL.md",
             r"No comparison against\s*\n?\s*`ropper`",
@@ -523,16 +578,22 @@ def claim_live_speedup(docs, base, args):
         ours = best([binary, "--binary", fx, "--depth", "10"])
         ref = best(rf_paths.oracle_cmd(fx, dump=False, depth=10))
         rows.append((name, kind, ref / ours))
-    bad = [f"{n} {s:.1f}x >= {SPEEDUP_LIMITS[k]}x" for n, k, s in rows if s >= SPEEDUP_LIMITS[k]]
+    # v0.5: inverted with SPEEDUP-MET. A run BELOW the criterion is now the
+    # interesting event. Kept at `warn` severity rather than `fail` because
+    # this is raw wall clock on whatever machine the gate runs on, and a
+    # loaded CI box is not a regression; SPEEDUP-MET is the fail-severity
+    # half, and it compares the two documents against each other where no
+    # machine can move the answer.
+    bad = [f"{n} {s:.1f}x < {SPEEDUP_LIMITS[k]}x" for n, k, s in rows if s < SPEEDUP_LIMITS[k]]
     return Result(
         "LIVE-SPEEDUP",
         "warn",
         "README.md speedup table",
-        "measured speedup on THIS machine still falls short of PLAN's 10x/4x criteria",
+        "measured speedup on THIS machine reaches PLAN's 10x/4x criteria",
         not bad,
-        "x86/x64 < 10.0x, capstone arches < 4.0x",
+        "x86/x64 >= 10.0x, capstone arches >= 4.0x",
         ", ".join(f"{n}={s:.1f}x" for n, _, s in rows),
-        "; ".join(bad) or "wall-clock, machine dependent - README's table is macOS",
+        "; ".join(bad) or "wall-clock, machine dependent - a loaded host can dip below",
     )
 
 
@@ -541,7 +602,7 @@ CLAIMS = [
     claim_parity_percentage,
     claim_reference_total,
     claim_bit_exact,
-    claim_speedup_table_stays_retracted,
+    claim_speedup_table_meets_the_criteria,
     claim_retraction_markers,
     claim_no_ropper_speedup,
     claim_flag_coverage,

@@ -244,10 +244,24 @@ def run_loop(mcp, binary):
     check(ir["words"], "the chain has no words")
     check(chain["python"], "the chain has no script")
     # The step-1 answer has to be the address the chain actually uses.
+    #
+    # `data_addr` is the IR's "rendered as a pack() word" kind, and since
+    # CHLX-02 it carries two different sorts of value: section locations,
+    # whose comment names the section (`@ .data`, `@ .data + 8`), and plain
+    # numeric stack arguments — the NULL argv terminator, the execve syscall
+    # number — whose comment does not.  Only the first sort is an address, so
+    # only the first sort can be inside a section.  Asserting the invariant
+    # over the second sort is what made this harness demand that 0x3b live in
+    # .data.  See crates/rf-chain/src/lib.rs's `WordKind::DataAddr` doc, which
+    # has said "and on Windows also numeric stack arguments" since v0.1.
     sec = found["argv_section"]
     lo = argv_addr
     hi = argv_addr + int(sec["size"], 16) if isinstance(sec["size"], str) else argv_addr + sec["size"]
-    data_words = [int(w["value"], 16) for w in ir["words"] if w["kind"] == "data_addr"]
+    data_words = [
+        int(w["value"], 16)
+        for w in ir["words"]
+        if w["kind"] == "data_addr" and w.get("comment", "").startswith("@ ")
+    ]
     check(data_words, "the chain writes no data address")
     check(
         all(lo <= a < hi for a in data_words),

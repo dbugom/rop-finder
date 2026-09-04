@@ -9,6 +9,14 @@ publish = false
 # This crate exists only to host benches. An empty lib keeps `cargo check -p
 # rf-bench` meaningful and gives the bench targets something to link against.
 
+[features]
+# PERF-10 exit criterion. Swaps a counting `GlobalAlloc` into `bin/probe.rs`
+# so `probe alloc` can report allocations-per-gadget around `post_process`.
+# Off by default: the counters are two relaxed atomics on every allocation in
+# the process, which is exactly the kind of thing that must not be in a
+# timing run.
+alloc-count = []
+
 [dependencies]
 rf-core = { path = "../rf-core" }
 rf-scan = { path = "../rf-scan" }
@@ -23,6 +31,13 @@ harness = false
 
 [[bench]]
 name = "dedup"
+harness = false
+
+# PERF-03/04/09: the scan phase alone, serial and parallel, so a decode
+# regression cannot hide behind post_process in an end-to-end mean and the
+# parallel-scaling ratio is recorded per commit.
+[[bench]]
+name = "decode_phase"
 harness = false
 
 [[bench]]

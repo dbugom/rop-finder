@@ -28,6 +28,17 @@ pub trait GadgetSink {
     fn remaining(&self) -> Option<usize> {
         None
     }
+
+    /// Hint that `additional` gadgets are about to be accepted.
+    ///
+    /// The scan knows the exact count before it hands anything over — the
+    /// work items have already finished — and on the MIPS fixture that is
+    /// 324,286 gadgets arriving one `push` at a time, whose `Vec` regrowth
+    /// was 18 ms of the parallel run's tail, all of it serial. Defaulted to
+    /// a no-op so a streaming sink (rf-cli's JSONL writer) is unaffected.
+    fn reserve(&mut self, additional: usize) {
+        let _ = additional;
+    }
 }
 
 /// Estimated heap footprint of one gadget: the struct itself plus the byte
@@ -65,6 +76,9 @@ impl GadgetSink for VecSink {
     fn accepted(&self) -> usize {
         self.gadgets.len()
     }
+    fn reserve(&mut self, additional: usize) {
+        self.gadgets.reserve(additional);
+    }
 }
 
 /// Bounded collector: stops the scan with [`Error::Budget`] once
@@ -95,6 +109,11 @@ impl BoundedSink {
     }
 }
 
+/// Note what is deliberately NOT implemented here: [`GadgetSink::reserve`].
+/// The scan offers the size of the whole RAW candidate stream, and a bounded
+/// sink exists precisely because the caller cannot afford that — pre-sizing
+/// to it would blow the budget in the one allocation the budget is meant to
+/// prevent.
 impl GadgetSink for BoundedSink {
     fn accept(&mut self, g: Gadget) -> Result<(), Error> {
         if let Some(limit) = self.max_gadgets {

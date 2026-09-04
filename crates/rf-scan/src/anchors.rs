@@ -918,6 +918,77 @@ pub fn find_matches(code: &[u8], anchor: &Anchor) -> Vec<usize> {
     }
 }
 
+/// Every position in `lo..hi` where `anchor` matches — **including
+/// overlapping ones**, unlike [`find_matches`].
+///
+/// PERF-04 needs the hit list of one (region, anchor) pair to be computable
+/// in pieces, because on the MIPS fixture a single anchor holds 92% of the
+/// hits and finding them is 27 ms that no amount of anchor-level parallelism
+/// can split. Python's `re.finditer` is stateful — after a match it resumes
+/// at `match_end` — so a sub-range cannot reproduce its output on its own:
+/// a range starting inside a match the previous range consumed would emit a
+/// hit the whole-buffer scan never had.
+///
+/// The state is recovered exactly by separating the two halves of what
+/// `finditer` does. This function does the stateless half (every position
+/// that matches); [`merge_finditer`] does the stateful half in one cheap
+/// serial pass, and leftmost-greedy selection over all matching positions is
+/// precisely `finditer`. `find_matches_agrees_with_chunked_scan` asserts the
+/// identity over every anchor table in the project.
+pub fn find_matches_in(code: &[u8], anchor: &Anchor, lo: usize, hi: usize) -> Vec<usize> {
+    let len = anchor.pattern.len();
+    let mut hits = Vec::new();
+    if len == 0 || code.len() < len {
+        return hits;
+    }
+    let last = code.len() - len; // last position a full match can start at
+    let hi = hi.min(last + 1);
+    let mut pos = lo;
+    let fixed_head = match anchor.pattern.first() {
+        Some(BytePat::Fixed(b)) => Some(*b),
+        _ => None,
+    };
+    while pos < hi {
+        let p = match fixed_head {
+            Some(first) => match memchr::memchr(first, &code[pos..hi]) {
+                Some(o) => pos + o,
+                None => break,
+            },
+            None => pos,
+        };
+        // memchr has already established `pattern[0]` when the head is
+        // fixed; when it is a wildcard or a class, nothing has, so the
+        // whole pattern is tested (this is the bug the chunked-vs-whole
+        // property test caught: skipping byte 0 on a wildcard head admits
+        // matches `find_matches` never had).
+        let from = usize::from(fixed_head.is_some());
+        if anchor.pattern[from..]
+            .iter()
+            .enumerate()
+            .all(|(i, bp)| bp.matches(code[p + from + i]))
+        {
+            hits.push(p);
+        }
+        pos = p + 1;
+    }
+    hits
+}
+
+/// Leftmost-greedy selection over ascending, possibly overlapping match
+/// positions — the stateful half of `re.finditer` (`pos = match_end`).
+pub fn merge_finditer(all: &[usize], anchor: &Anchor) -> Vec<usize> {
+    let len = anchor.pattern.len();
+    let mut out = Vec::with_capacity(all.len());
+    let mut next = 0usize;
+    for &p in all {
+        if p >= next {
+            out.push(p);
+            next = p + len;
+        }
+    }
+    out
+}
+
 fn find_matches_fixed_head(code: &[u8], anchor: &Anchor, first: u8) -> Vec<usize> {
     let len = anchor.pattern.len();
     let mut hits = Vec::new();
@@ -984,6 +1055,71 @@ mod tests {
         let anchors = rop_anchors();
         let code = [0x00, 0xc3, 0xc3, 0x00];
         assert_eq!(find_matches(&code, &anchors[0]), vec![1, 2]);
+    }
+
+    /// PERF-04's parallel anchor search is only sound if cutting the byte
+    /// range and re-applying `re.finditer`'s leftmost-greedy rule reproduces
+    /// the single-sweep hit list EXACTLY — a hit that appears or disappears
+    /// changes the gadget set, and near a chunk boundary is precisely where
+    /// `pos = match_end` state would be lost.
+    ///
+    /// This ran red before `find_matches_in` tested `pattern[0]` on a
+    /// wildcard-headed anchor: `elf-ARMv7-ls` went from 3,782 raw gadgets to
+    /// 4,779.
+    #[test]
+    fn find_matches_agrees_with_chunked_scan() {
+        // A deterministic pseudo-random buffer: dense enough in every byte
+        // value that the ARM/MIPS/PPC/SPARC/RISC-V class-headed anchors and
+        // the x86 fixed-headed ones all hit, many of them overlapping.
+        let mut code = vec![0u8; 8192];
+        let mut x: u32 = 0x1234_5678;
+        for b in code.iter_mut() {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *b = (x >> 16) as u8;
+        }
+        let mut tables: Vec<Anchor> = Vec::new();
+        tables.extend(rop_anchors());
+        tables.extend(jop_anchors(true));
+        tables.extend(sys_anchors());
+        for arch in [
+            Arch::Arm,
+            Arch::ArmThumb,
+            Arch::Arm64,
+            Arch::Mips32,
+            Arch::Mips64,
+            Arch::Ppc32,
+            Arch::Ppc64,
+            Arch::Sparc,
+            Arch::RiscV32,
+            Arch::RiscV64,
+        ] {
+            for endian in [Endianness::Little, Endianness::Big] {
+                for thumb in [false, true] {
+                    for kind in [TableKind::Rop, TableKind::Jop, TableKind::Sys] {
+                        tables.extend(table(kind, arch, endian, thumb));
+                    }
+                }
+            }
+        }
+        // Chunk sizes chosen to land boundaries inside multi-byte patterns.
+        for &step in &[1usize, 2, 3, 5, 7, 64, 1000] {
+            for anchor in &tables {
+                let whole = find_matches(&code, anchor);
+                let mut all = Vec::new();
+                let mut lo = 0usize;
+                while lo < code.len() {
+                    let hi = (lo + step).min(code.len());
+                    all.extend(find_matches_in(&code, anchor, lo, hi));
+                    lo = hi;
+                }
+                assert_eq!(
+                    whole,
+                    merge_finditer(&all, anchor),
+                    "anchor {:?} at chunk step {step}",
+                    anchor.name
+                );
+            }
+        }
     }
 
     #[test]

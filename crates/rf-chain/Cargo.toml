@@ -8,6 +8,12 @@ license.workspace = true
 [dependencies]
 rf-core = { path = "../rf-core" }
 rf-scan = { path = "../rf-scan" }
+# CHLX-01: the Linux fallback strategies (register transfers, non-leading
+# `pop`, displaced write-what-where, `repz ret` as a bare return) are driven
+# by v0.4's constraint query layer — `sets`/`clobbers`/`stack_delta`/
+# `transfers`/`terminator`, verified against a Unicorn ground truth — rather
+# than by re-matching disassembly text inside the builder.
+rf-classify = { path = "../rf-classify" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

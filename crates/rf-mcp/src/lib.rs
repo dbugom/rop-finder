@@ -883,11 +883,37 @@ pub struct ChainQuery {
     /// windows-virtualprotect: runtime address of the API (hex). Primary
     /// resolution path; without it the PE must import the API (IAT).
     pub api_addr: Option<String>,
+    /// windows-virtualprotect: which API to call — "VirtualProtect"
+    /// (default) or "VirtualAlloc". Picks the IAT import to resolve and
+    /// the argument recipe; the two do not take the same four arguments.
+    pub api_name: Option<String>,
     /// windows-virtualprotect: runtime shellcode address (hex; default:
     /// the binary's writable .data section).
     pub shellcode_addr: Option<String>,
     /// windows-virtualprotect: dwSize argument (hex; default 0x1000).
     pub shellcode_size: Option<String>,
+    /// windows-virtualprotect (x64): what the alignment invariant may
+    /// assume about the chain's first word — "return_address" (default)
+    /// or "aligned". Echoed back in `assumptions`.
+    pub chain_base: Option<String>,
+    /// flNewProtect / flProtect (hex; default 0x40 =
+    /// PAGE_EXECUTE_READWRITE) for windows-virtualprotect, or
+    /// linux-mprotect's `prot` (default 7 = PROT_READ|WRITE|EXEC).
+    pub prot: Option<String>,
+    /// linux-syscall: the syscall number to invoke, and the syscall the
+    /// linux-srop frame carries. Decimal, or hex with an explicit "0x".
+    pub syscall: Option<String>,
+    /// linux-syscall / linux-srop: argument registers, e.g.
+    /// "rdi=0x404000,rsi=0x1000,rdx=7" (values are hex).
+    pub syscall_args: Option<String>,
+    /// CHWIN-08: pivot the stack pointer here before the chain body runs
+    /// (hex). The chain is then in two pieces — `assumptions.pivot_words`
+    /// leading words go at the overflow point, the rest at this address.
+    pub chain_pivot: Option<String>,
+    /// CHWIN-08: shellcode bytes (hex, e.g. "9090cc") to WRITE into the
+    /// region at shellcode_addr with write-what-where gadgets instead of
+    /// assuming they are already there.
+    pub stage: Option<String>,
     /// Architecture slice for a fat (Universal) Mach-O, e.g. "x86_64",
     /// "arm64", "i386". REQUIRED for a multi-slice container: without it
     /// the scan is refused rather than concatenating slices whose virtual
@@ -2145,12 +2171,13 @@ impl RopFinderMcp {
         rec: &mut AuditRecord,
         q: ChainQuery,
     ) -> Result<ChainResponse, ToolError> {
-        if !matches!(q.target.as_str(), "linux-execve" | "windows-virtualprotect") {
+        if !rf_cli::chain_targets().contains(&q.target.as_str()) {
             return Err(ToolError::new(
                 ErrorCode::UsageError,
                 format!(
-                    "unknown chain target {:?}; supported: linux-execve, windows-virtualprotect",
-                    q.target
+                    "unknown chain target {:?}; supported: {}",
+                    q.target,
+                    rf_cli::chain_targets().join(", ")
                 ),
             ));
         }
@@ -2161,36 +2188,17 @@ impl RopFinderMcp {
         let label = confined.label.clone();
         let timeout = clamp_timeout(q.timeout_secs, self.config.timeout);
         let max_file_bytes = self.config.max_file_bytes;
-        let req = rf_cli::ScanRequest {
-            depth,
-            rop: true,
-            jop: true,
-            sys: true,
-            multibr: false,
-            only: None,
-            filter: None,
-            range: None,
-            badbytes: q.badbytes.clone(),
-            offset: q.offset.clone(),
-            base: q.base.clone(),
-            section: Vec::new(),
-            thumb: false,
-            cfg_aware: q.cfg_aware.unwrap_or(false),
-            align: None,
-            call_preceded: false,
-            all: false,
-            noinstr: false,
-            arch: q.arch.clone(),
-            max_gadgets: self.config.max_gadgets,
-            max_memory: None,
-            compat: false,
-        };
-        let spec = rf_cli::ChainSpec {
-            target: q.target.clone(),
-            api_addr: q.api_addr.clone(),
-            shellcode_addr: q.shellcode_addr.clone(),
-            shellcode_size: q.shellcode_size.clone(),
-        };
+        let req = chain_scan_request(&q, depth, self.config.max_gadgets);
+        let spec = chain_spec(&q);
+        // ECO-02: the target's parameters are validated by the SAME
+        // functions the CLI uses, before the scan, so an unknown api_name /
+        // chain_base / syscall_args value is a usage error on both surfaces
+        // with the same accepted set (tests/capability_matrix.py gates it).
+        if spec.target == "windows-virtualprotect" {
+            rf_cli::win_opts(&spec).map_err(scan_err_to_tool)?;
+        } else {
+            rf_cli::linux_opts(&spec).map_err(scan_err_to_tool)?;
+        }
 
         // NOTE (MCP-03, residual): `rf_cli::chain_bytes` runs its own scan
         // and has no token seam, so a chain build is bounded by the
@@ -2224,6 +2232,79 @@ impl RopFinderMcp {
                 Ok((out, facts))
             };
 
+        match self
+            .guard
+            .run(Some(Self::cancel_signal(ctx)), timeout, work)
+            .await
+        {
+            Ok((v, facts)) => {
+                facts.apply(rec);
+                self.stats.add_bytes_read(facts.bytes_read);
+                Ok(v)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `ECO-04`: the feasibility report. Never fails for a reason the
+    /// binary is responsible for — an infeasible chain is a `feasible:
+    /// false` document with the requirement that failed, what was tried,
+    /// and which parameter changes the server MEASURED would help.
+    async fn run_plan(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        rec: &mut AuditRecord,
+        q: ChainQuery,
+    ) -> Result<schema::PlanResponse, ToolError> {
+        if !rf_cli::chain_targets().contains(&q.target.as_str()) {
+            return Err(ToolError::new(
+                ErrorCode::UsageError,
+                format!(
+                    "unknown chain target {:?}; supported: {}",
+                    q.target,
+                    rf_cli::chain_targets().join(", ")
+                ),
+            ));
+        }
+        let depth = self.check_depth(q.depth)?;
+        rec.binary = Some(q.binary_path.clone());
+        let confined = self.open_confined(&q.binary_path)?;
+        rec.binary = Some(confined.label.clone());
+        let label = confined.label.clone();
+        let timeout = clamp_timeout(q.timeout_secs, self.config.timeout);
+        let max_file_bytes = self.config.max_file_bytes;
+        let req = chain_scan_request(&q, depth, self.config.max_gadgets);
+        let spec = chain_spec(&q);
+        if spec.target == "windows-virtualprotect" {
+            rf_cli::win_opts(&spec).map_err(scan_err_to_tool)?;
+        } else {
+            rf_cli::linux_opts(&spec).map_err(scan_err_to_tool)?;
+        }
+        let binary_label = label.clone();
+        let offset_hex = q.offset.clone();
+        let work = move |_cancel: rf_scan::CancelToken| -> Result<
+            (schema::PlanResponse, ScanFacts),
+            ToolError,
+        > {
+            let bytes = confined.read_all(max_file_bytes)?;
+            let file_hash = sha256_hex(&bytes);
+            let offset = match &offset_hex {
+                Some(o) => rf_cli::parse_hex(o, "--offset")
+                    .map_err(|e| ToolError::new(ErrorCode::UsageError, e))?,
+                None => 0,
+            };
+            let outcome =
+                rf_cli::plan_chain_bytes(&bytes, None, &req, &spec).map_err(scan_err_to_tool)?;
+            let out = plan_response(&outcome, file_hash.clone(), binary_label, offset);
+            let facts = ScanFacts {
+                sha256: file_hash,
+                bytes_read: bytes.len() as u64,
+                cache: "bypass",
+                total_count: out.requirements.len() as u64,
+                returned: out.satisfied_requirements.len() as u64,
+            };
+            Ok((out, facts))
+        };
         match self
             .guard
             .run(Some(Self::cancel_signal(ctx)), timeout, work)
@@ -2306,6 +2387,106 @@ fn truncate_info(
     warnings
 }
 
+/// `ChainQuery` is `Deserialize` but not `Clone` (it is a wire type, and
+/// deriving `Clone` on it would put a second copy of every future field in
+/// the schema's derive chain). `build_rop_chain` needs one extra copy to
+/// re-probe with, so the copy is spelled out here where a new field makes
+/// it a compile error rather than a silently dropped parameter.
+fn clone_query(q: &ChainQuery) -> ChainQuery {
+    ChainQuery {
+        binary_path: q.binary_path.clone(),
+        target: q.target.clone(),
+        depth: q.depth,
+        base: q.base.clone(),
+        offset: q.offset.clone(),
+        badbytes: q.badbytes.clone(),
+        cfg_aware: q.cfg_aware,
+        api_addr: q.api_addr.clone(),
+        api_name: q.api_name.clone(),
+        shellcode_addr: q.shellcode_addr.clone(),
+        shellcode_size: q.shellcode_size.clone(),
+        chain_base: q.chain_base.clone(),
+        prot: q.prot.clone(),
+        syscall: q.syscall.clone(),
+        syscall_args: q.syscall_args.clone(),
+        chain_pivot: q.chain_pivot.clone(),
+        stage: q.stage.clone(),
+        arch: q.arch.clone(),
+        timeout_secs: q.timeout_secs,
+    }
+}
+
+/// The `ScanRequest` a chain build / plan runs its scan with. One place,
+/// so `build_rop_chain` and `plan_chain` cannot answer about two different
+/// gadget universes.
+fn chain_scan_request(
+    q: &ChainQuery,
+    depth: usize,
+    max_gadgets: Option<usize>,
+) -> rf_cli::ScanRequest {
+    rf_cli::ScanRequest {
+        depth,
+        rop: true,
+        jop: true,
+        sys: true,
+        multibr: false,
+        only: None,
+        filter: None,
+        range: None,
+        badbytes: q.badbytes.clone(),
+        offset: q.offset.clone(),
+        base: q.base.clone(),
+        section: Vec::new(),
+        thumb: false,
+        cfg_aware: q.cfg_aware.unwrap_or(false),
+        align: None,
+        call_preceded: false,
+        all: false,
+        noinstr: false,
+        arch: q.arch.clone(),
+        max_gadgets,
+        max_memory: None,
+        compat: false,
+    }
+}
+
+/// The `ChainSpec` for a query. Shared by `build_rop_chain` and
+/// `plan_chain`, and identical field for field to what the CLI builds from
+/// its flags (ECO-02).
+fn chain_spec(q: &ChainQuery) -> rf_cli::ChainSpec {
+    rf_cli::ChainSpec {
+        target: q.target.clone(),
+        api_addr: q.api_addr.clone(),
+        api_name: q.api_name.clone(),
+        shellcode_addr: q.shellcode_addr.clone(),
+        shellcode_size: q.shellcode_size.clone(),
+        chain_base: q.chain_base.clone(),
+        prot: q.prot.clone(),
+        syscall: q.syscall.clone(),
+        syscall_args: q.syscall_args.clone(),
+        pivot: q.chain_pivot.clone(),
+        stage: q.stage.clone(),
+    }
+}
+
+/// `ECO-04`: the plan, with every satisfying gadget carrying the same
+/// stable id `find_gadgets` handed out — so `get_gadgets` resolves it.
+fn plan_response(
+    outcome: &rf_cli::ChainPlanOutcome,
+    binary_sha256: String,
+    binary_label: String,
+    offset: u64,
+) -> schema::PlanResponse {
+    let mut plan = outcome.plan.clone();
+    let sha = binary_sha256.clone();
+    plan.attach_gadget_ids(|vaddr| {
+        outcome
+            .gadget_bytes(vaddr)
+            .map(|b| schema::gadget_id(&sha, vaddr.wrapping_sub(offset), b))
+    });
+    schema::PlanResponse::from_plan(&plan, binary_sha256, binary_label)
+}
+
 /// Build the chain response, giving every referenced gadget the same stable
 /// id `find_gadgets` would.
 ///
@@ -2357,6 +2538,18 @@ fn chain_response(
         })
         .collect();
     ChainResponse {
+        assumptions: outcome
+            .assumptions
+            .as_ref()
+            .map(|a| schema::ChainAssumptions {
+                api_name: a.api_name.clone(),
+                pivot_addr: a.pivot_addr.map(|v| format!("0x{v:x}")),
+                pivot_words: a.pivot_words as u64,
+                chain_base_parity: a.chain_base_parity.to_string(),
+                chain_base_mod16: a.chain_base_mod16,
+                shellcode_addr: format!("0x{:x}", a.shellcode_addr),
+                old_protect_addr: a.old_protect_addr.map(|v| format!("0x{v:x}")),
+            }),
         chain: schema::ChainIr {
             arch: chain.arch.clone(),
             description: chain.description.clone(),
@@ -2907,7 +3100,14 @@ impl RopFinderMcp {
     #[tool(
         description = "Build a ROP chain. target must be \"linux-execve\" (ELF x86/x64 only, \
         ported from ROPgadget's ropmaker: x86 int 0x80 / x64 syscall, \"/bin//sh\" written \
-        to a writable section) or \"windows-virtualprotect\". Returns the chain IR as JSON \
+        to a writable section), \"linux-mprotect\" (the NX answer: page-aligns the region \
+        and calls mprotect), \"linux-syscall\" (any syscall -- pass `syscall` and \
+        `syscall_args`), \"linux-ret2libc\" (calls `api_addr` with \"/bin//sh\": SysV arg1 \
+        in rdi on x64, cdecl stack argument on x86), \"linux-srop\" (x86-64: rt_sigreturn \
+        plus a sigcontext frame, so only `pop rax` and a trap are needed) or \
+        \"windows-virtualprotect\". Every one of those has been EXECUTED under the emulator \
+        harness on a shipped fixture; call plan_chain first to find out whether THIS binary \
+        can host the one you want. Returns the chain IR as JSON \
         (words with kinds gadget_addr / immediate / data_addr / code_addr / padding plus the \
         referenced gadget table, each entry carrying the same stable id find_gadgets \
         returns), the equivalent python exploit script, arch, description and word_count. A \
@@ -2921,7 +3121,54 @@ impl RopFinderMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let (mut rec, t0) = self.begin(&ctx, "build_rop_chain", params_hash(&q));
-        let out = self.run_chain(&ctx, &mut rec, q).await;
+        let probe = ChainQuery { ..clone_query(&q) };
+        let out = match self.run_chain(&ctx, &mut rec, q).await {
+            Ok(v) => Ok(v),
+            // ECO-04: one contract. A refusal carries the SAME document
+            // plan_chain returns, in `details.plan`, so a caller never has
+            // to parse a prose sentence to find out which requirement
+            // failed or what would fix it. The message is unchanged.
+            Err(e) if matches!(e.code, ErrorCode::NotFound | ErrorCode::UsageError) => {
+                let mut probe_rec = rec.clone();
+                let detail = self.run_plan(&ctx, &mut probe_rec, probe).await.ok();
+                Err(match detail {
+                    Some(plan) => {
+                        // MERGE, never replace: `details.what` /
+                        // `details.limit` are part of the CRIT-03 error
+                        // contract and other callers branch on them.
+                        let mut d = match e.details.clone() {
+                            Some(Value::Object(m)) => m,
+                            _ => serde_json::Map::new(),
+                        };
+                        d.insert(
+                            "plan".to_string(),
+                            serde_json::to_value(&plan).unwrap_or(Value::Null),
+                        );
+                        ToolError {
+                            details: Some(Value::Object(d)),
+                            ..e
+                        }
+                    }
+                    None => e,
+                })
+            }
+            Err(e) => Err(e),
+        };
+        self.finish(rec, t0, out).await
+    }
+
+    /// ECO-04: feasibility, not a chain.
+    #[tool(
+        description = "Ask whether this binary can host a ROP chain for `target`, and if not,         exactly why. ALWAYS succeeds: infeasibility is a result. Returns {feasible,         requirements[{id, description, satisfied, strategies_tried[{pattern, candidates}],         relaxations[{param, from, to, would_help}]}], satisfied_requirements[{id, gadget_id,         vaddr}], assumptions{chain_base_parity, write_target, needs_leak}}. Requirement ids         are stable (set_rdx, write_primitive, api_transfer, syscall_trap, stack_align).         `candidates` counts the gadgets the builder could actually USE for that strategy         (clean-tailed, and modelled by the constraint layer), so 0 means the strategy had         nothing to work with, while a non-zero count with satisfied:false means something         else rejected them. `would_help` is         MEASURED, not guessed: the server re-scans at double depth and with multibr and         re-runs the same probe. Every gadget_id resolves through get_gadgets.         build_rop_chain returns this same document in its error details when it refuses.",
+        output_schema = crate::schema::plan_output_schema()
+    )]
+    async fn plan_chain(
+        &self,
+        Parameters(q): Parameters<ChainQuery>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let (mut rec, t0) = self.begin(&ctx, "plan_chain", params_hash(&q));
+        let out = self.run_plan(&ctx, &mut rec, q).await;
         self.finish(rec, t0, out).await
     }
 

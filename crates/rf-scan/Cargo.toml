@@ -1,6 +1,6 @@
 [package]
 name = "rf-scan"
-description = "Gadget scanning engine: anchor tables, per-start decode cache, filters, dedup"
+description = "Gadget scanning engine: anchor tables, resumable region decode, trie-indexed dedup, filters"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -36,3 +36,10 @@ rayon = "1.10"
 # table because the root Cargo.toml is owned elsewhere this release; promote
 # it to `regex.workspace = true` when rf-cli/rf-mcp need the same crate.
 regex.workspace = true
+
+[dev-dependencies]
+# PERF-04: `tests/engine_invariants.rs` builds rayon pools of several widths
+# to prove that how the work list is partitioned cannot change the listing.
+# An integration test is its own crate, so the library's own rayon is not in
+# scope for it.
+rayon = "1.10"

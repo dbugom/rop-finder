@@ -52,10 +52,12 @@ async fn mcp_stdio_end_to_end() {
         "find_string",
         "find_bytes",
         "get_mitigations",
+        // v0.5: ECO-04's feasibility report.
+        "plan_chain",
     ] {
         assert!(names.contains(&want), "missing tool {want}: {names:?}");
     }
-    assert_eq!(tools.len(), 14, "unexpected extra tools: {names:?}");
+    assert_eq!(tools.len(), 15, "unexpected extra tools: {names:?}");
     for t in tools {
         assert!(t["description"].is_string());
         assert_eq!(t["inputSchema"]["type"], "object");
@@ -292,22 +294,30 @@ async fn mcp_stdio_end_to_end() {
         );
     }
 
-    // bash lacks the write-what-where gadget → structured not_found
-    // (CRIT-03 collapsed `chain_error` into the closed set; the message
-    // still says which gadget was missing, and details.what is
-    // "chain_gadget")
+    // A gadget the recipe needs and the scan does not hold → structured
+    // not_found (CRIT-03 collapsed `chain_error` into the closed set; the
+    // message still names the missing gadget, and details.what is
+    // "chain_gadget").
+    //
+    // depth 2 is deliberate: this used to run at the default depth against
+    // bash, but CHLX-01's fallback strategies now build a chain there, and
+    // a shortage test pinned to a fixture that has since grown a route is
+    // asserting about the fixture rather than about the error shape.
     let resp = mcp
         .call_tool(
             13,
             "build_rop_chain",
-            json!({"binary_path": elf, "target": "linux-execve"}),
+            json!({"binary_path": elf, "target": "linux-execve", "depth": 2}),
         )
         .await;
-    assert_eq!(resp["result"]["isError"], true);
+    assert_eq!(resp["result"]["isError"], true, "{resp}");
     let err = &resp["result"]["structuredContent"]["error"];
     assert_eq!(err["code"], "not_found");
     assert_eq!(err["details"]["what"], "chain_gadget");
-    assert!(err["message"].as_str().unwrap().contains("mov qword ptr"));
+    assert!(err["message"]
+        .as_str()
+        .unwrap()
+        .contains("can't find a suitable gadget"));
 
     // windows-virtualprotect: pe-x86-cmd stdcall chain via api_addr
     let pe86 = fixtures_dir().join("pe-x86-cmd-v6.1.7600");
@@ -989,4 +999,124 @@ async fn fat_macho_requires_an_arch_on_the_mcp_surface() {
         )
         .await;
     assert_eq!(missing["result"]["isError"], Value::Bool(true), "{missing}");
+}
+
+// ---------------------------------------------------------------------------
+// CHWIN-02 / CHWIN-04 / CHWIN-06 — the Windows chain parameters, on MCP
+//
+// `tests/capability_matrix.py` fails the build when a capability exists on
+// one front end and not the other, so every `--api-name` / `--chain-base` /
+// `--prot` behaviour the CLI has is asserted here against the SERVER.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn windows_chain_parameters_and_assumptions() {
+    let mut mcp = McpChild::spawn().await;
+    let pe86 = fixtures_dir().join("pe-x86-cmd-v6.1.7600");
+
+    // Default build: the assumptions object says what was assumed, and the
+    // out-parameter does not alias the shellcode (CHWIN-02).
+    let resp = mcp
+        .call_tool(
+            90,
+            "build_rop_chain",
+            json!({"binary_path": pe86, "target": "windows-virtualprotect",
+                   "api_addr": "0x7fff12340000"}),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], Value::Bool(false), "{resp}");
+    let body = structured(&resp);
+    let a = &body["assumptions"];
+    assert_eq!(a["api_name"], "VirtualProtect");
+    assert_eq!(a["chain_base_parity"], "return_address");
+    assert_eq!(a["chain_base_mod16"], 8);
+    assert_eq!(a["shellcode_addr"], "0x4ad24000");
+    assert_ne!(
+        a["old_protect_addr"], a["shellcode_addr"],
+        "CHWIN-02: the out-parameter must not alias the shellcode"
+    );
+    let words = body["chain"]["words"].as_array().unwrap();
+    assert_ne!(words[5]["value"], words[2]["value"]);
+
+    // A Linux chain makes none of these assumptions and says so.
+    let linux = fixtures_dir().join("elf-Linux-x64");
+    let resp = mcp
+        .call_tool(
+            91,
+            "build_rop_chain",
+            json!({"binary_path": linux, "target": "linux-execve"}),
+        )
+        .await;
+    assert_eq!(structured(&resp)["assumptions"], Value::Null);
+
+    // CHWIN-06: cmd.exe imports VirtualAlloc, not VirtualProtect, and
+    // api_name selects the argument recipe as well as the symbol.
+    let resp = mcp
+        .call_tool(
+            92,
+            "build_rop_chain",
+            json!({"binary_path": pe86, "target": "windows-virtualprotect",
+                   "api_addr": "0x7fff12340000", "api_name": "VirtualAlloc"}),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], Value::Bool(false), "{resp}");
+    let body = structured(&resp);
+    assert_eq!(body["assumptions"]["api_name"], "VirtualAlloc");
+    assert_eq!(body["assumptions"]["old_protect_addr"], Value::Null);
+    let words = body["chain"]["words"].as_array().unwrap();
+    assert_eq!(
+        words[4]["value"], "0x1000",
+        "arg3 flAllocationType MEM_COMMIT"
+    );
+    assert!(body["python"].as_str().unwrap().contains("VirtualAlloc"));
+
+    // CHWIN-04: chain_base is accepted in BOTH spellings the CLI accepts,
+    // and `prot` reaches flNewProtect.
+    for base in ["aligned", "return_address", "return-address"] {
+        let resp = mcp
+            .call_tool(
+                93,
+                "build_rop_chain",
+                json!({"binary_path": pe86, "target": "windows-virtualprotect",
+                       "api_addr": "0x7fff12340000", "chain_base": base,
+                       "prot": "0x20"}),
+            )
+            .await;
+        assert_eq!(
+            resp["result"]["isError"],
+            Value::Bool(false),
+            "{base}: {resp}"
+        );
+        let body = structured(&resp);
+        let want = if base == "aligned" {
+            "aligned"
+        } else {
+            "return_address"
+        };
+        assert_eq!(body["assumptions"]["chain_base_parity"], want);
+        assert_eq!(
+            body["chain"]["words"].as_array().unwrap()[4]["value"],
+            "0x20"
+        );
+    }
+
+    // Unknown values are usage errors that name the accepted set — the same
+    // refusal the CLI gives, not a silent default.
+    for (id, extra) in [
+        (94u64, json!({"api_name": "VirtualProtectEx"})),
+        (95, json!({"chain_base": "stack"})),
+        (96, json!({"prot": "not-hex"})),
+    ] {
+        let mut params = json!({"binary_path": pe86, "target": "windows-virtualprotect",
+                                "api_addr": "0x7fff12340000"});
+        for (k, v) in extra.as_object().unwrap() {
+            params.as_object_mut().unwrap().insert(k.clone(), v.clone());
+        }
+        let resp = mcp.call_tool(id, "build_rop_chain", params).await;
+        assert_eq!(resp["result"]["isError"], true, "{extra}: {resp}");
+        assert_eq!(
+            resp["result"]["structuredContent"]["error"]["code"], "usage_error",
+            "{extra}: {resp}"
+        );
+    }
 }
