@@ -789,3 +789,13 @@ What would make it more defensible, in order:
 4. Write a CHANGELOG.
 5. Either build the PyO3 wrapper `ECO-10` asks for, or amend `ECO-10`'s
    status to say plainly that its Python half was descoped.
+
+---
+
+## Addendum, 2026-09-04
+
+The qualification recorded above under "what I would not ship without" item 1 has been
+partly discharged: the Unix confinement suite, including MCP-01's `confine_race`
+harness, was executed on Linux and passed. See [linux-verification-2026-09-04.md](linux-verification-2026-09-04.md).
+Items 2 (the repository URL) and 3 (fixture tests that skip-loudly outside the repo)
+stand, and the full-workspace Linux run did not complete.
