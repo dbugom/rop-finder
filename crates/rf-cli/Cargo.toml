@@ -6,6 +6,7 @@
 name = "rop-finder"
 description = "A fast, memory-safe ROP/JOP/SYS gadget finder with ROPgadget output parity, semantic classification and chain generation"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

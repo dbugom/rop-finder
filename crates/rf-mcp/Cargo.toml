@@ -5,6 +5,7 @@
 name = "rop-finder-mcp"
 description = "MCP (Model Context Protocol) server exposing rop-finder gadget scanning to agent hosts over stdio, with a directory allowlist and hard resource caps"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

@@ -64,12 +64,21 @@ fn long_version() -> &'static str {
     LONG_VERSION.get_or_init(|| {
         format!(
             "{ver}\n\
+             Written by {authors}.\n\
+             \n\
              capstone {cs} (bundled; decodes ARM, ARM64, MIPS, PPC, SPARC, RISC-V)\n\
              iced-x86 (decodes x86/x64)\n\
+             \n\
              A port of ROPgadget by Jonathan Salwan, Alexey Vishnyakov and \
              contributors (BSD-3-Clause):\n\
              https://github.com/JonathanSalwan/ROPgadget",
             ver = env!("CARGO_PKG_VERSION"),
+            // From `authors` in the workspace manifest, so the binary and the
+            // crates.io metadata cannot disagree. Cargo joins multiple authors
+            // with ':'. This credits the author of the Rust work; it does NOT
+            // replace the ROPgadget line below, which credits the upstream
+            // project this is a port of and is required by its licence (ENG-03).
+            authors = env!("CARGO_PKG_AUTHORS").replace(':', ", "),
             cs = rf_scan::capstone_version(),
         )
     })
@@ -2343,6 +2352,20 @@ mod tests {
         assert!(v.contains("Jonathan Salwan"), "{v}");
         // The version is the linked library's, not a placeholder.
         assert!(v.contains("capstone 5.0"), "{v}");
+        // The author of the Rust work is named, and is taken from the
+        // manifest rather than typed here — a literal would drift, which is
+        // exactly how the MCP server came to report version 0.1.0 for a
+        // 1.0.0 build.
+        assert!(v.contains("Written by "), "{v}");
+        for author in env!("CARGO_PKG_AUTHORS").split(':') {
+            assert!(v.contains(author), "author {author:?} missing from:\n{v}");
+        }
+        // Crediting the port's author must never displace the upstream
+        // attribution the licence requires (ENG-03). Both, always.
+        assert!(
+            v.find("Written by ") < v.find("A port of ROPgadget"),
+            "the author line must precede, not replace, the upstream credit:\n{v}"
+        );
     }
 
     /// CHWIN-09: the experimental gate fires for the Windows chain and

@@ -3300,7 +3300,10 @@ impl ServerHandler for RopFinderMcp {
                 .enable_resources()
                 .build(),
         )
-        .with_server_info(rmcp::model::Implementation::new("rop-finder-mcp", env!("CARGO_PKG_VERSION")))
+        .with_server_info(rmcp::model::Implementation::new(
+            "rop-finder-mcp",
+            env!("CARGO_PKG_VERSION"),
+        ))
         .with_instructions(self.instructions())
     }
 
