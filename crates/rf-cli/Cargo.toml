@@ -1,25 +1,47 @@
 [package]
-name = "rf-cli"
-description = "rop-finder command line interface"
+# Directory `crates/rf-cli`, library target `rf_cli`, package `rop-finder`.
+# This is the package PLAN's exit criterion names: `cargo install rop-finder`
+# builds the `rop-finder` executable from here. (`rf-cli` on crates.io is
+# someone else's crate, `rf-cli v1.0.0-rc.18`, the RavenFabric client.)
+name = "rop-finder"
+description = "A fast, memory-safe ROP/JOP/SYS gadget finder with ROPgadget output parity, semantic classification and chain generation"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/rop-finder"
+keywords = ["rop", "gadget", "ropgadget", "exploit", "security"]
+categories = ["command-line-utilities", "development-tools::debugging"]
+
+# The library half exists so `rop-finder-mcp` and the tests can call the same
+# code the binary does. It is NOT a published API: it carries clap types and
+# output formatting, and docs/API-STABILITY.md excludes it explicitly. Build
+# against `rop-finder-api` instead.
+[lib]
+name = "rf_cli"
 
 [[bin]]
 name = "rop-finder"
 path = "src/main.rs"
 
+[package.metadata.docs.rs]
+all-features = true
+
 [dependencies]
-rf-core = { path = "../rf-core" }
-rf-scan = { path = "../rf-scan" }
-rf-chain = { path = "../rf-chain" }
-rf-classify = { path = "../rf-classify" }
+# ENG-08/ECO-10: the shared request/option layer, re-exported from
+# `rf_cli` so nothing downstream had to change spelling.
+rop-finder-api.workspace = true
+rop-finder-core.workspace = true
+rop-finder-scan.workspace = true
+rop-finder-chain.workspace = true
+rop-finder-classify.workspace = true
 # CLI-01/ENG-05, CLI-07, ROB-04, CLI-08/PERF-12: the authenticated,
 # bounded scan cache, shared byte for byte with rf-mcp.
-rf-cache = { path = "../rf-cache" }
+rop-finder-cache.workspace = true
 clap.workspace = true
-globset = "0.4"
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
+sha2.workspace = true

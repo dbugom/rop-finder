@@ -1,4 +1,4 @@
-//! `rf_cli::scan_bytes` through the RAW loader, one architecture per option
+//! `rf_api::scan_bytes` through the RAW loader, one architecture per option
 //! byte — the decode-engine target.
 //!
 //! `cli_scan_bytes` can only reach a decoder if the input still parses as a
@@ -20,5 +20,5 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let req = common::request_from(opt);
-    let _ = rf_cli::scan_bytes(body, Some(common::raw_spec_from(opt)), &req);
+    let _ = rf_api::scan_bytes(body, Some(common::raw_spec_from(opt)), &req);
 });

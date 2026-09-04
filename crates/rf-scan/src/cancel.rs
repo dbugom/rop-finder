@@ -66,7 +66,12 @@ pub enum Error {
     /// `ScanOptions::max_gadgets` or `max_memory` was exceeded. `produced`
     /// is what had been accepted when the limit was hit; `limit` is the
     /// limit that tripped (gadgets or bytes — see the message).
-    Budget { produced: usize, limit: usize },
+    Budget {
+        /// Gadgets accepted before the limit tripped.
+        produced: usize,
+        /// The limit that tripped — gadgets or bytes, see the message.
+        limit: usize,
+    },
     /// A loader or decoder error from rf-core.
     Core(rf_core::Error),
 }

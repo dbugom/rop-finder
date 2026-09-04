@@ -1,15 +1,29 @@
 [package]
-name = "rf-cache"
+# Directory `crates/rf-cache`, library target `rf_cache`, package
+# `rop-finder-cache` (see the workspace manifest).
+name = "rop-finder-cache"
 description = "Integrity-tagged, bounded on-disk scan cache shared by the rop-finder CLI and MCP server"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/rop-finder-cache"
+keywords = ["rop", "gadget", "cache", "exploit"]
+categories = ["caching", "development-tools::debugging"]
+
+[lib]
+name = "rf_cache"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
-rf-scan = { path = "../rf-scan" }
+rop-finder-scan.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
+sha2.workspace = true
 # 32 random bytes for the entry-authentication key, once per cache
 # directory. Already in the resolved graph (uuid pulls it), so this adds an
 # edge to Cargo.lock, not a package.
@@ -24,4 +38,4 @@ rustix = { version = "1", features = ["process"] }
 # Only to prove KNOWN_CLASSES has not drifted from the classifier
 # (`known_classes_match_rf_classify`). rf-classify does not depend on
 # rf-cache, so this is not a cycle.
-rf-classify = { path = "../rf-classify" }
+rop-finder-classify.workspace = true

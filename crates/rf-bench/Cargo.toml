@@ -1,8 +1,17 @@
 [package]
+# NOT PUBLISHED, and the only member that is not. This crate is a test
+# harness: its whole content is criterion benches plus the `probe` binary
+# that CI's regression checker drives, it is useless without the repository's
+# fixture corpus (which cannot be redistributed — see docs/PUBLISHING.md),
+# and nothing outside this workspace could depend on it for anything. Its
+# library target is deliberately empty. `publish = false` makes that intent
+# explicit, which ECO-10 records as missing: an unpublished crate with no
+# `publish` key is indistinguishable from one nobody got round to releasing.
 name = "rf-bench"
 description = "Criterion benchmark suite for the rop-finder scan engine (CLAIM-02 / PERF-08)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish = false
 
@@ -18,8 +27,8 @@ publish = false
 alloc-count = []
 
 [dependencies]
-rf-core = { path = "../rf-core" }
-rf-scan = { path = "../rf-scan" }
+rop-finder-core.workspace = true
+rop-finder-scan.workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true }

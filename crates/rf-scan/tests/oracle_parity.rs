@@ -1,7 +1,7 @@
 //! Parity measurement against the ROPgadget reference dumps.
 //!
 //! The heavy sweep is opt-in through environment variables so that a plain
-//! `cargo test -p rf-scan` stays fast and needs no oracle checkout:
+//! `cargo test -p rop-finder-scan` stays fast and needs no oracle checkout:
 //!
 //!   * `RF_DUMP_DIR=<dir>` — write `<fixture>.tsv` (`key<TAB>text`, key =
 //!     `0x{vaddr:0width$x}|{hex bytes}`, exactly the key the oracle harness

@@ -55,19 +55,28 @@ pub const DECODER_OPTIONS: u32 = DecoderOptions::NO_INVALID_CHECK;
 pub struct WinInsn {
     /// Offset (in the scanned buffer) one past this instruction's last byte.
     pub end: usize,
+    /// iced-x86's flow-control class (call, ret, branch, ...).
     pub flow: FlowControl,
+    /// iced-x86's exact instruction code.
     pub code: Code,
+    /// iced-x86's mnemonic id.
     pub mnem: Mnemonic,
+    /// The instruction's segment override, or [`Register::None`].
     pub seg_prefix: Register,
+    /// `f2` prefix present.
     pub repne: bool,
+    /// `f3` prefix present.
     pub repe: bool,
 }
 
 /// One decoded instruction with text (used by the property tests).
 #[derive(Debug, Clone)]
 pub struct InsnRec {
+    /// Offset one past this instruction's last byte.
     pub end: usize,
+    /// The lowercase mnemonic on its own.
     pub mnem: String,
+    /// The full formatted instruction text.
     pub text: String,
 }
 

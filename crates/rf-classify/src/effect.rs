@@ -43,27 +43,43 @@ pub enum ValueSrc {
     /// **entry** — so `pop rdi ; pop rsi ; ret` reports rdi from offset 0 and
     /// rsi from offset 8 — and is `None` when the running stack-pointer delta
     /// stopped being constant before this instruction.
-    Stack { offset: Option<i64> },
+    Stack {
+        /// Byte offset from the stack pointer at gadget entry; `None` when
+        /// the running delta stopped being constant.
+        offset: Option<i64>,
+    },
     /// Another register's incoming value (`mov rax, rbx`).
-    Register { reg: String },
+    Register {
+        /// The source register.
+        reg: String,
+    },
     /// Memory that is *not* on the stack. `base` is the register that must
     /// already hold an attacker-controlled pointer for the operand to be
     /// usable; it is `None` for an absolute or PC-relative address, which
     /// needs no set-up at all.
     Memory {
+        /// Base register of the memory operand, if any.
         base: Option<String>,
+        /// Index register of the memory operand, if any.
         index: Option<String>,
+        /// Signed displacement, in bytes.
         disp: i64,
     },
     /// The *address* of a memory operand rather than its contents — x86
     /// `lea`, and the address-forming half of a load/store.
     Address {
+        /// Base register of the address being formed, if any.
         base: Option<String>,
+        /// Index register of the address being formed, if any.
         index: Option<String>,
+        /// Signed displacement, in bytes.
         disp: i64,
     },
     /// An instruction immediate.
-    Immediate { value: i64 },
+    Immediate {
+        /// The immediate's value, sign-extended.
+        value: i64,
+    },
     /// A combination this analysis does not decompose further (`mul`, a
     /// three-input arithmetic form, a conditional move).
     Computed,
@@ -90,12 +106,16 @@ impl ValueSrc {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ValueDst {
+    /// A register.
     Register {
+        /// The destination register.
         reg: String,
     },
     /// A stack slot, at a byte offset from the stack pointer's value at
     /// gadget entry (`push rax` on entry writes offset -8 on x86-64).
     Stack {
+        /// Byte offset from the stack pointer at gadget entry; `None` when
+        /// the running delta stopped being constant.
         offset: Option<i64>,
     },
     /// Non-stack memory. `base` is the register that must already hold an
@@ -104,13 +124,17 @@ pub enum ValueDst {
     /// `add byte ptr [rax], al` (a byte increment through the pointer it is
     /// incrementing with).
     Memory {
+        /// Base register of the memory operand, if any.
         base: Option<String>,
+        /// Index register of the memory operand, if any.
         index: Option<String>,
+        /// Signed displacement, in bytes.
         disp: i64,
     },
 }
 
 impl ValueDst {
+    /// The destination register, for a register destination.
     pub fn register(&self) -> Option<&str> {
         match self {
             ValueDst::Register { reg } => Some(reg.as_str()),
@@ -127,6 +151,7 @@ impl ValueDst {
         }
     }
 
+    /// True for a non-stack memory destination.
     pub fn is_memory(&self) -> bool {
         matches!(self, ValueDst::Memory { .. })
     }
@@ -139,7 +164,9 @@ impl ValueDst {
 /// destination is the one that survives the gadget.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Transfer {
+    /// Where the value went.
     pub dst: ValueDst,
+    /// Where the value came from.
     pub src: ValueSrc,
     /// Registers that must already hold attacker-controlled values for this
     /// transfer to be usable — the base and index registers of whichever of
@@ -175,11 +202,17 @@ pub enum TerminatorTarget {
     /// (`jmp 0x400340`, `call 0x401120`).
     Direct,
     /// Indirect through a register (`jmp rax`, `blr x16`, `bctr`).
-    Register { reg: String },
+    Register {
+        /// The register holding the branch target.
+        reg: String,
+    },
     /// Indirect through memory (`jmp qword ptr [rax + 8]`).
     Memory {
+        /// Base register of the memory operand, if any.
         base: Option<String>,
+        /// Index register of the memory operand, if any.
         index: Option<String>,
+        /// Signed displacement, in bytes.
         disp: i64,
     },
     /// The target is not an operand: it comes off the stack (`ret`) or out of

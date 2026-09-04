@@ -16,7 +16,7 @@ the old classifier eval, which was the classifier retyped.
   input   crates/rf-classify/tests/ground-truth/x86-sample.jsonl
           (produced by `tests/effect_sample.rs`, a deterministic stride)
   output  crates/rf-classify/tests/ground-truth/x86-truth.jsonl
-  check   `cargo test -p rf-classify --test ground_truth`
+  check   `cargo test -p rop-finder-classify --test ground_truth`
 
     "D:/Private/ROP-Finder/.venv-oracle/Scripts/python.exe" \
         crates/rf-classify/tests/ground-truth/oracle_unicorn.py

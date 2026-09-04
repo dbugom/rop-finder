@@ -10,6 +10,11 @@ members = [
     # duplication was the finding — the align post-filter and the
     # char-boundary panic each existed twice.
     "crates/rf-cache",
+    # ENG-08/ECO-10: the shared request/option layer, so that rf-mcp depends
+    # on a LIBRARY crate instead of on the rf-cli BINARY. That coupling is
+    # the concrete reason the align post-filter and the cache char-boundary
+    # panic each existed in two places.
+    "crates/rf-api",
     "crates/rf-cli",
     "crates/rf-mcp",
     # CLAIM-02 / PERF-08: the criterion suite PLAN.md made a Phase-0 exit
@@ -17,8 +22,34 @@ members = [
     "crates/rf-bench",
 ]
 
+# ---------------------------------------------------------------------------
+# ENG-08 / ECO-10 — package identity
+#
+# DIRECTORY NAME vs PACKAGE NAME. Every crate lives in `crates/rf-<x>/` and
+# every LIBRARY TARGET is still called `rf_<x>`, so `use rf_core::…` is
+# unchanged and nothing in src/ moved. What changed at 1.0.0 is the PACKAGE
+# name — the name on crates.io — which is now `rop-finder`, `rop-finder-mcp`
+# and `rop-finder-<x>` for the libraries. Two reasons, in order of force:
+#
+#   1. `rf-core` and `rf-cli` ARE ALREADY TAKEN by other people. Verified,
+#      not assumed, on 2026-09-04:
+#          $ cargo info rf-core   -> Downloaded rf-core v0.6.0
+#                                    "The core library for the RuFi framework"
+#          $ cargo info rf-cli    -> Downloaded rf-cli v1.0.0-rc.18
+#                                    "RavenFabric — CLI client (rf)"
+#      while every `rop-finder*` name reports "could not find … in registry".
+#      Publishing this workspace under the old names is not merely a bad
+#      idea, it is impossible.
+#   2. PLAN's own exit criterion is `cargo install rop-finder`, which needs a
+#      PACKAGE named `rop-finder`; a `[[bin]]` of that name inside a package
+#      called something else does not satisfy it.
+#
+# The mapping is stated once, here and in docs/PUBLISHING.md, and each member
+# manifest repeats its own line.
+# ---------------------------------------------------------------------------
+
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 license = "BSD-2-Clause"
 # Real floor, not aspiration: the highest `rust-version` declared anywhere in
@@ -27,16 +58,49 @@ license = "BSD-2-Clause"
 # `cargo metadata --format-version 1 --locked` and take the maximum
 # `rust_version` field. The pinned toolchain lives in rust-toolchain.toml.
 rust-version = "1.88"
+# PLACEHOLDER — THE ONE THING A HUMAN MUST SET BEFORE THE FIRST REAL PUBLISH.
+# This working copy has no git remote at all (`git remote -v` prints nothing,
+# and .git/config carries no [remote] section), so there is no canonical URL
+# to put here and inventing a github.com path would point crates.io and
+# docs.rs at a repository that either does not exist or belongs to someone
+# else. `.invalid` is reserved by RFC 2606 precisely so a placeholder can
+# never resolve to a stranger's property. docs/PUBLISHING.md step 1 is
+# replacing this line; nothing else in the release is blocked on it, and
+# `cargo publish --dry-run` does not check it.
+repository = "https://placeholder.invalid/rop-finder"
 
 [workspace.dependencies]
+# --- the workspace's own crates ------------------------------------------
+#
+# ENG-08: these carry BOTH `path` and `version`. A bare `path` dependency is
+# rejected outright by `cargo publish` ("all dependencies must have a version
+# specified when publishing"), because the tarball that reaches a consumer
+# has no `../rf-core` next to it — the version is what the published crate
+# resolves against instead. Declared once here so the nine members cannot
+# drift onto different requirements of each other.
+#
+# The requirement is a caret (`1.0.0` means `>=1.0.0, <2.0.0`), not `=1.0.0`:
+# these crates are released in lockstep, and `rf_scan::Gadget` appears in
+# rf-classify's and rf-chain's signatures, so what actually matters is that a
+# consumer's graph unifies on ONE 1.x of each — which caret does, and which
+# an exact pin would instead turn into an unsolvable constraint the moment a
+# consumer pins a different patch. See docs/API-STABILITY.md.
+rop-finder-core = { path = "crates/rf-core", version = "1.0.0" }
+rop-finder-scan = { path = "crates/rf-scan", version = "1.0.0" }
+rop-finder-classify = { path = "crates/rf-classify", version = "1.0.0" }
+rop-finder-chain = { path = "crates/rf-chain", version = "1.0.0" }
+rop-finder-cache = { path = "crates/rf-cache", version = "1.0.0" }
+rop-finder-api = { path = "crates/rf-api", version = "1.0.0" }
+
+# --- third-party ----------------------------------------------------------
 goblin = "0.10"
 # Exact pin, not a caret range. iced-x86's FastFormatter produces the
 # user-visible x86/x64 instruction text, and rf-scan/src/x86.rs hand-matches
 # capstone's exact output strings ("ds ret", "repz ret", "bnd jmp", rep-on-
 # string-ops). Any 1.x release that changes formatting silently breaks the
 # parity numbers in docs/measured-2026-09.md, so this is pinned the same way
-# rf-scan/Cargo.toml pins capstone = "=0.13.0". Do not relax without re-running
-# tests/parity.py.
+# rf-scan/Cargo.toml pins capstone = "=0.14.0". Do not relax without
+# re-running tests/parity.py.
 iced-x86 = { version = "=1.21.0", default-features = false, features = ["std", "decoder", "intel", "instr_info", "fast_fmt"] }
 memchr = "2.7"
 # Used by rf-scan (the ROPgadget-compatible `--filter` / `--re` alternation),
@@ -48,6 +112,7 @@ thiserror = "2"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 # Benchmarks only (crates/rf-bench). `default-features = false` drops the
 # `plotters`/`rayon` HTML-report stack: CI needs the JSON estimates that the
 # regression checker reads, not gnuplot output, and the smaller graph keeps

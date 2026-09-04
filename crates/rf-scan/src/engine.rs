@@ -62,8 +62,11 @@ pub struct ScanOptions {
     /// ROPgadget --depth: candidate starts are `anchor_pos - i` for
     /// `i in 0..depth` (shortest gadget first).
     pub depth: usize,
+    /// Search the ROP anchor table (ROPgadget's default; `--norop` clears it).
     pub rop: bool,
+    /// Search the JOP anchor table (`--nojop` clears it).
     pub jop: bool,
+    /// Search the SYS anchor table (`--nosys` clears it).
     pub sys: bool,
     /// ROPgadget --multibr: allow branch instructions in the middle of a
     /// gadget (ret-family still always rejected in the middle).
@@ -208,7 +211,10 @@ impl ScanOptions {
 /// One gadget. Text is produced once at the output boundary.
 #[derive(Debug, Clone)]
 pub struct Gadget {
+    /// The gadget's address in the scanned view: after `--base` rebasing
+    /// and after the `--offset` slide.
     pub vaddr: u64,
+    /// The gadget's own bytes, exactly `end - start` of them.
     pub bytes: Vec<u8>,
     /// Full formatted text per instruction (mnemonic + operands).
     pub insns: Vec<String>,
@@ -237,6 +243,7 @@ impl Gadget {
         self.insns.join(" ; ")
     }
 
+    /// The gadget's bytes as lowercase hex, no separators.
     pub fn bytes_hex(&self) -> String {
         let mut s = String::with_capacity(self.bytes.len() * 2);
         for b in &self.bytes {

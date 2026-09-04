@@ -538,7 +538,7 @@ pub struct GadgetFilter {
     /// `pop`, or a load based on the stack pointer). With no `writes_regs`,
     /// at least one register must be.
     pub from_stack: bool,
-    /// Coarse terminator kinds ([`Terminator::kind`]); any-of. Empty means
+    /// Coarse terminator kinds (`Terminator::kind`); any-of. Empty means
     /// no constraint, and so does a value of `"any"`.
     ///
     /// `terminator` is a comma-separated any-of list, exactly as the CLI's

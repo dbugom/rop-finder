@@ -1,13 +1,27 @@
 [package]
-name = "rf-classify"
-description = "Semantic classification and quality ranking of gadgets"
+# Directory `crates/rf-classify`, library target `rf_classify`, package
+# `rop-finder-classify` (see the workspace manifest).
+name = "rop-finder-classify"
+description = "Semantic classification, constraint predicates and quality ranking of rop-finder gadgets"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/rop-finder-classify"
+keywords = ["rop", "gadget", "exploit", "classification", "ranking"]
+categories = ["development-tools::debugging", "algorithms"]
+
+[lib]
+name = "rf_classify"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
-rf-core = { path = "../rf-core" }
-rf-scan = { path = "../rf-scan" }
+rop-finder-core.workspace = true
+rop-finder-scan.workspace = true
 iced-x86.workspace = true
 serde.workspace = true
 serde_json.workspace = true

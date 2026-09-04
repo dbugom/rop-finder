@@ -33,8 +33,63 @@
 //! (ELF `SHF_EXECINSTR`, PE `IMAGE_SCN_MEM_EXECUTE`, Mach-O instruction
 //! attributes). Scan regions mirror ROPgadget's loaders: executable
 //! `PT_LOAD` *segments* for ELF, executable *sections* for PE/Mach-O/Raw.
+//!
+//! # Getting started
+//!
+//! [`Binary::load`] sniffs the container and hands back a [`LoadedBinary`];
+//! every variant's payload implements [`Image`], which is the whole
+//! contract [`rf_scan`](https://docs.rs/rf-scan) needs in order to scan it.
+//!
+//! ```
+//! use rf_core::{Arch, Binary, Endianness, Image, LoadedBinary, RawBinary};
+//!
+//! // A real caller starts from a file:
+//! //     let bytes = std::fs::read("/bin/ls")?;
+//! //     let loaded = Binary::load(&bytes)?;
+//! // A doctest starts from a flat blob, which needs no container at all.
+//! // These two bytes are `pop rdi ; ret`.
+//! let blob = RawBinary::new(&[0x5f, 0xc3], Arch::X64, Endianness::Little);
+//! let loaded = LoadedBinary::Raw(blob);
+//!
+//! // Format-agnostic questions go through `Image`.
+//! let image: &dyn Image = match &loaded {
+//!     LoadedBinary::Elf(b) => b,
+//!     LoadedBinary::Pe(b) => b,
+//!     LoadedBinary::MachO(b) => b,
+//!     LoadedBinary::Raw(b) => b,
+//!     LoadedBinary::Universal(_) => panic!("pick a slice first"),
+//! };
+//! assert_eq!(image.arch(), Arch::X64);
+//! assert_eq!(image.addr_size(), 8);
+//!
+//! // The regions a scanner walks. For ELF these are the executable
+//! // PT_LOAD segments; for PE/Mach-O/Raw the executable sections.
+//! let total: u64 = image.exec_scan_regions().iter().map(|s| s.size).sum();
+//! assert_eq!(total, 2);
+//! ```
+//!
+//! # Semver policy
+//!
+//! Covered by semver from 1.0: the item signatures below, the variants of
+//! [`Arch`], [`Format`] and [`LoadedBinary`], the fields of [`Section`],
+//! and the [`Image`] trait's method set.
+//!
+//! **Not** covered, and free to change in a patch release: the exact text
+//! of any [`Error`] or [`Mitigation::evidence`] string, the *contents* of a
+//! mitigation report for a given file (a better reader may turn an
+//! [`Enabled::Unknown`] into a decided answer), the order of
+//! [`Mitigations::names`] beyond the guarantee that it is stable within a
+//! release, and anything marked `#[doc(hidden)]`. Adding an [`Arch`] or
+//! [`Format`] variant is a minor release — match exhaustively at your own
+//! risk. Pin `rf-core = "1"`.
+//!
+//! See `docs/API-STABILITY.md` in the repository for the workspace-wide
+//! statement.
 
 #![forbid(unsafe_code)]
+// ENG-08: every public item carries documentation. This lint is the gate
+// that keeps it that way.
+#![warn(missing_docs)]
 
 mod arch;
 mod binary;

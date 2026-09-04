@@ -55,8 +55,12 @@ use std::fmt;
 /// [`Mitigation::evidence`] always says which bytes were missing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Enabled {
+    /// The deciding bytes are present and say the mitigation is on.
     Yes,
+    /// The deciding bytes are present and say the mitigation is off.
     No,
+    /// The container does not carry the deciding bytes; the paired
+    /// [`Mitigation::evidence`] says which ones were missing.
     Unknown,
 }
 
@@ -186,10 +190,13 @@ impl Mitigations {
         self.note.as_deref()
     }
 
+    /// How many mitigations this container reported.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// True when the container reported none at all — a raw blob, say.
+    /// [`note`](Self::note) then says why.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

@@ -18,7 +18,7 @@
 //!
 //! ## Mode resolution
 //!
-//! [`Gadget`](crate::Gadget) records the architecture only through the image
+//! [`crate::Gadget`] records the architecture only through the image
 //! it came from; it does not record endianness or ARM/Thumb mode. Rather than
 //! widen every call signature, [`Detailer::resolve`] opens every capstone mode
 //! that is plausible for an [`Arch`] and keeps the one that **reproduces the
@@ -41,12 +41,19 @@ use crate::Gadget;
 /// privileged", and those seven ids mean the same thing on every arch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InsnGroups {
+    /// `CS_GRP_JUMP`.
     pub jump: bool,
+    /// `CS_GRP_CALL`.
     pub call: bool,
+    /// `CS_GRP_RET`.
     pub ret: bool,
+    /// `CS_GRP_INT` — a software interrupt / trap.
     pub int: bool,
+    /// `CS_GRP_IRET` — an interrupt return.
     pub iret: bool,
+    /// `CS_GRP_PRIVILEGE`.
     pub privileged: bool,
+    /// `CS_GRP_BRANCH_RELATIVE` — a PC-relative branch.
     pub branch_relative: bool,
 }
 
@@ -79,16 +86,22 @@ impl InsnGroups {
 /// are normalized by [`normalize_reg`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemRef {
+    /// Base register, normalized to lowercase.
     pub base: Option<String>,
+    /// Index register, normalized to lowercase.
     pub index: Option<String>,
+    /// Signed displacement, in bytes.
     pub disp: i64,
 }
 
 /// One decoded operand, architecture-independent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operand {
+    /// A register, normalized to lowercase.
     Reg(String),
+    /// An immediate.
     Imm(i64),
+    /// A memory reference.
     Mem(MemRef),
     /// Anything else capstone models per-architecture (condition fields,
     /// coprocessor operands, register lists already expanded into `Reg`).
@@ -101,14 +114,18 @@ pub enum Operand {
 /// decide from the mnemonic (which is what [`crate::detail`]'s callers do).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperandInfo {
+    /// The operand itself.
     pub op: Operand,
+    /// Read/write flags, where the architecture reports them.
     pub access: Option<Access>,
 }
 
 /// Read/write flags for one operand.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Access {
+    /// The instruction reads this operand.
     pub read: bool,
+    /// The instruction writes this operand.
     pub write: bool,
 }
 
@@ -129,7 +146,9 @@ pub struct InsnDetail {
     /// Registers capstone reports as written. Same caveat as
     /// [`InsnDetail::regs_read`].
     pub regs_written: Vec<String>,
+    /// The decoded operands, in operand order.
     pub operands: Vec<OperandInfo>,
+    /// The architecture-independent capstone groups.
     pub groups: InsnGroups,
 }
 
@@ -185,12 +204,17 @@ impl std::fmt::Debug for Detailer {
 
 impl Detailer {
     /// Open a detail-mode handle for an explicitly known configuration.
+    /// Open a capstone handle in detail mode for `(arch, endian, thumb)`.
+    ///
+    /// Fails with [`crate::Error::Core`] when no capstone configuration
+    /// covers the combination.
     pub fn new(arch: Arch, endian: Endianness, thumb: bool) -> Result<Self, Error> {
         let spec = cs::spec(arch, endian, thumb)?;
         let cs = cs::open_detail(&spec, true)?;
         Ok(Detailer { cs, spec, arch })
     }
 
+    /// The architecture this detailer was opened for.
     pub fn arch(&self) -> Arch {
         self.arch
     }

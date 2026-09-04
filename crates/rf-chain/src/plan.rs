@@ -42,7 +42,9 @@ use crate::hex_u64;
 /// and why.
 #[derive(Debug, Clone, Serialize)]
 pub struct Strategy {
+    /// The gadget pattern tried, in the `search` wildcard language.
     pub pattern: String,
+    /// How many scanned gadgets the builder could actually USE for this.
     pub candidates: usize,
     /// What the strategy does, for a reader who does not know the pattern
     /// language.
@@ -50,6 +52,7 @@ pub struct Strategy {
 }
 
 impl Strategy {
+    /// Record one strategy the builder tried.
     pub fn new(
         pattern: impl Into<String>,
         candidates: usize,
@@ -67,9 +70,14 @@ impl Strategy {
 /// satisfiable. `would_help` is measured, not predicted.
 #[derive(Debug, Clone, Serialize)]
 pub struct Relaxation {
+    /// The scan parameter that was changed (`depth`, `multibr`).
     pub param: String,
+    /// Its value in the base scan.
     pub from: String,
+    /// Its value in the re-scan.
     pub to: String,
+    /// What the re-scan MEASURED: true when the requirement was satisfied
+    /// with the parameter changed. Never a prediction.
     pub would_help: bool,
 }
 
@@ -78,23 +86,30 @@ pub struct Relaxation {
 pub struct Requirement {
     /// Stable, machine-friendly: `set_rdx`, `write_primitive`, `api_transfer`.
     pub id: String,
+    /// What the requirement means, for a human reader.
     pub description: String,
+    /// Whether this binary meets it.
     pub satisfied: bool,
+    /// Every strategy the builder tried, with its candidate count.
     pub strategies_tried: Vec<Strategy>,
+    /// Measured parameter changes that would (or would not) help.
     pub relaxations: Vec<Relaxation>,
 }
 
 /// A requirement that IS met, and the gadget that meets it.
 #[derive(Debug, Clone, Serialize)]
 pub struct SatisfiedRequirement {
+    /// The [`Requirement::id`] this satisfies.
     pub id: String,
     /// The stable id `find_gadgets` / `get_gadgets` use. Filled in by the
     /// front end, which is the only layer that knows the file hash; `null`
     /// when the requirement is met by something that is not a gadget of
     /// this binary (an `--api-addr`, a writable section).
     pub gadget_id: Option<String>,
+    /// The satisfying gadget's address, or 0 when it is not a gadget.
     #[serde(serialize_with = "hex_u64")]
     pub vaddr: u64,
+    /// The satisfying gadget's disassembly text.
     pub text: String,
 }
 
@@ -113,16 +128,22 @@ pub struct PlanAssumptions {
 /// The answer to "can this binary host this chain, and if not, why not?".
 #[derive(Debug, Clone, Serialize)]
 pub struct ChainPlan {
+    /// The `--chain` target this plan is for.
     pub target: String,
+    /// The architecture, as [`crate::arch_name`] spells it.
     pub arch: String,
+    /// The container format (`elf`, `pe`).
     pub format: String,
     /// Ground truth: the real builder was run and it succeeded. The
     /// requirement list explains the verdict; it does not decide it, so a
     /// probe that drifts from the builder shows up as a contradiction
     /// rather than as a wrong answer.
     pub feasible: bool,
+    /// Every requirement, satisfied or not, in builder order.
     pub requirements: Vec<Requirement>,
+    /// The satisfied ones, with the gadget that satisfies each.
     pub satisfied_requirements: Vec<SatisfiedRequirement>,
+    /// What the plan took for granted.
     pub assumptions: PlanAssumptions,
     /// The builder's structured refusal, when there was one.
     pub error: Option<String>,
@@ -131,6 +152,8 @@ pub struct ChainPlan {
 }
 
 impl ChainPlan {
+    /// An empty plan for `(target, arch, format)`; requirements are added
+    /// by the per-target probes.
     pub fn new(
         target: impl Into<String>,
         arch: impl Into<String>,
@@ -154,6 +177,7 @@ impl ChainPlan {
         self.requirements.iter().any(|r| r.id == id && !r.satisfied)
     }
 
+    /// The requirement with this id, if the plan has one.
     pub fn requirement(&self, id: &str) -> Option<&Requirement> {
         self.requirements.iter().find(|r| r.id == id)
     }
@@ -189,6 +213,7 @@ impl ChainPlan {
         }
     }
 
+    /// The plan as JSON - the document `--plan-chain` prints.
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
     }

@@ -256,11 +256,11 @@ fn window(sec: &Section, delta: u64) -> Window {
 /// meaningless list (CORE-03).
 #[must_use]
 pub fn data_windows(
-    target: &rf_cli::Target,
+    target: &rf_api::Target,
     slice: Option<&rf_core::MachOBinary>,
     delta: u64,
 ) -> Vec<Window> {
-    use rf_cli::Target;
+    use rf_api::Target;
     if let Some(m) = slice {
         return m
             .sections()
@@ -303,11 +303,11 @@ pub fn data_windows(
 /// exactly the regions the gadget scan walks.
 #[must_use]
 pub fn exec_windows(
-    target: &rf_cli::Target,
+    target: &rf_api::Target,
     slice: Option<&rf_core::MachOBinary>,
     delta: u64,
 ) -> Vec<Window> {
-    use rf_cli::Target;
+    use rf_api::Target;
     if let Some(m) = slice {
         return m
             .exec_scan_regions()

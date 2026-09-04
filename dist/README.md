@@ -24,10 +24,22 @@ unverifiable binary from here.
 
 Get a binary one of the two ways below instead.
 
+## Install it from crates.io
+
+```sh
+cargo install rop-finder        # -> `rop-finder`
+cargo install rop-finder-mcp    # -> `rop-finder-mcp`
+```
+
+This is the shortest route, and it needs the same C toolchain the "build it
+yourself" section lists. **Not available until the 1.0.0 release is actually
+uploaded** — it is packaged and `cargo publish --dry-run`-verified but not
+published; see `docs/PUBLISHING.md`.
+
 ## Build it yourself
 
 ```sh
-cargo build --release -p rf-cli -p rf-mcp
+cargo build --release -p rop-finder -p rop-finder-mcp
 # -> target/release/rop-finder       (CLI)
 # -> target/release/rop-finder-mcp   (MCP server)
 ```

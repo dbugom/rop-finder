@@ -1,9 +1,27 @@
 [package]
-name = "rf-core"
-description = "Binary loading (ELF via goblin), section model, and rebasing for rop-finder"
+# Directory `crates/rf-core`, library target `rf_core`, package
+# `rop-finder-core` (see the workspace manifest: `rf-core` on crates.io is
+# someone else's crate, `rf-core v0.6.0`, the RuFi framework).
+name = "rop-finder-core"
+description = "Binary loading for rop-finder: ELF, PE, Mach-O, fat Mach-O and raw blobs, with a section model, rebasing, mitigations and symbols"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/rop-finder-core"
+keywords = ["elf", "pe", "macho", "binary", "loader"]
+categories = ["parser-implementations", "development-tools::debugging"]
+
+# The package is `rop-finder-core`; the Rust crate it provides is `rf_core`.
+# Cargo names the extern by the LIB TARGET, so a consumer writes
+# `rop-finder-core = "1"` in Cargo.toml and `use rf_core::…` in the source.
+[lib]
+name = "rf_core"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 goblin.workspace = true

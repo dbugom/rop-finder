@@ -521,3 +521,215 @@ python tests/parity.py --seed-reference --baseline-dir my-baseline
 python tests/parity.py --update-floor  --baseline-dir my-baseline
 python tests/parity.py                 --baseline-dir my-baseline   # the gate
 ```
+
+---
+
+## Part 4 - the five source reverts, re-run for v1.0.0 (RUN 2026-09-04)
+
+Phase 6's exit criteria say the v0.2 mutation experiments are re-run and
+"still turn CI red". This is that re-run, on the v1.0.0 tree - after the
+workspace was restructured into publishable library crates (`crates/rf-api`
+extracted from `rf-cli`, all nine packages renamed for crates.io, `rf-mcp`
+moved off the binary crate). The point of repeating it is narrow and
+specific: **a restructure that claims to move code without changing
+behaviour must leave every gate still able to go red.** A gate that has
+quietly stopped failing is a worse outcome than a failing test.
+
+**Environment.** Windows 11 Pro 10.0.26200, rustc 1.89.0, cargo 1.89.0,
+CPython 3.12.10. Oracle: ROPgadget @ `b6e3fe31af46` under
+`D:\Private\ROP-Finder\.venv-oracle`, capstone 5.0.7. Corpus: 24 fixtures,
+763,204 reference gadgets, zero skips. Build: `cargo build --release -p
+rop-finder` - note the package rename; `-p rf-cli` in Part 2 above is the
+same crate (`docs/PUBLISHING.md` section 2).
+
+**Tree state before and after.** `cargo fmt --all -- --check` clean,
+`cargo clippy --workspace --all-targets -- -D warnings` exit 0,
+`cargo test --workspace --lib --bins --tests` **729 passed, 0 failed, 4
+ignored**, `cargo test --doc --workspace` **21 passed, 0 failed**.
+
+**Procedure, unchanged from Part 2.** Back the file up byte-for-byte, apply
+the revert with a byte-level replace that asserts exactly one match, build,
+run the gates the fix is supposed to be held by, restore from the backup,
+`diff` the restored file against the backup, and finally verify all four
+files against a `sha256sum` manifest taken before any mutation.
+
+Restoration proof, after all five:
+
+```
+$ sha256sum -c ORIGINAL.sha256
+crates/rf-core/src/elf.rs: OK
+crates/rf-cli/src/lib.rs: OK
+crates/rf-scan/src/x86.rs: OK
+crates/rf-scan/src/engine.rs: OK
+```
+
+### Result - all five still go red
+
+| # | Fix reverted | Gate | 2026-09-03 (v0.2.0) | 2026-09-04 (v1.0.0) |
+|---|---|---|---|---|
+| R1 | `CORE-01` | `cargo test -p rop-finder-core` | RED - 2 failed, 54 passed | **RED** - 2 failed, 74 passed |
+| R1 | `CORE-01` | `cargo test -p rop-finder --test refusals` | RED - 1 failed, 9 passed | **RED** - 1 failed, 9 passed |
+| R2 | `CLI-01` | `cargo test -p rop-finder` | RED - 2 failed, 61 passed | **RED** - 2 failed, 81 passed |
+| R2 | `CLI-01` | `python tests/parity.py` | green (never passes `--cache`) | green, same reason - now verified structurally |
+| R3 | `SCAN-02` | `cargo test -p rop-finder-scan --lib` | RED - 1 failed, 57 passed | **RED** - 1 failed, 71 passed |
+| R3 | `SCAN-02` | `python tests/parity.py` | RED - every CET-marked fixture | **RED** - same two fixtures, same -1 each |
+| R4 | `SCAN-03` | `cargo test -p rop-finder-scan --lib` | RED - 2 failed, 56 passed | **RED** - 2 failed, 70 passed |
+| R4 | `SCAN-03` | `python tests/parity.py` | RED - every x86/x64 fixture | **RED** - same fixtures, same deltas |
+| R5 | `CRIT-01` | `cargo test -p rop-finder-scan` | RED - 1 failed, 57 passed | **RED** - 1 failed, 71 passed |
+| R5 | `CRIT-01` | `python tests/parity.py` | green (never passes `--cfg-aware`) | green, same reason |
+
+The failing test *names* are identical to 2026-09-03 in every row. The
+passing counts moved because the suite grew from 333 to 729.
+
+### R1 - `CORE-01`: guess `Arch::X86` for an unrecognized `e_machine`
+
+Revert: in `crates/rf-core/src/elf.rs`, replace the
+`other => return Err(Error::UnsupportedArch { machine })` arm with
+`_other => X86`.
+
+```
+$ cargo test -p rop-finder-core
+test elf::tests::unknown_e_machine_is_refused_naming_the_machine ... FAILED
+test elf::tests::unknown_e_machine_refused_for_a_sample_of_real_unsupported_machines ... FAILED
+test result: FAILED. 74 passed; 2 failed
+
+$ cargo test -p rop-finder --test refusals
+test unrecognized_e_machine_is_refused_and_prints_no_gadgets ... FAILED
+test result: FAILED. 9 passed; 1 failed
+```
+
+Behaviour, on a copy of `elf-Linux-x86` with `e_machine` patched to `0x9999`
+(bytes 0x12-0x13):
+
+```
+reverted:  exit=0, "Unique gadgets found: 42508"   <- all fabricated, silently
+restored:  exit=2, 0 gadgets printed
+           [Error] unsupported architecture: machine type 0x9999 (39321) is not
+           one rop-finder can disassemble; refusing rather than emitting
+           fabricated gadgets
+```
+
+42,508 is the same fabricated count recorded in Part 2.
+
+### R2 - `CLI-01`: drop the raw spec from `cache_key`
+
+Revert: in `crates/rf-cli/src/lib.rs`, pass `Option::<&str>::None` in place
+of `id.raw_arch`, `id.raw_mode` and `id.raw_endian`.
+
+```
+$ cargo test -p rop-finder
+test tests::cache_key_covers_every_output_affecting_parameter ... FAILED
+test tests::a_cached_scan_is_never_served_across_rawarch ... FAILED
+test result: FAILED. 81 passed; 2 failed
+```
+
+Behaviour, against a fresh `ROP_FINDER_CACHE_DIR` on
+`tests/fixtures/raw-x86.raw`:
+
+```
+reverted:  --rawArch x86 --rawMode 32                     -> [Cache] miss v1-dc5a3c8ae1702 - stored 7 gadgets
+           --rawArch arm --rawMode arm --rawEndian little -> [Cache] hit  v1-dc5a3c8ae1702 (7 gadgets)   <- LIE
+                                                              (and it printed seven x86 gadgets)
+restored:  --rawArch arm --rawMode arm --rawEndian little -> [Cache] miss v1-dc5a3c8ae1702 - stored 0 gadgets
+```
+
+`tests/parity.py` stays green through this, as in Part 2, and now for a
+reason checked rather than remembered: neither the string `--cache` nor
+`--cfg-aware` appears anywhere in `tests/parity.py`. `cargo test -p
+rop-finder` is still the only gate holding `CLI-01`.
+
+### R3 - `SCAN-02`: stop emitting the `notrack` prefix
+
+Revert: in `crates/rf-scan/src/x86.rs`, delete the
+`text.insert_str(0, "notrack ")` line, so `add_notrack` returns without
+inserting the prefix.
+
+```
+$ cargo test -p rop-finder-scan --lib
+test x86::tests::renders_capstone_spelling ... FAILED
+test result: FAILED. 71 passed; 1 failed
+
+$ python tests/parity.py --fixture macho-x86-ls --top 0
+  |ref|=1272  |ours|=1271  matched=1271  ref-only=1  ours-only=0  (99.9214% of ref)
+  REGRESSION: our own gadget count 1271 < floor 1272 (output collapsed)
+  REGRESSION: matched 1271 < floor 1272 (-1 gadgets)
+  REGRESSION: text-normalized matches 1269 < floor 1272
+PARITY GATE: FAIL
+
+$ python tests/parity.py --fixture pe-x64-cmd --top 0
+  |ref|=12509  |ours|=12508  matched=12508  ref-only=1  ours-only=0  (99.992% of ref)
+  REGRESSION: matched 12508 < floor 12509 (-1 gadgets)
+PARITY GATE: FAIL
+```
+
+Byte-for-byte the deltas recorded in Part 2.
+
+### R4 - `SCAN-03`: render `f3 c3` as `rep ret` again
+
+Revert: in `crates/rf-scan/src/x86.rs`, drop the `Mnemonic::Ret` special case
+so the `rep ` prefix is stripped like any other.
+
+```
+$ cargo test -p rop-finder-scan --lib
+test engine::tests::repz_ret_is_rendered_and_findable_with_only ... FAILED
+test x86::tests::renders_capstone_spelling ... FAILED
+test result: FAILED. 70 passed; 2 failed
+
+$ python tests/parity.py --fixture elf-Linux-x86 --top 0
+  text: exact=42300  normalized=42300  divergent=173
+  REGRESSION: matched 42473 < floor 42508 (-35 gadgets)
+  REGRESSION: text-normalized matches 42300 < floor 42508
+  (elf-Linux-x86-NDH-chall, matched by the same name prefix:
+   text: exact=33526  divergent=104; matched 33630 < floor 33642 (-12 gadgets))
+PARITY GATE: FAIL
+
+$ python tests/parity.py --fixture elf-Linux-x64 --top 0
+  text: exact=43682  normalized=43682  divergent=266
+  REGRESSION: matched 43948 < floor 43972 (-24 gadgets)
+PARITY GATE: FAIL
+```
+
+-35 and -24, `exact=42300` and `exact=43682` - identical to Part 2.
+
+### R5 - `CRIT-01`: require an endbr landing pad on every gadget
+
+Revert: in `crates/rf-scan/src/engine.rs`, replace `survives_cet`'s
+`match g.table` with an unconditional `is_endbr_entry(g)`.
+
+```
+$ cargo test -p rop-finder-scan
+test engine::tests::cfg_aware_is_table_aware ... FAILED
+test result: FAILED. 71 passed; 1 failed
+```
+
+Behaviour - the original `CRIT-01` bug, reproduced:
+
+```
+                                reverted   restored
+--cfg-aware pe-x64-cmd-v6.1.7601       0      2,097
+--cfg-aware elf-Linux-x64              0      8,389
+```
+
+`python tests/parity.py --fixture elf-Linux-x64` stays green through this,
+because the harness never passes `--cfg-aware`. `cargo test -p
+rop-finder-scan` is still the only gate holding `CRIT-01`.
+
+### What this re-run says
+
+Nothing about the gate set changed, which is the useful result. The same two
+findings (`CLI-01`, `CRIT-01`) are still invisible to the parity harness and
+still held by exactly one `cargo test` suite each, so the required-CI-job
+argument at the end of Part 2 still stands: dropping either
+`cargo test -p rop-finder` or `cargo test -p rop-finder-scan` from CI would
+silently un-gate a finding.
+
+One thing that did change and is worth naming: the v1.0.0 restructure moved
+`request_options`, `scan_bytes`, `info_bytes`, the chain entry points and the
+whole query layer out of `rf-cli` into `rf-api`, and **none of these five
+reverts touch that moved code**. These five experiments therefore say nothing
+about whether the move was behaviour-preserving. That claim rests on the
+eight gates - all re-run on 2026-09-04, all green, `tests/parity.py` still at
+763,166 of 763,204 (99.9950%) - and on `cargo test --workspace` holding at
+exactly 729, not on this section. A reader who wants a mutation experiment
+aimed at the restructure itself does not have one; see
+`docs/REMEDIATION-OUTCOME.md`.

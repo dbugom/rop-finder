@@ -940,114 +940,12 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rf-bench"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "criterion",
- "rf-core",
- "rf-scan",
+ "rop-finder-core",
+ "rop-finder-scan",
  "serde_json",
-]
-
-[[package]]
-name = "rf-cache"
-version = "0.1.0"
-dependencies = [
- "getrandom",
- "rf-classify",
- "rf-scan",
- "rustix",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
-name = "rf-chain"
-version = "0.1.0"
-dependencies = [
- "rf-classify",
- "rf-core",
- "rf-scan",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "rf-classify"
-version = "0.1.0"
-dependencies = [
- "iced-x86",
- "rf-core",
- "rf-scan",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "rf-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "globset",
- "regex",
- "rf-cache",
- "rf-chain",
- "rf-classify",
- "rf-core",
- "rf-scan",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
-name = "rf-core"
-version = "0.1.0"
-dependencies = [
- "goblin",
- "thiserror",
-]
-
-[[package]]
-name = "rf-mcp"
-version = "0.1.0"
-dependencies = [
- "base64",
- "blake3",
- "clap",
- "rayon",
- "regex",
- "rf-cache",
- "rf-chain",
- "rf-classify",
- "rf-cli",
- "rf-core",
- "rf-scan",
- "rmcp",
- "rustix",
- "schemars",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "windows-sys",
-]
-
-[[package]]
-name = "rf-scan"
-version = "0.1.0"
-dependencies = [
- "capstone",
- "goblin",
- "iced-x86",
- "memchr",
- "rayon",
- "regex",
- "rf-core",
 ]
 
 [[package]]
@@ -1084,6 +982,121 @@ dependencies = [
  "quote",
  "serde_json",
  "syn 3.0.4",
+]
+
+[[package]]
+name = "rop-finder"
+version = "1.0.0"
+dependencies = [
+ "clap",
+ "regex",
+ "rop-finder-api",
+ "rop-finder-cache",
+ "rop-finder-chain",
+ "rop-finder-classify",
+ "rop-finder-core",
+ "rop-finder-scan",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "rop-finder-api"
+version = "1.0.0"
+dependencies = [
+ "globset",
+ "regex",
+ "rop-finder-chain",
+ "rop-finder-classify",
+ "rop-finder-core",
+ "rop-finder-scan",
+ "serde_json",
+]
+
+[[package]]
+name = "rop-finder-cache"
+version = "1.0.0"
+dependencies = [
+ "getrandom",
+ "rop-finder-classify",
+ "rop-finder-scan",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "rop-finder-chain"
+version = "1.0.0"
+dependencies = [
+ "rop-finder-classify",
+ "rop-finder-core",
+ "rop-finder-scan",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "rop-finder-classify"
+version = "1.0.0"
+dependencies = [
+ "iced-x86",
+ "rop-finder-core",
+ "rop-finder-scan",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rop-finder-core"
+version = "1.0.0"
+dependencies = [
+ "goblin",
+ "thiserror",
+]
+
+[[package]]
+name = "rop-finder-mcp"
+version = "1.0.0"
+dependencies = [
+ "base64",
+ "blake3",
+ "clap",
+ "rayon",
+ "regex",
+ "rmcp",
+ "rop-finder-api",
+ "rop-finder-cache",
+ "rop-finder-chain",
+ "rop-finder-classify",
+ "rop-finder-core",
+ "rop-finder-scan",
+ "rustix",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "windows-sys",
+]
+
+[[package]]
+name = "rop-finder-scan"
+version = "1.0.0"
+dependencies = [
+ "capstone",
+ "goblin",
+ "iced-x86",
+ "memchr",
+ "rayon",
+ "regex",
+ "rop-finder-core",
 ]
 
 [[package]]

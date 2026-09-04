@@ -49,7 +49,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use rf_cli::{RawSpec, ScanRequest};
+use rf_api::{RawSpec, ScanRequest};
 use rf_core::{Arch, Binary, ElfBinary, Endianness, MachOBinary, PeBinary, UniversalBinary};
 
 // ---------------------------------------------------------------------------
@@ -525,12 +525,12 @@ fn exercise(index: u64, m: &[u8]) {
     }
 
     // ---- --info -------------------------------------------------------
-    if rf_cli::info_bytes(m, None, None).is_ok() {
+    if rf_api::info_bytes(m, None, None).is_ok() {
         bump(&stat::INFO_OK, 1);
     }
-    let _ = rf_cli::info_bytes(m, None, Some(0));
-    let _ = rf_cli::info_bytes(m, None, Some(u64::MAX));
-    let _ = rf_cli::info_bytes(m, Some(raw_spec(index)), Some(0x4000_0000));
+    let _ = rf_api::info_bytes(m, None, Some(0));
+    let _ = rf_api::info_bytes(m, None, Some(u64::MAX));
+    let _ = rf_api::info_bytes(m, Some(raw_spec(index)), Some(0x4000_0000));
 
     // ---- full scan, when the exec extent is small enough to be quick --
     let cap = if index % BIG_SCAN_EVERY == 0 {
@@ -538,11 +538,11 @@ fn exercise(index: u64, m: &[u8]) {
     } else {
         SCAN_EXEC_CAP
     };
-    if let Ok(target) = rf_cli::load_target(m, None) {
-        let view = rf_cli::build_view(&target);
+    if let Ok(target) = rf_api::load_target(m, None) {
+        let view = rf_api::build_view(&target);
         let exec: u64 = view.regions.iter().map(|r| r.bytes.len() as u64).sum();
         if exec <= cap {
-            if let Ok(out) = rf_cli::scan_bytes(m, None, &request()) {
+            if let Ok(out) = rf_api::scan_bytes(m, None, &request()) {
                 bump(&stat::SCAN_AUTO, 1);
                 bump(&stat::GADGETS, out.result.gadgets.len() as u64);
             }
@@ -551,7 +551,7 @@ fn exercise(index: u64, m: &[u8]) {
 
     // ---- forced-raw scan: the decode engine on arbitrary bytes --------
     let head = &m[..m.len().min(RAW_SCAN_CAP)];
-    if let Ok(out) = rf_cli::scan_bytes(head, Some(raw_spec(index)), &request()) {
+    if let Ok(out) = rf_api::scan_bytes(head, Some(raw_spec(index)), &request()) {
         bump(&stat::SCAN_RAW, 1);
         bump(&stat::GADGETS, out.result.gadgets.len() as u64);
     }

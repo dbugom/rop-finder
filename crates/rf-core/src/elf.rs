@@ -11,7 +11,9 @@ use crate::Error;
 /// ELF class (32- or 64-bit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElfClass {
+    /// `ELFCLASS32` — 32-bit addresses.
     Bit32,
+    /// `ELFCLASS64` — 64-bit addresses.
     Bit64,
 }
 
@@ -31,6 +33,7 @@ impl ElfClass {
 /// synthesize `PT_LOAD#n` names from program headers.
 #[derive(Debug, Clone)]
 pub struct Section {
+    /// Section name, or a synthetic `PT_LOAD#n` for a stripped ELF.
     pub name: String,
     /// Virtual address of the first byte.
     pub vaddr: u64,
@@ -117,6 +120,10 @@ pub struct ElfBinary {
 }
 
 impl ElfBinary {
+    /// Parse an ELF image.
+    ///
+    /// Returns [`Error::UnsupportedArch`] for a machine type rop-finder
+    /// cannot disassemble, rather than guessing one (CORE-01).
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let elf = goblin::elf::Elf::parse(bytes)?;
 
@@ -186,22 +193,28 @@ impl ElfBinary {
         })
     }
 
+    /// `EI_CLASS`: whether addresses in this file are 32- or 64-bit.
     pub fn class(&self) -> ElfClass {
         self.class
     }
 
+    /// The raw `e_machine` value, for callers that need to report it
+    /// (see [`ModeDivergence`]).
     pub fn machine(&self) -> u16 {
         self.machine
     }
 
+    /// True when [`class`](Self::class) is [`ElfClass::Bit64`].
     pub fn is_64(&self) -> bool {
         self.class == ElfClass::Bit64
     }
 
+    /// True when `EI_DATA` says `ELFDATA2LSB`.
     pub fn little_endian(&self) -> bool {
         self.little_endian
     }
 
+    /// `e_entry`, in the current (possibly rebased) view.
     pub fn entry(&self) -> u64 {
         self.entry
     }

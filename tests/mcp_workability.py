@@ -289,7 +289,7 @@ def main():
                     help="dump every request and response")
     args = ap.parse_args()
 
-    exe = rf_paths.rop_finder(package="rf-mcp", stem="rop-finder-mcp")
+    exe = rf_paths.rop_finder(package="rop-finder-mcp", stem="rop-finder-mcp")
     fixtures = rf_paths.FIXTURES
     binary = os.path.join(fixtures, FIXTURE)
     if not os.path.exists(binary):

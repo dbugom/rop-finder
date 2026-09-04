@@ -214,7 +214,7 @@ impl MachOBinary {
         &self.exec_regions
     }
 
-    /// Load address of the image — see [`text_image_base`]. Captured at
+    /// Load address of the image — the `__TEXT` segment's `vmaddr`. Captured at
     /// parse time.
     pub fn image_base(&self) -> u64 {
         self.image_base

@@ -1,0 +1,31 @@
+[package]
+# Directory `crates/rf-api`, library target `rf_api`, package
+# `rop-finder-api` (see the workspace manifest).
+name = "rop-finder-api"
+description = "The front-end-agnostic rop-finder API: ScanRequest, the scan/info/chain pipelines and their cancellable twins, and the constraint query"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/rop-finder-api"
+keywords = ["rop", "gadget", "ropgadget", "exploit", "api"]
+categories = ["development-tools::debugging", "api-bindings"]
+
+[lib]
+name = "rf_api"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+rop-finder-core.workspace = true
+rop-finder-scan.workspace = true
+rop-finder-classify.workspace = true
+rop-finder-chain.workspace = true
+# `--section` globbing (`--section ".init*,.plt"`).
+globset = "0.4"
+# ECO-01's `--search` wildcard patterns compile to anchored regexes.
+regex.workspace = true
+serde_json.workspace = true

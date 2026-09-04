@@ -28,8 +28,26 @@
 //!
 //! A cache that cannot prove an entry is its own does not fall back to
 //! trusting it: [`DiskCache::open`] fails, and the caller runs uncached.
+//!
+//! # Semver policy
+//!
+//! Covered by semver from 1.0: the signatures of [`make_key`],
+//! [`DiskCache`]'s and [`MemCache`]'s methods, and the fields of
+//! [`CacheLimits`], [`CacheStats`] and [`MemStats`].
+//!
+//! **Not** covered: the on-disk format. [`CACHE_FORMAT_VERSION`] and the
+//! key schema version are in both the hashed material and the file name
+//! precisely so that changing them MISSES rather than mismatching — a
+//! format change is a cold cache, never a wrong answer, and so it is not a
+//! breaking change. The text of an [`OpenError`] is not covered either.
+//! Pin `rf-cache = "1"`.
+//!
+//! See `docs/API-STABILITY.md` in the repository for the workspace-wide
+//! statement.
 
 #![deny(clippy::indexing_slicing, clippy::string_slice)]
+// ENG-08: every public item carries documentation.
+#![warn(missing_docs)]
 
 mod hex;
 mod mac;

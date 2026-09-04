@@ -3,7 +3,7 @@
 //! `#[ignore]`d, prints to stdout, writes nothing:
 //!
 //! ```text
-//! cargo test -p rf-classify --release --test effect_cost -- --ignored --nocapture
+//! cargo test -p rop-finder-classify --release --test effect_cost -- --ignored --nocapture
 //! ```
 //!
 //! Two things make the cost small enough to pay unconditionally:

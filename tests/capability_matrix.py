@@ -713,8 +713,8 @@ def main():
                     help="print both surfaces and exit 0")
     args = ap.parse_args()
 
-    cli = rf_paths.rop_finder(package="rf-cli", stem="rop-finder")
-    srv = rf_paths.rop_finder(package="rf-mcp", stem="rop-finder-mcp")
+    cli = rf_paths.rop_finder(package="rop-finder", stem="rop-finder")
+    srv = rf_paths.rop_finder(package="rop-finder-mcp", stem="rop-finder-mcp")
     binary = rf_paths.fixture_path(args.fixture)
     if not os.path.exists(binary):
         sys.exit(f"missing fixture {binary} (run tests/fetch_fixtures.py)")

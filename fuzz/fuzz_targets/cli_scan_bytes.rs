@@ -1,4 +1,4 @@
-//! `rf_cli::scan_bytes` target at BOUNDED depth — the whole pipeline.
+//! `rf_api::scan_bytes` target at BOUNDED depth — the whole pipeline.
 //!
 //! options -> load -> view -> rf_scan::scan_binary -> post_process. This is
 //! the target that finally puts the decode engine (iced-x86 for x86/x64,
@@ -22,5 +22,5 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let req = common::request_from(opt);
-    let _ = rf_cli::scan_bytes(body, None, &req);
+    let _ = rf_api::scan_bytes(body, None, &req);
 });

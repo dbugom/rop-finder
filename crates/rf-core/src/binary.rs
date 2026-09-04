@@ -11,8 +11,11 @@ use crate::{ElfBinary, Error, MachOBinary, PeBinary, RawBinary, UniversalBinary}
 /// Detected container format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
+    /// `ELF`.
     Elf,
+    /// `MZ` (PE/COFF).
     Pe,
+    /// One of the four Mach-O magics.
     MachO,
     /// Fat ("Universal") Mach-O container.
     Universal,
@@ -21,12 +24,33 @@ pub enum Format {
 }
 
 /// A loaded binary of any supported format.
+///
+/// Produced by [`Binary::load`]. Match on it to reach the per-format extras
+/// (`ElfBinary::symbols`, `PeBinary::imports`, `UniversalBinary::slices`);
+/// for the format-agnostic questions, every variant's payload implements
+/// [`crate::Image`].
+///
+/// ```
+/// use rf_core::{Binary, Format, LoadedBinary};
+///
+/// // A 64-bit little-endian ELF header is enough to be detected...
+/// assert_eq!(Binary::detect(b"ELF"), Format::Elf);
+/// // ...and a blob with no magic is refused rather than guessed at.
+/// assert_eq!(Binary::detect(b"not a binary"), Format::RawUnknown);
+/// assert!(Binary::load(b"not a binary").is_err());
+/// # let _: fn(LoadedBinary) = |_| ();
+/// ```
 #[derive(Debug)]
 pub enum LoadedBinary {
+    /// An ELF image.
     Elf(ElfBinary),
+    /// A PE/COFF image.
     Pe(PeBinary),
+    /// A single-architecture Mach-O image.
     MachO(MachOBinary),
+    /// A fat (Universal) Mach-O container of several slices.
     Universal(UniversalBinary),
+    /// A flat blob loaded with an explicit architecture.
     Raw(RawBinary),
 }
 

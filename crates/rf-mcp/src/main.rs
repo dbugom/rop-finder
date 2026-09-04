@@ -53,7 +53,7 @@ struct ServerCli {
     #[arg(long = "audit-log", value_name = "<path>")]
     audit_log: Option<PathBuf>,
 
-    /// Rotate the audit log at this size, keeping <path>.1 and <path>.2.
+    /// Rotate the audit log at this size, keeping `<path>.1` and `<path>.2`.
     #[arg(long = "audit-log-max-mb", default_value_t = rf_mcp::audit::DEFAULT_AUDIT_MAX_MB)]
     audit_log_max_mb: u64,
 

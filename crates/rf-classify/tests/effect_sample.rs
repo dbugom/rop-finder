@@ -6,7 +6,7 @@
 //! modify the source tree.
 //!
 //! ```text
-//! cargo test -p rf-classify --test effect_sample -- --ignored --nocapture \
+//! cargo test -p rop-finder-classify --test effect_sample -- --ignored --nocapture \
 //!   > crates/rf-classify/tests/ground-truth/x86-sample.jsonl
 //! ```
 //!

@@ -29,8 +29,105 @@
 //! separates `pop rdi ; ret` from `retf 0xce39` — what the gadget's
 //! *terminator* is and whether it loads a register off the stack — and
 //! [`rank_key`] is the full order the CLI and the MCP server sort by.
+//!
+//! # Getting started
+//!
+//! One gadget in, one [`Classification`] out. The interesting part is not
+//! the label — it is the semantic fields underneath it, which are what let
+//! you ask "a gadget that loads rdi from the stack and clobbers neither rsi
+//! nor rdx" without re-parsing disassembly text.
+//!
+//! ```
+//! use rf_classify::{classify, Class, Terminator};
+//! use rf_core::{Arch, Endianness, RawBinary};
+//! use rf_scan::{scan_binary, ScanOptions};
+//!
+//! // `pop rdi ; ret`
+//! let image = RawBinary::new(&[0x5f, 0xc3], Arch::X64, Endianness::Little);
+//! let gadgets = scan_binary(&image, &ScanOptions { depth: 4, ..ScanOptions::default() })?;
+//! let g = gadgets.iter().find(|g| g.text() == "pop rdi ; ret").expect("pop rdi ; ret");
+//!
+//! let c = classify(g, Arch::X64);
+//! assert_eq!(c.primary, Class::RegWrite);
+//! assert_eq!(c.terminator, Terminator::Ret);
+//! assert_eq!(c.regs_written, ["rdi"]);
+//! assert_eq!(c.regs_from_stack, ["rdi"]);
+//! // The stack pointer moves 16 bytes: 8 for the pop, 8 for the return.
+//! assert_eq!(c.stack_delta, Some(16));
+//! # Ok::<(), rf_core::Error>(())
+//! ```
+//!
+//! ## Asking a real question
+//!
+//! The predicates on [`Classification`] are the query vocabulary both front
+//! ends expose (`--set-reg`, `--from-stack`, `--no-clobber`, `--terminator`),
+//! so a filter written against them means the same thing as the flag:
+//!
+//! ```
+//! use rf_classify::{Classifier, TerminatorClass};
+//! use rf_core::{Arch, Endianness, RawBinary};
+//! use rf_scan::{scan_binary, ScanOptions};
+//!
+//! // `pop rdi ; ret`, `pop rsi ; ret`, `xor eax, eax ; ret`
+//! let bytes = [0x5f, 0xc3, 0x5e, 0xc3, 0x31, 0xc0, 0xc3];
+//! let image = RawBinary::new(&bytes, Arch::X64, Endianness::Little);
+//! let gadgets = scan_binary(&image, &ScanOptions { depth: 4, ..ScanOptions::default() })?;
+//!
+//! // One classifier for the whole listing: it holds the open decoders.
+//! let cls = Classifier::new(Arch::X64);
+//! let hits: Vec<String> = gadgets
+//!     .iter()
+//!     .filter(|g| {
+//!         let c = cls.classify(g);
+//!         c.sets_reg("rdi")
+//!             && c.reg_from_stack("rdi")
+//!             && !c.clobbers_any(["rsi", "rdx"])
+//!             && c.terminator_class() == TerminatorClass::Ret
+//!     })
+//!     .map(|g| g.text())
+//!     .collect();
+//! assert_eq!(hits, ["pop rdi ; ret"]);
+//! # Ok::<(), rf_core::Error>(())
+//! ```
+//!
+//! ## Ranking
+//!
+//! ```
+//! use rf_classify::{classify, rank_key};
+//! use rf_core::{Arch, Endianness, RawBinary};
+//! use rf_scan::{scan_binary, ScanOptions};
+//!
+//! // `pop rdi ; ret` and a bare `ret`.
+//! let image = RawBinary::new(&[0x5f, 0xc3], Arch::X64, Endianness::Little);
+//! let mut gadgets = scan_binary(&image, &ScanOptions { depth: 4, ..ScanOptions::default() })?;
+//! gadgets.sort_by_key(|g| rank_key(&classify(g, Arch::X64), g));
+//! // RankKey orders best-first, so the useful gadget comes first.
+//! assert_eq!(gadgets[0].text(), "pop rdi ; ret");
+//! # Ok::<(), rf_core::Error>(())
+//! ```
+//!
+//! # Semver policy
+//!
+//! Covered by semver from 1.0: the fields of [`Classification`] and its
+//! predicate methods, the [`Class`], [`Terminator`] and [`TerminatorClass`]
+//! variant sets and their [`Class::name`] spellings, and the signatures of
+//! [`classify`], [`quality_score`], [`usability`] and [`rank_key`].
+//!
+//! **Not** covered, and free to change in a minor release: **the numeric
+//! output of [`quality_score`] / [`quality_score_full`] and the tier
+//! boundaries of [`usability`]** — these are a heuristic that is expected to
+//! be re-tuned against measured precision, so compare ranks, never absolute
+//! scores; and which class a *particular* gadget earns, since a rule fix
+//! changes it (that is what TAXONOMY.md's rule numbers are for — cite the
+//! rule, not the outcome). Adding a [`Class`] or [`Terminator`] variant is a
+//! minor release. Pin `rf-classify = "1"`.
+//!
+//! See `docs/API-STABILITY.md` in the repository for the workspace-wide
+//! statement.
 
 #![forbid(unsafe_code)]
+// ENG-08: every public item carries documentation.
+#![warn(missing_docs)]
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -55,17 +152,28 @@ pub use effect::{TerminatorClass, TerminatorTarget, Transfer, ValueDst, ValueSrc
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Class {
+    /// Writes a general-purpose register (`"reg-write"`).
     RegWrite,
+    /// Moves the stack pointer to a value the payload controls
+    /// (`"stack-pivot"`).
     StackPivot,
+    /// Loads from memory (`"mem-read"`).
     MemRead,
+    /// Stores to memory (`"mem-write"`).
     MemWrite,
+    /// Computes on registers (`"arithmetic"`).
     Arithmetic,
+    /// Contains a syscall/trap instruction (`"syscall"`).
     Syscall,
+    /// Branches through a register — a JOP dispatcher (`"dispatcher"`).
     Dispatcher,
+    /// No labeled instruction: pure control flow, or a nop (`"other"`).
     Other,
 }
 
 impl Class {
+    /// The kebab-case name used on both the CLI and the MCP surface, and in
+    /// serialized output. This is the vocabulary `--class` accepts.
     pub fn name(self) -> &'static str {
         match self {
             Class::RegWrite => "reg-write",
@@ -93,14 +201,23 @@ impl Class {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Terminator {
+    /// A bare near return.
     Ret,
+    /// `ret imm16` — returns and adds a fixed amount to the stack pointer.
     RetImm,
+    /// A far return (`retf`).
     Retf,
+    /// An interrupt return (`iret`).
     Iret,
+    /// A far transfer (far `jmp`/`call`).
     Far,
+    /// An indirect jump.
     Jmp,
+    /// An indirect call.
     Call,
+    /// A syscall or trap instruction.
     Syscall,
+    /// The gadget does not transfer control at its end.
     None,
 }
 
@@ -170,6 +287,8 @@ pub struct Classification {
     /// lowercase and sigil-free (`$sp` -> `sp`, `%o0` -> `o0`), deduped, in
     /// first-appearance order.
     pub regs_written: Vec<String>,
+    /// Registers the gadget reads, normalized the same way as
+    /// [`Classification::regs_written`].
     pub regs_read: Vec<String>,
     /// The subset of `regs_written` whose value comes off the stack — a
     /// `pop`, or a load whose base register is the stack pointer. This is the
@@ -519,10 +638,15 @@ pub fn usability(c: &Classification, _g: &Gadget) -> u8 {
 /// and platforms — which is what a cursor needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct RankKey {
+    /// The usability tier, 0-3; see [`usability`].
     pub usability: u8,
+    /// The quality score; see [`quality_score`].
     pub quality: i32,
+    /// Instruction count, terminator included.
     pub n_insns: usize,
+    /// Side-effect count (TAXONOMY.md R11).
     pub side_effects: usize,
+    /// The gadget's address — the deterministic final tie-break.
     pub vaddr: u64,
 }
 
@@ -581,6 +705,12 @@ impl std::fmt::Debug for Classifier {
 }
 
 impl Classifier {
+    /// Build a classifier for `arch`, opening every capstone detail mode
+    /// that could have produced a gadget for it.
+    ///
+    /// Reuse one classifier across a whole listing: opening the detail
+    /// handles is the expensive part, and [`Classifier::classify`] takes
+    /// `&self`.
     pub fn new(arch: Arch) -> Self {
         Classifier {
             arch,
@@ -588,6 +718,7 @@ impl Classifier {
         }
     }
 
+    /// The architecture this classifier was built for.
     pub fn arch(&self) -> Arch {
         self.arch
     }
@@ -598,6 +729,10 @@ impl Classifier {
         self.arch.is_x86_family() || !self.detailers.borrow().is_empty()
     }
 
+    /// Classify one gadget.
+    ///
+    /// Prefer this over the free [`classify`] function when classifying
+    /// more than one gadget: this reuses the open decoder handles.
     pub fn classify(&self, g: &Gadget) -> Classification {
         match self.arch {
             Arch::X86 => x86::classify_x86(g, 32),

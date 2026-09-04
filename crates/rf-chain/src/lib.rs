@@ -17,6 +17,62 @@
 //!   * per-target invariant hooks ([`ChainInvariant`]) are the Phase 4b
 //!     extension point — the Win64 16-byte stack-alignment invariant lands
 //!     there; Linux execve needs no extra invariants.
+//!
+//! # Getting started
+//!
+//! ```
+//! use rf_chain::{build_linux, DataSection, LinuxChainOpts, WordKind};
+//! use rf_core::{Arch, Binary, Image};
+//! use rf_scan::{scan_binary, ScanOptions};
+//!
+//! # fn demo(bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+//! let elf = Binary::parse(bytes)?;
+//! let gadgets = scan_binary(&elf, &ScanOptions::default())?;
+//! let data: Vec<DataSection> = elf
+//!     .sections()
+//!     .iter()
+//!     .filter(|s| !s.executable)
+//!     .map(|s| DataSection { name: s.name.clone(), vaddr: s.vaddr, writable: s.writable })
+//!     .collect();
+//!
+//! let chain = build_linux(
+//!     &gadgets,
+//!     &data,
+//!     Image::arch(&elf),
+//!     "elf",
+//!     &[],
+//!     &LinuxChainOpts::default(),
+//! )?;
+//!
+//! // The IR is the point: every word knows what it is.
+//! assert!(chain.words.iter().any(|w| w.kind == WordKind::GadgetAddr));
+//! let _python = chain.to_python();
+//! let _json = chain.to_json();
+//! let _bytes = chain.to_bytes();
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Semver policy
+//!
+//! Covered by semver from 1.0: the signatures of [`build_linux`],
+//! [`build_windows_virtualprotect`], [`plan_linux`] and [`plan_windows`];
+//! the fields of [`RopChain`], [`ChainWord`], [`GadgetRef`] and
+//! [`plan::ChainPlan`]; the [`WordKind`] and [`ChainError`] variant sets;
+//! and the `--chain` target names in [`LinuxTarget::NAMES`].
+//!
+//! **Not** covered, and free to change in a patch release: **which gadgets
+//! a chain picks and therefore its exact byte payload** — a better strategy
+//! is a bug fix, and the emulator harness (`tests/emulate.py`) is what
+//! holds the behaviour, not the byte sequence; the exact Python script text
+//! beyond the ROPgadget-compatible header; and every error and comment
+//! string. Adding a [`WordKind`] variant or a chain target is a minor
+//! release. Pin `rf-chain = "1"`.
+//!
+//! See `docs/API-STABILITY.md` in the repository for the workspace-wide
+//! statement.
+
+#![warn(missing_docs)]
 
 use rf_core::Arch;
 use serde::Serialize;
@@ -62,9 +118,12 @@ fn hex_u64<S: serde::Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
 /// One machine word of the chain (8 bytes on x64, 4 on x86).
 #[derive(Debug, Clone, Serialize)]
 pub struct ChainWord {
+    /// The word's value, serialized as a hex string.
     #[serde(serialize_with = "hex_u64")]
     pub value: u64,
+    /// What this word IS - the distinction the emulator harness checks.
     pub kind: WordKind,
+    /// Human-readable note, emitted beside the word in the Python script.
     pub comment: String,
     /// Index into [`RopChain::gadgets`] for `GadgetAddr` words.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -74,8 +133,10 @@ pub struct ChainWord {
 /// A gadget referenced by the chain.
 #[derive(Debug, Clone, Serialize)]
 pub struct GadgetRef {
+    /// The gadget's address, serialized as a hex string.
     #[serde(serialize_with = "hex_u64")]
     pub vaddr: u64,
+    /// The gadget's disassembly text.
     pub text: String,
 }
 
@@ -92,6 +153,7 @@ pub struct RopChain {
     pub script_comment: String,
     /// Bytes per word (4 or 8).
     pub word_size: usize,
+    /// The chain payload, one machine word per entry, in stack order.
     pub words: Vec<ChainWord>,
     /// Distinct gadgets referenced by `GadgetAddr` words, in order of
     /// first reference; `ChainWord::source_gadget` indexes this list.
@@ -104,7 +166,12 @@ pub struct RopChain {
 pub enum ChainError {
     /// Mirrors ropmaker.py:23-40 dispatch: only ELF x86/x64 are supported.
     #[error("arch {arch} / format {format} not supported yet for the rop chain generation")]
-    Unsupported { arch: String, format: String },
+    Unsupported {
+        /// The architecture that was asked for.
+        arch: String,
+        /// The container format that was asked for.
+        format: String,
+    },
     /// A required gadget is absent from the scan output.
     #[error("can't find a suitable gadget: {0}")]
     MissingGadget(String),
@@ -114,9 +181,13 @@ pub enum ChainError {
     /// An IR invariant was violated (see [`RopChain::validate`]).
     #[error("chain word {index} (0x{value:016x}, {kind:?}): {reason}")]
     InvalidWord {
+        /// Index into [`RopChain::words`].
         index: usize,
+        /// The offending word's value.
         value: u64,
+        /// The offending word's kind.
         kind: WordKind,
+        /// Which invariant it violated.
         reason: String,
     },
 }

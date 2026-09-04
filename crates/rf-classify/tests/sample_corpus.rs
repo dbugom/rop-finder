@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! RF_SAMPLE_FIXTURE=elf-x64-bash-v4.1.5.1 RF_SAMPLE_STRIDE=757 \
-//!   cargo test -p rf-classify --test sample_corpus -- --ignored --nocapture
+//!   cargo test -p rop-finder-classify --test sample_corpus -- --ignored --nocapture
 //! ```
 //!
 //! | variable | meaning | default |

@@ -131,6 +131,7 @@ impl Default for GadgetTrie<'_> {
 }
 
 impl<'a> GadgetTrie<'a> {
+    /// An empty trie sized for roughly `gadgets` distinct texts.
     pub fn with_capacity(gadgets: usize) -> Self {
         // A gadget of k instructions adds at most k nodes, but shares its
         // whole tail with everything ending the same way, which is the
@@ -202,6 +203,7 @@ impl<'a> GadgetTrie<'a> {
         self.distinct
     }
 
+    /// True when no gadget text has been inserted.
     pub fn is_empty(&self) -> bool {
         self.distinct == 0
     }

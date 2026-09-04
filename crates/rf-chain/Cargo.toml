@@ -1,19 +1,33 @@
 [package]
-name = "rf-chain"
-description = "ROP chain builders: Chain IR + Linux execve (x86/x64)"
+# Directory `crates/rf-chain`, library target `rf_chain`, package
+# `rop-finder-chain` (see the workspace manifest).
+name = "rop-finder-chain"
+description = "ROP chain construction for rop-finder: the Chain IR, Linux execve and Windows VirtualProtect builders, and the feasibility plan"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/rop-finder-chain"
+keywords = ["rop", "ropchain", "exploit", "gadget", "execve"]
+categories = ["development-tools::debugging"]
+
+[lib]
+name = "rf_chain"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
-rf-core = { path = "../rf-core" }
-rf-scan = { path = "../rf-scan" }
+rop-finder-core.workspace = true
+rop-finder-scan.workspace = true
 # CHLX-01: the Linux fallback strategies (register transfers, non-leading
 # `pop`, displaced write-what-where, `repz ret` as a bare return) are driven
 # by v0.4's constraint query layer — `sets`/`clobbers`/`stack_delta`/
 # `transfers`/`terminator`, verified against a Unicorn ground truth — rather
 # than by re-matching disassembly text inside the builder.
-rf-classify = { path = "../rf-classify" }
+rop-finder-classify.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

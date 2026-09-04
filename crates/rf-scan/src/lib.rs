@@ -21,8 +21,115 @@
 //! decode ([`cs::RegionIndex`]) replaces it and answers each candidate with
 //! an array lookup; on x86/x64 each candidate is simply decoded, over
 //! exactly its own bytes.
+//!
+//! # Getting started
+//!
+//! [`scan_binary`] takes anything that implements [`rf_core::Image`] and a
+//! [`ScanOptions`], and hands back the finished listing: deduplicated,
+//! filtered and sorted the way ROPgadget sorts it.
+//!
+//! ```
+//! use rf_core::{Arch, Endianness, RawBinary};
+//! use rf_scan::{scan_binary, ScanOptions};
+//!
+//! // A real caller loads a file with `rf_core::Binary::load`. These bytes
+//! // are `xor eax, eax ; ret` followed by `pop rdi ; ret`.
+//! let image = RawBinary::new(&[0x31, 0xc0, 0xc3, 0x5f, 0xc3], Arch::X64, Endianness::Little);
+//!
+//! let opts = ScanOptions {
+//!     depth: 4,
+//!     ..ScanOptions::default()
+//! };
+//! let gadgets = scan_binary(&image, &opts)?;
+//!
+//! let texts: Vec<String> = gadgets.iter().map(|g| g.text()).collect();
+//! assert!(texts.iter().any(|t| t == "pop rdi ; ret"));
+//! assert!(texts.iter().any(|t| t == "xor eax, eax ; ret"));
+//! // The listing is sorted and deduplicated.
+//! let mut sorted = texts.clone();
+//! sorted.sort();
+//! assert_eq!(texts, sorted);
+//! # Ok::<(), rf_core::Error>(())
+//! ```
+//!
+//! ## Filtering
+//!
+//! Filters are engine options, not a post-pass over the listing, because
+//! several of them (`align`, `cfg_aware`) change which candidate starts are
+//! generated at all:
+//!
+//! ```
+//! use rf_core::{Arch, Endianness, RawBinary};
+//! use rf_scan::{scan_binary, ScanOptions};
+//!
+//! let image = RawBinary::new(&[0x31, 0xc0, 0xc3, 0x5f, 0xc3], Arch::X64, Endianness::Little);
+//! let opts = ScanOptions {
+//!     depth: 4,
+//!     // ROPgadget `--only`: every mnemonic must be in this set.
+//!     only: Some(["pop".to_string(), "ret".to_string()].into_iter().collect()),
+//!     ..ScanOptions::default()
+//! };
+//! let texts: Vec<String> = scan_binary(&image, &opts)?.iter().map(|g| g.text()).collect();
+//! // `xor eax, eax ; ret` is gone: `xor` is not in the set.
+//! assert_eq!(texts, vec!["pop rdi ; ret".to_string(), "ret".to_string()]);
+//! # Ok::<(), rf_core::Error>(())
+//! ```
+//!
+//! ## Bounding and cancelling a scan
+//!
+//! [`scan_binary`] is unbounded and uncancellable by construction — it
+//! resets the budget fields before it runs, so no caller can be surprised
+//! by one. To bound a scan, use [`scan_bounded`]; to stop one from another
+//! thread, put a [`CancelToken`] in the options and use either
+//! [`scan_bounded`] or [`scan_binary_into`], which are the two entry points
+//! that observe it.
+//!
+//! ```
+//! use rf_core::{Arch, Endianness, RawBinary};
+//! use rf_scan::{scan_bounded, CancelToken, Error, ScanOptions};
+//!
+//! let image = RawBinary::new(&[0x31, 0xc0, 0xc3, 0x5f, 0xc3], Arch::X64, Endianness::Little);
+//! let cancel = CancelToken::new();
+//! cancel.cancel(); // in practice: from another thread, or on a timeout
+//! let opts = ScanOptions {
+//!     depth: 4,
+//!     cancel,
+//!     max_gadgets: Some(1_000_000),
+//!     ..ScanOptions::default()
+//! };
+//! assert!(matches!(scan_bounded(&image, &opts), Err(Error::Cancelled)));
+//! ```
+//!
+//! ## Streaming
+//!
+//! For a listing too large to hold, implement [`GadgetSink`] and call
+//! [`scan_binary_into`], which never builds a `Vec`. The stream is in raw
+//! traversal order: run [`post_process`] over what you collected if you
+//! want the deduplicated, sorted listing.
+//!
+//! # Semver policy
+//!
+//! Covered by semver from 1.0: the signatures of [`scan_binary`],
+//! [`scan_binary_into`], [`scan_bounded`], [`post_process`] and
+//! [`scan_section`]; the [`GadgetSink`] trait; and the fields of
+//! [`ScanOptions`] and [`Gadget`].
+//!
+//! **Not** covered, and free to change in a patch release: **the exact
+//! disassembly text** in [`Gadget::insns`] and [`Gadget::text`] — it is
+//! whatever iced-x86 and the linked capstone print, both of which drift
+//! between releases, which is why `tests/parity.py` re-measures it rather
+//! than asserting it; which gadgets a given binary yields (a decode fix
+//! changes the set, and that is the point of a fix); and the text of any
+//! [`Error`]. Adding a field to [`ScanOptions`] is a minor release, so
+//! construct it with `..ScanOptions::default()` rather than exhaustively.
+//! Pin `rf-scan = "1"`.
+//!
+//! See `docs/API-STABILITY.md` in the repository for the workspace-wide
+//! statement.
 
 #![forbid(unsafe_code)]
+// ENG-08: every public item carries documentation.
+#![warn(missing_docs)]
 
 pub mod anchors;
 pub mod cancel;

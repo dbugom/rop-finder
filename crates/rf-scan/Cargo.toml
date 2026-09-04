@@ -1,12 +1,26 @@
 [package]
-name = "rf-scan"
-description = "Gadget scanning engine: anchor tables, resumable region decode, trie-indexed dedup, filters"
+# Directory `crates/rf-scan`, library target `rf_scan`, package
+# `rop-finder-scan` (see the workspace manifest).
+name = "rop-finder-scan"
+description = "Gadget scanning engine for rop-finder: anchor tables, resumable region decode, trie-indexed dedup, filters"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/rop-finder-scan"
+keywords = ["rop", "gadget", "ropgadget", "exploit", "disassembler"]
+categories = ["development-tools::debugging", "algorithms"]
+
+[lib]
+name = "rf_scan"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
-rf-core = { path = "../rf-core" }
+rop-finder-core.workspace = true
 goblin.workspace = true
 iced-x86.workspace = true
 memchr.workspace = true
@@ -32,9 +46,7 @@ memchr.workspace = true
 capstone = "=0.14.0"
 rayon = "1.10"
 # SCAN-01/CLI-02: ROPgadget's --filter is `re.match("({})$")` over the whole
-# mnemonic, not a suffix test. Declared here rather than in the workspace
-# table because the root Cargo.toml is owned elsewhere this release; promote
-# it to `regex.workspace = true` when rf-cli/rf-mcp need the same crate.
+# mnemonic, not a suffix test.
 regex.workspace = true
 
 [dev-dependencies]

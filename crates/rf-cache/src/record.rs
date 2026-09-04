@@ -80,8 +80,10 @@ pub struct CachedGadget {
     /// CLI-08 is a finding about how much disk this cache uses.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
+    /// The architecture the gadget was decoded as, for a fat container.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arch: Option<String>,
+    /// The `--section` the gadget's address falls in, when one was used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section: Option<String>,
     /// Phase 5 quality score (TAXONOMY.md R12), computed once at scan time.
@@ -246,6 +248,7 @@ pub struct CachedScan {
     /// crate, which fails [`CachedScan::validate`].
     #[serde(default)]
     pub version: u32,
+    /// The cached gadgets, in the order the scan produced them.
     pub gadgets: Vec<CachedGadget>,
     /// rf-mcp's `fallback_section_names` flag.
     #[serde(default)]
@@ -263,6 +266,8 @@ impl Default for CachedScan {
 }
 
 impl CachedScan {
+    /// Build a record from an rf-scan listing (the rf-cli flavour: `insns`,
+    /// no rendered `text`).
     #[must_use]
     pub fn from_scan_gadgets(gadgets: &[rf_scan::Gadget]) -> Self {
         CachedScan {

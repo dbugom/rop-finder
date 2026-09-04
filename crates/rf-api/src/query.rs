@@ -54,6 +54,18 @@ pub struct SeqPattern {
 }
 
 impl SeqPattern {
+    /// Compile a `--search` pattern. `;` separates instructions, `?` is any
+    /// one character and `%` any run of characters within one instruction.
+    ///
+    /// ```
+    /// use rf_api::query::SeqPattern;
+    ///
+    /// let p = SeqPattern::parse("pop rdi; ret")?;
+    /// assert!(p.matches(&["xor eax, eax", "pop rdi", "ret"]));
+    /// assert!(!p.matches(&["pop rdi", "pop rsi", "ret"]));
+    /// assert!(SeqPattern::parse("   ").is_err());
+    /// # Ok::<(), String>(())
+    /// ```
     pub fn parse(pattern: &str) -> Result<SeqPattern, String> {
         let mut pieces = Vec::new();
         for raw in pattern.split(';') {
@@ -252,18 +264,34 @@ pub struct Query {
 /// thirteen and a caller cannot transpose two `Option<&str>`s silently.
 #[derive(Debug, Default, Clone)]
 pub struct QuerySpec<'a> {
+    /// `--class` / `class`: keep gadgets whose PRIMARY class is one of these.
     pub class: Option<&'a str>,
+    /// `--label` / `label`: keep gadgets carrying at least one of these.
     pub label: Option<&'a str>,
+    /// `--writes-reg` / `writes_reg`: every named register must be written.
     pub writes_reg: Option<&'a str>,
+    /// `--set-reg` / `set_reg`: every named register must be SET (written
+    /// with a payload-decided value), not merely clobbered.
     pub set_reg: Option<&'a str>,
+    /// `--from-stack` / `from_stack`: narrow the write to one that
+    /// originates in a pop or a stack-pointer-relative load.
     pub from_stack: bool,
+    /// `--no-clobber` / `no_clobber`: reject gadgets clobbering any of these.
     pub no_clobber: Option<&'a str>,
+    /// `--reads-reg` / `reads_reg`: every named register must be read.
     pub reads_reg: Option<&'a str>,
+    /// `--max-stack-delta` / `max_stack_delta`: an unprovable delta is
+    /// REJECTED, never treated as 0.
     pub max_stack_delta: Option<i64>,
+    /// `--max-side-effects` / `max_side_effects` (TAXONOMY.md R11).
     pub max_side_effects: Option<usize>,
+    /// `--max-insns` / `max_insns`; the terminator counts.
     pub max_insns: Option<usize>,
+    /// `--terminator` / `terminator`: the 13-value coarse+fine vocabulary.
     pub terminator: Option<&'a str>,
+    /// `--search` / `search`: a [`SeqPattern`] over the instruction list.
     pub search: Option<&'a str>,
+    /// `--pivot` / `pivot`: the preset for `label = stack-pivot`.
     pub pivot: bool,
 }
 
@@ -271,6 +299,23 @@ pub struct QuerySpec<'a> {
 pub const PIVOT_LABEL: &str = "stack-pivot";
 
 impl Query {
+    /// Compile a [`QuerySpec`] into a predicate.
+    ///
+    /// Every unknown class, label or terminator spelling is a usage error
+    /// naming the accepted set, so a typo costs a message rather than an
+    /// empty result. An all-default spec compiles to a predicate that
+    /// accepts everything, which [`Query::is_empty`] reports.
+    ///
+    /// ```
+    /// use rf_api::query::{Query, QuerySpec};
+    ///
+    /// assert!(Query::parse(&QuerySpec::default())?.is_empty());
+    /// assert!(!Query::parse(&QuerySpec { set_reg: Some("rdi"), ..QuerySpec::default() })?
+    ///     .is_empty());
+    /// assert!(Query::parse(&QuerySpec { class: Some("nonsense"), ..QuerySpec::default() })
+    ///     .is_err());
+    /// # Ok::<(), String>(())
+    /// ```
     pub fn parse(spec: &QuerySpec<'_>) -> Result<Query, String> {
         let valid: Vec<&str> = [
             rf_classify::Class::RegWrite,

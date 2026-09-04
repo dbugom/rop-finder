@@ -939,7 +939,7 @@ fn clamp_timeout(req: Option<u64>, default: Duration) -> Duration {
 /// Parsed + validated `run_ropgadget_command` arguments.
 #[derive(Debug)]
 pub struct ParsedArgs {
-    pub request: rf_cli::ScanRequest,
+    pub request: rf_api::ScanRequest,
     /// --re post-filter (regex over gadget text). This one really is a
     /// post-filter in ROPgadget too (options.py:22-33).
     pub re: Option<String>,
@@ -948,7 +948,7 @@ pub struct ParsedArgs {
 /// ANCH-02 - parse `--align` the way ROPgadget's argparse does.
 ///
 /// ROPgadget declares `--align` as `type=int`, i.e. DECIMAL. rf-mcp used to
-/// hand the value to `rf_cli::parse_hex`, which strips an optional `0x` and
+/// hand the value to `rf_api::parse_hex`, which strips an optional `0x` and
 /// then always parses base 16, so `--align 16` meant 0x16 = 22 - a
 /// different, and for a power-of-two request nonsensical, alignment.
 /// Decimal first; hexadecimal only when the caller writes an explicit `0x`,
@@ -967,9 +967,9 @@ pub fn parse_align(v: &str) -> Result<usize, String> {
 }
 
 /// Validate `args` against the PLAN §6.1 allowlist and map them onto a
-/// [`rf_cli::ScanRequest`]. Anything outside the allowlist is rejected.
+/// [`rf_api::ScanRequest`]. Anything outside the allowlist is rejected.
 pub fn parse_ropgadget_args(args: &[String]) -> Result<ParsedArgs, ToolError> {
-    let mut req = rf_cli::ScanRequest::default();
+    let mut req = rf_api::ScanRequest::default();
     let mut re = None;
     let mut i = 0;
     while i < args.len() {
@@ -1092,8 +1092,8 @@ fn split_sections(section: Option<&str>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn query_to_request(q: &GadgetQuery, rop: bool, jop: bool, sys: bool) -> rf_cli::ScanRequest {
-    rf_cli::ScanRequest {
+fn query_to_request(q: &GadgetQuery, rop: bool, jop: bool, sys: bool) -> rf_api::ScanRequest {
+    rf_api::ScanRequest {
         depth: q.depth.unwrap_or(10),
         rop,
         jop,
@@ -1151,8 +1151,8 @@ struct FindRequest {
 /// rather than `CS_MODE_32` — so those print 16 digits despite 4-byte
 /// pointers (raw.py:54-67). Reproduced so a hit's address column matches
 /// the CLI's and the oracle's.
-fn search_addr_size(target: &rf_cli::Target, arch: rf_core::Arch) -> usize {
-    if matches!(target, rf_cli::Target::Raw(_))
+fn search_addr_size(target: &rf_api::Target, arch: rf_core::Arch) -> usize {
+    if matches!(target, rf_api::Target::Raw(_))
         && matches!(arch, rf_core::Arch::Arm | rf_core::Arch::ArmThumb)
     {
         return 8;
@@ -1374,7 +1374,7 @@ impl RopFinderMcp {
         rop: bool,
         jop: bool,
         sys: bool,
-    ) -> Result<rf_cli::ScanRequest, ToolError> {
+    ) -> Result<rf_api::ScanRequest, ToolError> {
         let depth = self.check_depth(q.depth)?;
         let mut req = query_to_request(q, rop, jop, sys);
         req.depth = depth;
@@ -1490,7 +1490,7 @@ impl RopFinderMcp {
         &self,
         ctx: &RequestContext<RoleServer>,
         rec: &mut AuditRecord,
-        req: rf_cli::ScanRequest,
+        req: rf_api::ScanRequest,
         binary_path: &str,
         post: PostOpts,
     ) -> Result<ScanResponse, ToolError> {
@@ -1574,7 +1574,7 @@ impl RopFinderMcp {
                 // so it does not change when the caller shifts the reported
                 // addresses.
                 let offset = match &req.offset {
-                    Some(o) => rf_cli::parse_hex(o, "--offset")
+                    Some(o) => rf_api::parse_hex(o, "--offset")
                         .map_err(|e| ToolError::new(ErrorCode::UsageError, e))?,
                     None => 0,
                 };
@@ -1600,7 +1600,7 @@ impl RopFinderMcp {
                     let product =
                         scan::scan_bytes_cancellable(&bytes, &req, &cancel, max_gadgets, None)
                             .map_err(scan::ScanFail::to_tool_error)?;
-                    let arch = product.universal_arch.map(rf_cli::arch_name);
+                    let arch = product.universal_arch.map(rf_api::arch_name);
                     let addr_size = product.addr_size;
                     let selected = product.selected_sections;
                     let id_ctx = semantics::IdContext {
@@ -1616,13 +1616,13 @@ impl RopFinderMcp {
                     for g in &product.gadgets {
                         let cls = classifier.as_ref().map(|c| c.classify(g));
                         gadgets.push(CachedGadget {
-                            vaddr: rf_cli::fmt_addr(g.vaddr, addr_size),
+                            vaddr: rf_api::fmt_addr(g.vaddr, addr_size),
                             bytes: g.bytes_hex(),
                             text: g.text(),
                             arch: arch.map(str::to_string),
                             section: selected
                                 .as_deref()
-                                .and_then(|s| rf_cli::section_of(s, g.vaddr.wrapping_sub(offset))),
+                                .and_then(|s| rf_api::section_of(s, g.vaddr.wrapping_sub(offset))),
                             quality: cls.as_ref().map(|c| c.quality),
                             class: cls.as_ref().map(|c| c.primary.name().to_string()),
                             // CRIT-03: `delay_slot` is computed by the engine
@@ -1859,18 +1859,18 @@ impl RopFinderMcp {
         let binary_label = confined.label.clone();
         let base_value = base
             .as_deref()
-            .map(|b| rf_cli::parse_hex(b, "base"))
+            .map(|b| rf_api::parse_hex(b, "base"))
             .transpose()
             .map_err(|e| ToolError::new(ErrorCode::UsageError, e))?;
         let offset_value = offset
             .as_deref()
-            .map(|o| rf_cli::parse_hex(o, "offset"))
+            .map(|o| rf_api::parse_hex(o, "offset"))
             .transpose()
             .map_err(|e| ToolError::new(ErrorCode::UsageError, e))?
             .unwrap_or(0);
         let range_value = range
             .as_deref()
-            .map(rf_cli::parse_range)
+            .map(rf_api::parse_range)
             .transpose()
             .map_err(|e| ToolError::new(ErrorCode::UsageError, e))?
             .flatten();
@@ -1886,20 +1886,20 @@ impl RopFinderMcp {
         > {
             let bytes = confined.read_all(max_file_bytes)?;
             let file_hash = sha256_hex(&bytes);
-            let target = rf_cli::load_target(&bytes, None).map_err(scan_err_to_tool)?;
+            let target = rf_api::load_target(&bytes, None).map_err(scan_err_to_tool)?;
             // CORE-03: a fat container is refused rather than searched as a
             // concatenation, exactly as a scan of one is.
-            let selected = rf_cli::resolve_arch(&target, arch.as_deref(), false)
+            let selected = rf_api::resolve_arch(&target, arch.as_deref(), false)
                 .map_err(scan_err_to_tool)?;
             let slice = match (&target, selected) {
-                (rf_cli::Target::Universal(u), Some(a)) => {
+                (rf_api::Target::Universal(u), Some(a)) => {
                     Some(u.select(a).map_err(|e| {
                         ToolError::new(ErrorCode::UsageError, e.to_string())
                     })?)
                 }
                 _ => None,
             };
-            let view = rf_cli::build_view_selected(&target, selected);
+            let view = rf_api::build_view_selected(&target, selected);
             let image_base = view.base;
             let delta = base_value.map_or(0, |b| b.wrapping_sub(image_base));
             let opts = find::SearchOpts {
@@ -2075,7 +2075,7 @@ impl RopFinderMcp {
         > {
             let bytes = confined.read_all(max_file_bytes)?;
             let file_hash = sha256_hex(&bytes);
-            let target = rf_cli::load_target(&bytes, None).map_err(scan_err_to_tool)?;
+            let target = rf_api::load_target(&bytes, None).map_err(scan_err_to_tool)?;
             let out = checksec::report(&target, file_hash.clone(), label);
             let facts = ScanFacts {
                 sha256: file_hash,
@@ -2118,7 +2118,7 @@ impl RopFinderMcp {
         let base = q
             .base
             .as_deref()
-            .map(|b| rf_cli::parse_hex(b, "--base"))
+            .map(|b| rf_api::parse_hex(b, "--base"))
             .transpose()
             .map_err(|e| ToolError::new(ErrorCode::UsageError, e))?;
         let timeout = clamp_timeout(q.timeout_secs, self.config.timeout);
@@ -2132,7 +2132,7 @@ impl RopFinderMcp {
             move |_cancel: rf_scan::CancelToken| -> Result<(InfoResponse, ScanFacts), ToolError> {
                 let bytes = confined.read_all(max_file_bytes)?;
                 let file_hash = sha256_hex(&bytes);
-                let mut v = rf_cli::info_bytes(&bytes, None, base).map_err(scan_err_to_tool)?;
+                let mut v = rf_api::info_bytes(&bytes, None, base).map_err(scan_err_to_tool)?;
                 let warnings = truncate_info(&mut v, max_sections, max_imports, max_symbols);
                 let out = InfoResponse::from_value(v, file_hash.clone(), warnings);
                 let facts = ScanFacts {
@@ -2171,13 +2171,13 @@ impl RopFinderMcp {
         rec: &mut AuditRecord,
         q: ChainQuery,
     ) -> Result<ChainResponse, ToolError> {
-        if !rf_cli::chain_targets().contains(&q.target.as_str()) {
+        if !rf_api::chain_targets().contains(&q.target.as_str()) {
             return Err(ToolError::new(
                 ErrorCode::UsageError,
                 format!(
                     "unknown chain target {:?}; supported: {}",
                     q.target,
-                    rf_cli::chain_targets().join(", ")
+                    rf_api::chain_targets().join(", ")
                 ),
             ));
         }
@@ -2195,12 +2195,12 @@ impl RopFinderMcp {
         // chain_base / syscall_args value is a usage error on both surfaces
         // with the same accepted set (tests/capability_matrix.py gates it).
         if spec.target == "windows-virtualprotect" {
-            rf_cli::win_opts(&spec).map_err(scan_err_to_tool)?;
+            rf_api::win_opts(&spec).map_err(scan_err_to_tool)?;
         } else {
-            rf_cli::linux_opts(&spec).map_err(scan_err_to_tool)?;
+            rf_api::linux_opts(&spec).map_err(scan_err_to_tool)?;
         }
 
-        // NOTE (MCP-03, residual): `rf_cli::chain_bytes` runs its own scan
+        // NOTE (MCP-03, residual): `rf_api::chain_bytes` runs its own scan
         // and has no token seam, so a chain build is bounded by the
         // timeout and the join rather than interrupted mid-scan. `depth`
         // is already capped at `--max-depth`, and a worker that does not
@@ -2215,9 +2215,9 @@ impl RopFinderMcp {
                 let bytes = confined.read_all(max_file_bytes)?;
                 let file_hash = sha256_hex(&bytes);
                 let outcome =
-                    rf_cli::chain_bytes(&bytes, None, &req, &spec).map_err(scan_err_to_tool)?;
+                    rf_api::chain_bytes(&bytes, None, &req, &spec).map_err(scan_err_to_tool)?;
                 let offset = match &offset_hex {
-                    Some(o) => rf_cli::parse_hex(o, "--offset")
+                    Some(o) => rf_api::parse_hex(o, "--offset")
                         .map_err(|e| ToolError::new(ErrorCode::UsageError, e))?,
                     None => 0,
                 };
@@ -2256,13 +2256,13 @@ impl RopFinderMcp {
         rec: &mut AuditRecord,
         q: ChainQuery,
     ) -> Result<schema::PlanResponse, ToolError> {
-        if !rf_cli::chain_targets().contains(&q.target.as_str()) {
+        if !rf_api::chain_targets().contains(&q.target.as_str()) {
             return Err(ToolError::new(
                 ErrorCode::UsageError,
                 format!(
                     "unknown chain target {:?}; supported: {}",
                     q.target,
-                    rf_cli::chain_targets().join(", ")
+                    rf_api::chain_targets().join(", ")
                 ),
             ));
         }
@@ -2276,9 +2276,9 @@ impl RopFinderMcp {
         let req = chain_scan_request(&q, depth, self.config.max_gadgets);
         let spec = chain_spec(&q);
         if spec.target == "windows-virtualprotect" {
-            rf_cli::win_opts(&spec).map_err(scan_err_to_tool)?;
+            rf_api::win_opts(&spec).map_err(scan_err_to_tool)?;
         } else {
-            rf_cli::linux_opts(&spec).map_err(scan_err_to_tool)?;
+            rf_api::linux_opts(&spec).map_err(scan_err_to_tool)?;
         }
         let binary_label = label.clone();
         let offset_hex = q.offset.clone();
@@ -2289,12 +2289,12 @@ impl RopFinderMcp {
             let bytes = confined.read_all(max_file_bytes)?;
             let file_hash = sha256_hex(&bytes);
             let offset = match &offset_hex {
-                Some(o) => rf_cli::parse_hex(o, "--offset")
+                Some(o) => rf_api::parse_hex(o, "--offset")
                     .map_err(|e| ToolError::new(ErrorCode::UsageError, e))?,
                 None => 0,
             };
             let outcome =
-                rf_cli::plan_chain_bytes(&bytes, None, &req, &spec).map_err(scan_err_to_tool)?;
+                rf_api::plan_chain_bytes(&bytes, None, &req, &spec).map_err(scan_err_to_tool)?;
             let out = plan_response(&outcome, file_hash.clone(), binary_label, offset);
             let facts = ScanFacts {
                 sha256: file_hash,
@@ -2423,8 +2423,8 @@ fn chain_scan_request(
     q: &ChainQuery,
     depth: usize,
     max_gadgets: Option<usize>,
-) -> rf_cli::ScanRequest {
-    rf_cli::ScanRequest {
+) -> rf_api::ScanRequest {
+    rf_api::ScanRequest {
         depth,
         rop: true,
         jop: true,
@@ -2453,8 +2453,8 @@ fn chain_scan_request(
 /// The `ChainSpec` for a query. Shared by `build_rop_chain` and
 /// `plan_chain`, and identical field for field to what the CLI builds from
 /// its flags (ECO-02).
-fn chain_spec(q: &ChainQuery) -> rf_cli::ChainSpec {
-    rf_cli::ChainSpec {
+fn chain_spec(q: &ChainQuery) -> rf_api::ChainSpec {
+    rf_api::ChainSpec {
         target: q.target.clone(),
         api_addr: q.api_addr.clone(),
         api_name: q.api_name.clone(),
@@ -2472,7 +2472,7 @@ fn chain_spec(q: &ChainQuery) -> rf_cli::ChainSpec {
 /// `ECO-04`: the plan, with every satisfying gadget carrying the same
 /// stable id `find_gadgets` handed out — so `get_gadgets` resolves it.
 fn plan_response(
-    outcome: &rf_cli::ChainPlanOutcome,
+    outcome: &rf_api::ChainPlanOutcome,
     binary_sha256: String,
     binary_label: String,
     offset: u64,
@@ -2492,10 +2492,10 @@ fn plan_response(
 ///
 /// The chain IR carries only `{vaddr, text}` per gadget, and an id needs the
 /// gadget's BYTES — so they are recovered from the scan the chain was built
-/// from, which `rf_cli::chain_bytes` hands back. Where a gadget cannot be
+/// from, which `rf_api::chain_bytes` hands back. Where a gadget cannot be
 /// matched the id is `null` rather than fabricated.
 fn chain_response(
-    outcome: &rf_cli::ChainOutcome,
+    outcome: &rf_api::ChainOutcome,
     binary_sha256: String,
     binary_label: String,
     offset: u64,
@@ -2585,13 +2585,13 @@ fn params_hash<T: serde::Serialize>(q: &T) -> String {
 /// `not_found`, because every chain failure the builders produce is "this
 /// binary does not contain a gadget I need". The precise reason survives in
 /// the message and in the audit line's `kind`.
-fn scan_err_to_tool(e: rf_cli::ScanError) -> ToolError {
+fn scan_err_to_tool(e: rf_api::ScanError) -> ToolError {
     match e {
-        rf_cli::ScanError::Usage(m) => ToolError::new(ErrorCode::UsageError, m),
-        rf_cli::ScanError::Binary(m) => {
+        rf_api::ScanError::Usage(m) => ToolError::new(ErrorCode::UsageError, m),
+        rf_api::ScanError::Binary(m) => {
             ToolError::new(ErrorCode::UnsupportedBinary, m).with_kind("binary_error")
         }
-        rf_cli::ScanError::Chain(m) => {
+        rf_api::ScanError::Chain(m) => {
             ToolError::with_details(ErrorCode::NotFound, m, json!({"what": "chain_gadget"}))
                 .with_kind("chain_error")
         }
@@ -2721,7 +2721,7 @@ impl RopFinderMcp {
         let (mut rec, t0) = self.begin(&ctx, "find_gadgets_by_effect", params_hash(&q));
         let out = async {
             let depth = self.check_depth(q.depth)?;
-            let req = rf_cli::ScanRequest {
+            let req = rf_api::ScanRequest {
                 depth,
                 // All three families: the question is about the effect, and
                 // `terminator` is how a caller narrows it. A `jmp-reg`
@@ -2926,7 +2926,7 @@ impl RopFinderMcp {
                 ));
             }
             let depth = self.check_depth(q.depth)?;
-            let req = rf_cli::ScanRequest {
+            let req = rf_api::ScanRequest {
                 depth,
                 rop: true,
                 jop: true,
@@ -3050,7 +3050,7 @@ impl RopFinderMcp {
         let (mut rec, t0) = self.begin(&ctx, "search_gadgets_by_pattern", params_hash(&q));
         let out = async {
             let depth = self.check_depth(q.depth)?;
-            let req = rf_cli::ScanRequest {
+            let req = rf_api::ScanRequest {
                 depth,
                 rop: true,
                 jop: true,
@@ -3491,7 +3491,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// ROPgadget's `--align` is argparse `type=int`. rf-mcp parsed it with
-    /// `rf_cli::parse_hex`, which always parses base 16, so `--align 16`
+    /// `rf_api::parse_hex`, which always parses base 16, so `--align 16`
     /// meant 0x16 = 22 and `--align 10` meant 16. Decimal first; hex only
     /// with an explicit `0x`.
     #[test]
@@ -3507,7 +3507,7 @@ mod tests {
         }
         // The old behaviour, spelled out so a regression is unmistakable:
         // parse_hex("16") is 22, and that is what this test forbids.
-        assert_eq!(rf_cli::parse_hex("16", "x").unwrap(), 22);
+        assert_eq!(rf_api::parse_hex("16", "x").unwrap(), 22);
         assert_ne!(parse_align("16").unwrap() as u64, 22);
     }
 

@@ -188,9 +188,9 @@ cosmetic lint.
 | `load_pe` | `PeBinary::parse` + accessors + `Binary::load` | PE loader; **this is the `ROB-02` target** |
 | `load_macho` | `MachOBinary::parse` + `image_base()` + `rebase()` | Mach-O loader; `image_base` is `CORE-02` |
 | `load_universal` | `UniversalBinary::parse` + per-slice accessors | fat header = count + N (offset,size) triples, the classic amplification shape |
-| `cli_info_bytes` | `rf_cli::info_bytes` ×3 (auto, rebased, forced-raw) | the whole `--info` pipeline; cheapest target, run it longest |
-| `cli_scan_bytes` | `rf_cli::scan_bytes` at depth 2–5 | load → view → scan → post_process |
-| `cli_scan_raw` | `rf_cli::scan_bytes` with a forced `--rawArch` | **the decode engine**: arbitrary bytes into iced-x86 and into capstone's C code for all 14 architectures |
+| `cli_info_bytes` | `rf_api::info_bytes` ×3 (auto, rebased, forced-raw) | the whole `--info` pipeline; cheapest target, run it longest |
+| `cli_scan_bytes` | `rf_api::scan_bytes` at depth 2–5 | load → view → scan → post_process |
+| `cli_scan_raw` | `rf_api::scan_bytes` with a forced `--rawArch` | **the decode engine**: arbitrary bytes into iced-x86 and into capstone's C code for all 14 architectures |
 
 ### Why four loader targets rather than one with a format-selector byte
 

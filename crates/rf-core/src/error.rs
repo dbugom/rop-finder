@@ -21,7 +21,10 @@ pub enum Error {
     /// prints `[Error] ELF.getArch() - Architecture not supported` and
     /// `core.py:33` then aborts with exit 1 and zero gadgets).
     #[error("unsupported architecture: machine type {machine:#x} ({machine}) is not one rop-finder can disassemble; refusing rather than emitting fabricated gadgets")]
-    UnsupportedArch { machine: u64 },
+    UnsupportedArch {
+        /// The `e_machine` / `cputype` value the container declared.
+        machine: u64,
+    },
 }
 
 impl From<goblin::error::Error> for Error {

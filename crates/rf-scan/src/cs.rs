@@ -40,9 +40,13 @@ use crate::engine::{
 /// Static per-arch capstone configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct CsSpec {
+    /// capstone's architecture constant (`CS_ARCH_*`).
     pub arch: CsArch,
+    /// capstone's mode bits (`CS_MODE_*`).
     pub mode: Mode,
+    /// Explicit byte order, where capstone needs one.
     pub endian: Option<CsEndian>,
+    /// Enable the RISC-V compressed (`C`) extension.
     pub riscv_compressed: bool,
     /// RISC-V last-instruction size check (gadgets.py:109-112).
     pub is_riscv: bool,
@@ -403,6 +407,7 @@ impl RegionIndex {
         self.run.len()
     }
 
+    /// True when the index holds no slots (test/diagnostic accessor).
     pub fn is_empty(&self) -> bool {
         self.run.is_empty()
     }

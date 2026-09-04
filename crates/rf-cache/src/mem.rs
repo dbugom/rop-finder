@@ -58,18 +58,23 @@ impl Default for MemLimits {
 /// Counters for `get_server_stats` (MCP-09).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MemStats {
+    /// Lookups served from the cache.
     pub hits: u64,
+    /// Lookups that found nothing.
     pub misses: u64,
     /// Entries dropped because they were older than the TTL.
     pub expired: u64,
+    /// Entries added.
     pub inserted: u64,
     /// Entries dropped to stay under `max_bytes`.
     pub evicted: u64,
+    /// Bytes reclaimed by those evictions.
     pub evicted_bytes: u64,
     /// Entries never stored because one of them exceeds the whole budget.
     pub too_large: u64,
     /// Live values, filled in by [`MemCache::stats`].
     pub entries: u64,
+    /// Live retained bytes, filled in by [`MemCache::stats`].
     pub bytes: u64,
 }
 
@@ -119,6 +124,7 @@ pub fn now_unix() -> u64 {
 }
 
 impl MemCache {
+    /// An empty cache bounded by `limits`.
     #[must_use]
     pub fn new(limits: MemLimits) -> Self {
         MemCache {
@@ -127,6 +133,7 @@ impl MemCache {
         }
     }
 
+    /// The budget this cache was built with.
     #[must_use]
     pub fn limits(&self) -> MemLimits {
         self.limits
@@ -269,11 +276,13 @@ impl MemCache {
         self.inner().map.len()
     }
 
+    /// True when the cache holds nothing.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Drop every entry.
     pub fn clear(&self) {
         let mut g = self.inner();
         g.map.clear();

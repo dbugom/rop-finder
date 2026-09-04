@@ -12,7 +12,7 @@
 //!
 //! * **`CHLX-01` — per-requirement fallback strategies.**  The oracle needs a
 //!   *literal, leading* `xor rax, rax`, `pop rdi`, `pop rsi`, `pop rdx` and
-//!   `syscall`, and aborts when any one is missing.  [`plan_set_reg`] instead
+//!   `syscall`, and aborts when any one is missing.  `plan_set_reg` instead
 //!   asks the v0.4 constraint layer ([`rf_classify`]) which gadgets can put a
 //!   chosen value in a register at all, and tries, in order:
 //!     1. a `pop` **anywhere** in a gadget's payload window, not just the
@@ -53,7 +53,7 @@
 //! --------------------------
 //!   * search order: the gadget list is REVERSED first — "to find the
 //!     smaller gadget" (ropmakerx64.py:136-137);
-//!   * [`find_exact`] (`__lookingForSomeThing`): first instruction equal to
+//!   * `find_exact` (`__lookingForSomeThing`): first instruction equal to
 //!     the wanted text, every following instruction a `pop` or a bare `ret`
 //!     (`ret 0x6` & co. rejected — they ruin the stack pointer).  It is still
 //!     how the `syscall` / `int 0x80` / increment-ladder gadgets are found,
@@ -82,8 +82,11 @@ use crate::{arch_name, ChainError, ChainWord, GadgetRef, RopChain, WordKind};
 /// applies them, like ROPgadget's `liboffset`).
 #[derive(Debug, Clone)]
 pub struct DataSection {
+    /// The section's name, as the container spells it.
     pub name: String,
+    /// The section's address, rebase and `--offset` already applied.
     pub vaddr: u64,
+    /// Whether the section is writable - a string write needs this.
     pub writable: bool,
 }
 
@@ -131,6 +134,7 @@ const TLS_SECTIONS: &[&str] = &[".tdata", ".tbss"];
 /// write address may slide inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteWindow {
+    /// The section the window lives in.
     pub name: String,
     /// First usable address.
     pub base: u64,
@@ -1373,6 +1377,7 @@ impl LinuxTarget {
         "linux-srop",
     ];
 
+    /// Parse a `--chain` value; `None` for anything not in [`Self::NAMES`].
     pub fn parse(s: &str) -> Option<LinuxTarget> {
         Some(match s {
             "linux-execve" => LinuxTarget::Execve,
@@ -1384,6 +1389,7 @@ impl LinuxTarget {
         })
     }
 
+    /// The `--chain` spelling of this target.
     pub fn as_str(self) -> &'static str {
         match self {
             LinuxTarget::Execve => "linux-execve",
@@ -1414,6 +1420,7 @@ pub const DEFAULT_LINUX_LEN: u64 = 0x1000;
 /// behaviour, so `LinuxChainOpts::default()` is the old builder.
 #[derive(Debug, Clone)]
 pub struct LinuxChainOpts {
+    /// Which Linux chain to build.
     pub target: LinuxTarget,
     /// `--syscall <n>`: the syscall number for `linux-syscall`, and the
     /// number the SROP frame is built around. `None` = the target's own.

@@ -193,6 +193,64 @@ jobs:
         run: cargo audit
 
   # ------------------------------------------------------------------------
+  # ENG-08/ECO-10 - v1.0.0's packaging exit criterion, as a gate rather than a
+  # one-off: `cargo publish --dry-run` must succeed for every crate marked
+  # published. It packages, strips the path deps and BUILDS the tarball, so it
+  # catches the two failures a normal `cargo build` cannot see - a file that is
+  # not in the package (a dependency on something outside the crate directory)
+  # and an internal dependency that lost its `version` and so could never
+  # resolve for a consumer.
+  #
+  # IT NEVER UPLOADS. There is no token in this job and no step without
+  # --dry-run. The bootstrap config is explained in .cargo/publish-dry-run.toml
+  # and in docs/PUBLISHING.md section 7: before the first real publish, a
+  # dependent crate cannot resolve its siblings from crates.io because they are
+  # not there yet, so the verification build is pointed at the local paths.
+  # After the first release this job keeps working with or without it.
+  # ------------------------------------------------------------------------
+  package:
+    name: cargo publish --dry-run (ENG-08)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal --no-self-update
+          cargo --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: package-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: package-${{ runner.os }}-cargo-
+
+      # Dependency order, exactly as docs/PUBLISHING.md section 6 lists it.
+      - name: Dry-run every published crate
+        run: |
+          set -euo pipefail
+          for p in rop-finder-core rop-finder-scan rop-finder-classify rop-finder-chain rop-finder-cache rop-finder-api rop-finder rop-finder-mcp; do
+            echo "=== $p"
+            cargo publish --dry-run -p "$p" --config .cargo/publish-dry-run.toml
+          done
+
+      # rf-bench is publish = false on purpose (a bench harness that cannot run
+      # without the fixture corpus). If someone deletes that key, this fails and
+      # says why, instead of the crate quietly becoming publishable.
+      - name: rf-bench stays unpublished
+        run: |
+          set -euo pipefail
+          if cargo publish --dry-run -p rf-bench --config .cargo/publish-dry-run.toml; then
+            echo "::error::rf-bench is meant to be publish = false - see docs/PUBLISHING.md section 1" >&2
+            exit 1
+          fi
+          echo "rf-bench refused, as intended"
+
+  # ------------------------------------------------------------------------
   # CLAIM-04 - PLAN section 9 defines four "continuous" gates (parity harness,
   # criterion suite frozen in CI, cargo-fuzz "no panic, structured error",
   # property/schema tests). Before this block none of them ran anywhere: the
@@ -241,8 +299,8 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/venv-oracle"
           "$RUNNER_TEMP/venv-oracle/bin/pip" install --disable-pip-version-check capstone==5.0.7
 
-      - name: cargo build --release -p rf-cli
-        run: cargo build --release -p rf-cli
+      - name: cargo build --release -p rop-finder
+        run: cargo build --release -p rop-finder
 
       # The oracle is not bit-identical across platforms: python-capstone ships
       # a prebuilt libcapstone per wheel, and the macOS and Windows reference
@@ -362,8 +420,8 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/venv-oracle"
           "$RUNNER_TEMP/venv-oracle/bin/pip" install --disable-pip-version-check capstone==5.0.7
 
-      - name: cargo build --release -p rf-cli
-        run: cargo build --release -p rf-cli
+      - name: cargo build --release -p rop-finder
+        run: cargo build --release -p rop-finder
 
       # Extracts every quantitative claim from README/MANUAL/PLAN and resolves
       # it against live measurement or the committed parity baseline, so the
@@ -420,8 +478,8 @@ jobs:
           restore-keys: capmatrix-${{ runner.os }}-cargo-
 
       # Both front ends, because the gate is that they agree.
-      - name: cargo build --release -p rf-cli -p rf-mcp
-        run: cargo build --release -p rf-cli -p rf-mcp
+      - name: cargo build --release -p rop-finder -p rop-finder-mcp
+        run: cargo build --release -p rop-finder -p rop-finder-mcp
 
       # No ROPgadget oracle: this gate compares rop-finder against itself.
       - name: tests/capability_matrix.py
@@ -467,8 +525,8 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/venv-oracle"
           "$RUNNER_TEMP/venv-oracle/bin/pip" install --disable-pip-version-check capstone==5.0.7
 
-      - name: cargo build --release -p rf-cli
-        run: cargo build --release -p rf-cli
+      - name: cargo build --release -p rop-finder
+        run: cargo build --release -p rop-finder
 
       - name: tests/flag_conformance.py
         env:

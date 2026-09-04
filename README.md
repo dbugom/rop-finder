@@ -40,8 +40,13 @@ Second caveat, unchanged from v0.1.1: the small fixtures (raw-x86.raw, the
 RISC-V pair, pe-ARMv7) show 10-12x, but those runs are dominated by CPython's
 interpreter startup rather than scan work and are not evidence for anything.
 
-The full design rationale lives in [`../PLAN.md`](../PLAN.md). ROPgadget
-remains the parity oracle; its source is cloned at `../ropgadget`.
+ROPgadget remains the parity oracle. Two things this repository refers to
+live *outside* it: `../PLAN.md`, the original design document, and
+`../ropgadget`, the oracle checkout the parity harnesses run against. Neither
+is needed to install, use or build rop-finder — only the three harnesses that
+compare against it (`tests/parity.py`, `tests/chain_parity.py`,
+`tests/flag_conformance.py`) want the oracle, and each says so when it is
+missing.
 
 **📖 User documentation: [MANUAL.md](MANUAL.md)** — installation, concepts,
 CLI reference, and 9 scenario-based use cases (ASLR workflows, ring0 kernel
@@ -49,23 +54,116 @@ gadget discovery, chain generation, MCP/AI-agent setup, …). It also carries
 the [ROPgadget flag-coverage table](MANUAL.md#ropgadget-flag-coverage) and
 the [list of known divergences](MANUAL.md#known-divergences) from the oracle.
 
+## Install
+
+```sh
+cargo install rop-finder        # the CLI  -> `rop-finder`
+cargo install rop-finder-mcp    # the MCP server -> `rop-finder-mcp`
+```
+
+> **Not uploaded yet.** As of this commit the 1.0.0 release is *packaged and
+> verified* — `cargo publish --dry-run` succeeds for all eight published
+> crates — but nothing has been sent to crates.io, so the two lines above will
+> not resolve until a maintainer runs the release in
+> [`docs/PUBLISHING.md`](docs/PUBLISHING.md) §6. Build from a checkout until
+> then; the instructions below work today.
+
+**Prerequisites.** Rust 1.88 or newer (the declared MSRV; `rust-toolchain.toml`
+pins 1.89.0 for development) and a C toolchain — `capstone-sys` builds the
+vendored C capstone that drives every non-x86 architecture. Nothing else: no
+Python, no ROPgadget, no system capstone. Python is needed only to run this
+repository's own gates.
+
+From a checkout instead:
+
+```sh
+git clone <this repository> && cd rop-finder
+cargo build --release -p rop-finder -p rop-finder-mcp
+# -> target/release/rop-finder, target/release/rop-finder-mcp
+```
+
+There are deliberately no prebuilt binaries committed in this repository;
+[`dist/README.md`](dist/README.md) explains why (`ENG-09`) and describes the
+release artifacts `.github/workflows/release.yml` is configured to produce —
+`SHA256SUMS` over every artifact, and macOS builds codesigned with a hardened
+runtime and notarized. That workflow has never run (this checkout has no git
+remote), so **no release artifact of this project exists yet**; build from
+source.
+
+### Using it as a library
+
+The engine is split into crates a third party can build against — that is
+what `ENG-08`/`ECO-10` were about, and at 1.0.0 they are packaged for
+crates.io (with the caveat in the note above). **Package names carry the product prefix; the
+`use` names do not**, because cargo names an extern after the library target:
+
+| `cargo add …` | `use …` | What it gives you |
+|---|---|---|
+| `rop-finder-api` | `rf_api` | **Start here.** `ScanRequest` → `scan_bytes` / `info_bytes` / `chain_bytes`, the cancellable twins, the constraint query. What both front ends call. |
+| `rop-finder-core` | `rf_core` | Loaders: ELF, PE, Mach-O, fat Mach-O, raw; sections, rebasing, mitigations, symbols. |
+| `rop-finder-scan` | `rf_scan` | The engine: `ScanOptions`, `Gadget`, the streaming sink, the cancel token. |
+| `rop-finder-classify` | `rf_classify` | What a gadget does: class, labels, sets/clobbers, stack delta, terminator, rank. |
+| `rop-finder-chain` | `rf_chain` | Chain IR and the Linux/Windows builders. |
+| `rop-finder-cache` | `rf_cache` | The authenticated, bounded scan cache both front ends share. |
+
+```toml
+[dependencies]
+rop-finder-api = "1"
+```
+
+```rust
+use rf_api::{scan_bytes, ScanRequest};
+
+let bytes = std::fs::read("/bin/ls").unwrap();
+let req = ScanRequest { depth: 8, ..ScanRequest::default() };
+let out = scan_bytes(&bytes, None, &req).unwrap();
+for g in &out.result.gadgets {
+    println!("0x{:x} : {}", g.vaddr, g.text());
+}
+```
+
+What is covered by semver and what deliberately is not — the human output
+format, the exact gadget text, quality scores, error strings, the on-disk
+cache format — is [`docs/API-STABILITY.md`](docs/API-STABILITY.md). Which
+crate is published, under which name, and in which order they go out is
+[`docs/PUBLISHING.md`](docs/PUBLISHING.md). Pin the same major on every
+`rop-finder-*` crate: `rf_scan::Gadget` appears in `rf_classify`'s and
+`rf_chain`'s signatures, so two majors in one graph are two incompatible
+types.
+
 ## Layout
+
+Directory names keep the short `rf-` prefix; the crates.io package names do
+not (`rf-core` and `rf-cli` are unrelated crates owned by other people —
+`docs/PUBLISHING.md` §2).
 
 ```
 crates/
-  rf-core/      # binary loaders (goblin): ELF, PE, Mach-O, Universal, Raw
-  rf-scan/      # anchor tables, resumable region decode, trie-indexed dedup,
-                # iced-x86 (x86/x64) + capstone-rs (all other arches), rayon
-  rf-classify/  # (Phase 5) semantic classification of gadgets
-  rf-chain/     # Chain IR + Linux execve chain builders (x86 int 0x80,
-                # x64 syscall), ported from ROPgadget's ropmaker
-  rf-cli/       # `rop-finder` command line tool (clap) + shared scan
-                # orchestration library (ScanRequest → scan_bytes/info_bytes)
-  rf-mcp/       # `rop-finder-mcp` MCP server (rmcp SDK, stdio only)
+  rf-core/      # rop-finder-core:     binary loaders (goblin): ELF, PE,
+                # Mach-O, Universal, Raw; mitigations; symbols
+  rf-scan/      # rop-finder-scan:     anchor tables, resumable region decode,
+                # trie-indexed dedup, iced-x86 (x86/x64) + capstone-rs (all
+                # other arches), rayon
+  rf-classify/  # rop-finder-classify: semantic classification, the constraint
+                # predicates, quality/usability ranking
+  rf-chain/     # rop-finder-chain:    Chain IR + Linux execve/mprotect/
+                # syscall/ret2libc/SROP and Windows VirtualProtect builders
+  rf-cache/     # rop-finder-cache:    the one authenticated, bounded scan
+                # cache, shared by both front ends
+  rf-api/       # rop-finder-api:      shared request/option layer:
+                # ScanRequest, the option building, scan_bytes/info_bytes/
+                # chain_bytes and the cancellable twin, and the query layer
+  rf-cli/       # rop-finder:          the `rop-finder` CLI (clap), output
+                # formats, cache directory policy, interactive console
+  rf-mcp/       # rop-finder-mcp:      the `rop-finder-mcp` MCP server
+                # (rmcp SDK, stdio only)
+  rf-bench/     # not published:       criterion benches + the `probe` binary
 tests/
   fixtures/     # binaries copied from ROPgadget's test suite (all formats)
   parity.py     # output-parity harness against ROPgadget (run with python)
   capability_matrix.py  # the CLI and the MCP server expose the same tool
+fuzz/           # cargo-fuzz targets + `rf-smoke`, the portable mutation
+                # harness that runs on stable Rust everywhere
 ```
 
 ## Phase roadmap (PLAN.md §7)
@@ -73,21 +171,27 @@ tests/
 | Phase | Deliverable | Status |
 |---|---|---|
 | **0. Spike** | `rf-core` + `rf-scan` MVP: x86/x64 ELF only, memchr anchors, per-start decode cache, JSON out; parity harness | done — though the decode cache it shipped was measured at a 0.8% hit rate and deleted in v0.5 (`PERF-03`) |
-| **1. Engine** | All ROPgadget arches (capstone-rs), PE/Mach-O/Universal/Raw loaders, rayon parallelism, trie index | **done** — parity 99.995% over 24 fixtures; the perf exit criterion is MET as of v0.5 (>=10x on x86/x64, >=4x elsewhere — see the table above); the suffix-trie index ships as `rf_scan::trie` and is what dedup runs on. The fuzz corpus and the 10K-mutation criterion are still not built |
+| **1. Engine** | All ROPgadget arches (capstone-rs), PE/Mach-O/Universal/Raw loaders, rayon parallelism, trie index | **done** — parity 99.995% over 24 fixtures; the perf exit criterion is MET as of v0.5 (>=10x on x86/x64, >=4x elsewhere — see the table above); the suffix-trie index ships as `rf_scan::trie` and is what dedup runs on. The fuzz corpus exists (`fuzz/`, seven cargo-fuzz targets plus the portable `rf-smoke` harness) and the 10K-mutation criterion has an artifact 10x its size: 100,000 mutants, 0 panics |
 | 2. Features | `--section`, `--base` hardening, `--info` structured binary info | **done** |
 | 3. MCP server | `rf-mcp` stdio tools | **done** |
 | 4a. Chains | Chain IR, Linux execve chains (x86 int 0x80, x64 syscall) | **done** |
-| 4b. Chains | Windows VirtualProtect chains (x64 register ABI + x86 stdcall), anchor/IAT/export API resolution, alignment invariant, stack pivots, shellcode staging, multi-call composition, `--cfg-aware` | **partial** — 2 of 3 PLAN exit criteria met. The emulator harness lands in v0.5 (`tests/emulate.py`): every advertised Windows chain is now generated by the real CLI and *executed*, with VirtualProtect's four arguments and the shellcode's first four bytes asserted, and `CHWIN-01/-02/-03/-07` each have a failing-before and passing-after run in [`docs/chain-regressions.md`](docs/chain-regressions.md). Still no CET-marked PE fixture, so `--cfg-aware` remains untested against a real hardened binary |
+| 4b. Chains | Windows VirtualProtect chains (x64 register ABI + x86 stdcall), anchor/IAT/export API resolution, alignment invariant, stack pivots, shellcode staging, multi-call composition, `--cfg-aware` | **partial** — 2 of 3 PLAN exit criteria met. The emulator harness landed in v0.5 (`tests/emulate.py`): every advertised Windows chain is now generated by the real CLI and *executed*, with VirtualProtect's four arguments and the shellcode's first four bytes asserted, and `CHWIN-01/-02/-03/-07` each have a failing-before and passing-after run in [`docs/chain-regressions.md`](docs/chain-regressions.md). Still no CET-marked PE fixture, so `--cfg-aware` remains untested against a real hardened binary |
 | 5. Differentiators | Semantic classification + ranking (`rf-classify`, `--classify`/`--rank`), JOP dispatcher analysis, scan cache (`--cache`, MCP `sort_by`) | **partial** — classification, ranking, dispatcher analysis and the cache ship; the chain DSL and ARM64 PAC awareness do not, and both have been dropped from the roadmap rather than left as silent debt |
 
-## Building
+## Building and checking
 
 ```sh
-cargo build            # debug
-cargo build --release  # optimized CLI at target/release/rop-finder
-cargo test             # unit tests (rf-core, rf-scan, rf-cli)
-cargo clippy -- -D warnings
+cargo build --release                 # CLI at target/release/rop-finder
+cargo test --workspace                # the whole suite
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo deny check advisories licenses bans sources   # supply chain
+cargo audit
 ```
+
+The gates that need Python live in `tests/` and are listed under
+[Parity harness](#parity-harness) below; `.github/workflows/ci.yml` runs every
+one of them, and each is meant to be able to go red.
 
 `rop-finder --version` prints the tool version, the version of the capstone
 core the binary is linked against, and a one-line attribution to ROPgadget
@@ -114,19 +218,37 @@ rop-finder --binary ./prog --json --classify --rank          # classified, best 
 rop-finder --binary ./prog --cache                           # reuse a previous scan instantly
 ```
 
+Ask by *effect* rather than by text (the v0.4 constraint layer — the full list
+is in [MANUAL.md](MANUAL.md)):
+
+```sh
+rop-finder --binary ./prog --set-reg rdi --from-stack --terminator bare-ret
+rop-finder --binary ./prog --set-reg rsi --no-clobber rdi --max-side-effects 1
+rop-finder --binary ./prog --search "pop rdi; ret"     # ropper-style sequence
+rop-finder --binary ./prog --pivot                     # stack-pivot preset
+rop-finder --binary ./prog --plan-chain --chain linux-execve   # can it? if not, why not
+```
+
+Output formats: `--format human` (default, ROPgadget-compatible),
+`json`, `jsonl` (streaming, in scan order), `csv`, `raw`. Parse the structured
+ones — the human listing tracks ROPgadget and is not covered by semver.
+
 Formats are detected by magic bytes (ELF, PE, Mach-O, Universal/fat Mach-O);
 `--rawArch`/`--rawMode`/`--rawEndian` force the raw loader, exactly like
 ROPgadget (accepted values: `x86|arm|arm64|sparc|mips|ppc|riscv`,
-`32|64|arm|thumb|riscv`, `little|big`). Universal binaries are scanned as
-ROPgadget does: all slices' executable regions concatenated, disassembled
-with the first slice's architecture. Architectures: x86, x64, ARM (incl.
+`32|64|arm|thumb|riscv`, `little|big`). Universal (fat Mach-O) binaries need
+`--arch <slice>`: rop-finder **refuses** to do what ROPgadget does here, which
+is concatenate every slice's executable regions and disassemble them all with
+the first slice's decoder. The slices' virtual address ranges overlap and
+every slice but the first would be decoded wrongly, so most of that output is
+fabricated (`CORE-03`). The error names the slices the file actually holds. Architectures: x86, x64, ARM (incl.
 Thumb via `--thumb`), ARM64, MIPS32/64, PPC32/64, SPARC(V9), RISC-V 32/64 —
 with endianness from the binary.
 
 Output format matches ROPgadget: `0x<addr> : insn ; insn ; ...` (human) or a
-JSON array of `{"vaddr", "bytes", "text"}` with `--json` (plus an `arch`
-field per gadget for Universal binaries, and a `section` field per gadget
-when `--section` is used). `--classify` adds `class`, `labels`,
+JSON array of `{"vaddr", "bytes", "text"}` with `--json` / `--format json`
+(plus an `arch` field per gadget for Universal binaries, and a `section` field
+per gadget when `--section` is used). `--classify` adds `class`, `labels`,
 `regs_written`, `regs_read`, `side_effects`, `quality`, `dispatcher` and
 `low_confidence` to each JSON record (see Phase 5 below).
 
@@ -221,19 +343,20 @@ byte.
 
 ### windows-virtualprotect (Phase 4b)
 
-> **Experimental — the generated chain is not known to execute.** No
-> generated Windows chain has ever been run against a CPU or an emulator
-> (PLAN's Phase-4b "verify layout in an emulator harness" criterion has no
-> artifact), and the audit records three concrete defects in the emitted
-> layout: the stack-alignment pad is an inert data word that the preceding
-> gadget's `ret` lands on (`CHWIN-01`), `lpflOldProtect` defaults to the
-> shellcode address so VirtualProtect overwrites the first four bytes of
-> the buffer it just made RWX (`CHWIN-02`), and the IAT path uses the
-> `IMAGE_IMPORT_BY_NAME` record rather than the `FirstThunk` slot
-> (`CHWIN-03`). The CLI prints a warning to stderr whenever
-> `--chain windows-virtualprotect` is used. Treat the output as a layout
-> sketch to review by hand, not as a working primitive. Fixes are scheduled
-> for v0.5; see `docs/AUDIT-FINDINGS.md`.
+> **Still marked experimental, and the CLI still says so on stderr — but the
+> reason has changed.** The four layout defects this warning used to name —
+> `CHWIN-01` (an inert alignment pad the preceding `ret` lands on),
+> `CHWIN-02` (`lpflOldProtect` defaulting into the shellcode buffer),
+> `CHWIN-03` (the IAT path using `IMAGE_IMPORT_BY_NAME` instead of the
+> `FirstThunk` slot) and `CHWIN-07` — are **fixed in v0.5**, each with a
+> failing-before and a passing-after run recorded in
+> [`docs/chain-regressions.md`](docs/chain-regressions.md), and every
+> advertised Windows chain is now generated by the real CLI and *executed*
+> under Unicorn by `tests/emulate.py`, which asserts VirtualProtect's four
+> arguments and the shellcode's first four bytes. What the emulator cannot
+> check is still yours: that `--api-addr` is the runtime address, that `rsp`
+> really is `--chain-base` mod 16 at entry, and that CFG/CET is not enforced
+> on the target. That is the residual the flag warns about.
 
 A Windows `VirtualProtect(shellcode, size, PAGE_EXECUTE_READWRITE, &old)`
 chain for PE x86/x64, designed per PLAN sec. 6.2 after the mandatory
@@ -264,18 +387,23 @@ regenerate with `python tests/spike_inventory.py`):
   VirtualAlloc but NOT VirtualProtect — anchor-first is the primary path.
 - Parameters: `--api-addr`, `--shellcode-addr` (default: writable
   `.data`), `--shellcode-size` (default 0x1000).
-- **`--cfg-aware`**: keeps only gadgets entering on `endbr64`/`endbr32`
-  (CET/IBT-valid targets). goblin does not expose the load-config CET
-  flag, so the filter applies whenever the flag is passed; the CLI warns
-  when a PE advertises GUARD_CF and the flag is absent. **Two caveats.**
-  GUARD_CF is Microsoft's *software* Control Flow Guard, a different
-  mitigation from Intel CET/IBT — it is a proxy for "hardened", not a CET
-  marker. And the flag returns **zero gadgets on every fixture in this
-  repository** (verified: 0 hits on all 24), because none of them contains
-  an `endbr64`/`endbr32` byte sequence, so an empty result is
-  indistinguishable from "no CET-valid gadget exists". There is also no
-  CET-marked PE in the corpus to test it against. Both are `CRIT-01`,
-  scheduled for v0.2.
+- **`--cfg-aware`**: models Intel CET/IBT by *reach mechanism*, which is
+  what `CRIT-01` fixed in v0.2. JOP/SYS gadgets are entered through an
+  indirect `jmp`/`call`, so under IBT their entry must be an
+  `endbr64`/`endbr32` landing pad and the filter requires one. ROP gadgets
+  are entered through a `ret`, which IBT does not check at all — the
+  mitigation that constrains them is CET's *shadow stack*, a property of the
+  exploit rather than of the gadget — so they are kept. The earlier
+  implementation demanded a landing pad at the entry of every gadget, which
+  is why it returned zero gadgets on every binary in the repository. The
+  remaining honest limitation: goblin does not expose the load-config CET
+  fields, so "does this image use IBT at all" is answered by scanning the
+  executable regions for an actual `f3 0f 1e fa`/`fb` (`rf_scan::ibt_applicable`),
+  and the CLI *warns* when you pass the flag to an image that has none rather
+  than silently handing back a shorter list. A PE's `GUARD_CF` bit is
+  Microsoft's software Control Flow Guard, a different mitigation, and is
+  deliberately not used to decide this filter. There is still no CET-marked
+  PE in the fixture corpus to test against.
 
 The chain is first built as a target-independent IR (`rf-chain` crate):
 a `RopChain` is a word list where each word is tagged `gadget` /
@@ -376,13 +504,14 @@ harness's self-agreement figure stands.
 
 **Chain DSL: deferred.** The stretch goal from PLAN §5 (a declarative
 chain-description DSL compiled to the Chain IR) is intentionally not
-shipped in Phase 5 rather than half-shipped; the Chain IR and the two
-chain targets remain the supported interface. Future work.
+shipped in Phase 5 rather than half-shipped; the Chain IR and the six chain
+targets (`--chain`) remain the supported interface. Future work.
 
 ## MCP server
 
-`rop-finder-mcp` (crate `rf-mcp`) exposes the engine to AI agent hosts over
-the Model Context Protocol, using the official Rust SDK (`rmcp`). **stdio
+`rop-finder-mcp` (package `rop-finder-mcp`, directory `crates/rf-mcp`)
+exposes the engine to AI agent hosts over the Model Context Protocol, using
+the official Rust SDK (`rmcp`). **stdio
 transport only** — there is deliberately no network listener.
 
 ```sh
@@ -400,32 +529,47 @@ target/release/rop-finder-mcp --allow-dir /path/to/binaries --allow-dir /path/to
 allowlist; with none given the server exits 2. See the security model below.
 
 The scan orchestration (`ScanRequest` → `scan_bytes`/`info_bytes`) lives in
-the `rf-cli` library and is shared verbatim with the CLI — no stdout
-scraping.
+the `rop-finder-api` library (`rf_api`) and is shared verbatim with the CLI —
+no stdout scraping. Until v1.0 it lived in `rf_cli`, a *binary* crate, which
+is why the MCP server could not be published at all and had to keep its own
+copy of the option mapping; `ENG-08`/`ECO-10` extracted it. See
+[`docs/API-STABILITY.md`](docs/API-STABILITY.md) for what the published
+crates promise.
 
 ### Tools
 
-All ten tools return structured JSON (`structuredContent` + text content)
+All fifteen tools return structured JSON (`structuredContent` + text content)
 and declare an `outputSchema`; errors are `{error: {code, message, retryable,
-details, suggestions}}` with the MCP `isError` flag.
+details, suggestions}}` with the MCP `isError` flag. The table below is a
+summary — [MANUAL.md](MANUAL.md) carries the generated block with every
+parameter, regenerated from the server's own `tools/list` by a test so it
+cannot drift.
 
 | Tool | Purpose |
 |---|---|
 | `find_gadgets` | ROP gadgets only (ret-terminated); `sort_by: "quality"` ranks by the Phase 5 quality score |
 | `find_jop_gadgets` | JOP gadgets only (jmp/call-terminated); also supports `sort_by` |
 | `find_syscall_gadgets` | SYS gadgets only (syscall/sysenter/int/iret); also supports `sort_by` |
+| `find_gadgets_by_effect` | The constraint query as one call: "set rdi from the stack, preserve rsi and rdx, at most one side effect, a clean ret" |
+| `find_bytes` | A byte sequence in the mapped executable regions — the same regions `find_gadgets` walks |
+| `find_string` | A string in the mapped data sections: where `/bin/sh` lives, and at what address |
 | `get_gadgets` | Resolve stable gadget `id`s (the `id` field of any gadget record) back to full records, without re-running a search |
 | `get_binary_info` | The `--info` payload (format/arch/sections/imports), no scan |
+| `get_mitigations` | The binary's exploit mitigations, so an agent can decide whether ROP is even the right technique before it scans |
 | `get_server_config` | The effective allow roots and caps (`max_depth`, `max_file_bytes`, `max_results`, `max_concurrent`, `timeout_secs`, cache state), so an agent never has to probe for them |
 | `get_server_stats` | This session's counters: requests by tool, ok/denied/timeout/cancelled/error totals, cache hit/miss/eviction counts and `cache_bytes`, `inflight` |
 | `search_gadgets_by_pattern` | Regex over gadget text (invalid regex → literal substring), full scan |
 | `run_ropgadget_command` | Flag passthrough, restricted to the allowlist below |
-| `build_rop_chain` | ROP chains: `target: "linux-execve"` (ELF x86/x64) or `"windows-virtualprotect"` (PE x86/x64, with `api_addr`/`shellcode_addr`/`shellcode_size`/`cfg_aware`); returns chain IR + python script |
+| `plan_chain` | Whether this binary can host a chain for `target`, and if not, exactly which primitive is missing |
+| `build_rop_chain` | ROP chains; returns chain IR + python script |
 
-`build_rop_chain` takes `{"binary_path": ..., "target": "linux-execve" |
-"windows-virtualprotect", "depth"?, "base"?, "offset"?, "badbytes"?,
-"cfg_aware"?, "api_addr"?, "shellcode_addr"?, "shellcode_size"?,
-"timeout_secs"?}`. It shares the CLI's `chain_bytes` pipeline (no stdout
+`build_rop_chain` takes `{"binary_path": ..., "target": ..., "depth"?,
+"base"?, "offset"?, "badbytes"?, "cfg_aware"?, "api_addr"?,
+"shellcode_addr"?, "shellcode_size"?, "timeout_secs"?}`, where `target` is one
+of the same set the CLI's `--chain` accepts — `linux-execve`,
+`linux-mprotect`, `linux-syscall`, `linux-ret2libc`, `linux-srop` (ELF x86/x64)
+and `windows-virtualprotect` (PE x86/x64). An unknown target is a
+`usage_error` that lists the valid ones. It shares the CLI's `chain_bytes` pipeline (no stdout
 scraping), confined to the same directory allowlist; missing gadgets
 surface as a `chain_error`, and an unknown `target` is a `usage_error`.
 Chain builds bypass the gadget cache.
@@ -544,9 +688,13 @@ half that decides whether running this is safe for you.
   deterministic traversal order are returned.
 - **Loader errors are structured**: a malformed or unsupported binary
   returns a `binary_error` tool error rather than taking the server down.
-  This is not a proven no-panic guarantee — no fuzz corpus exists yet
-  (PLAN Phase 1's "zero panics on 10K mutated binaries" criterion is
-  untested), so read it as "the known error paths are handled".
+  This is not a *proof* of no-panic, but it is no longer an untested claim
+  either: `fuzz/` holds seven cargo-fuzz targets and `rf-smoke`, a
+  deterministic mutation harness that runs on stable Rust everywhere, and the
+  recorded run is **100,000 mutants of the 24 fixtures through
+  `Binary::load`, `info_bytes` and `scan_bytes` with 0 panics and 0 hard
+  failures** (`fuzz/README.md`, which also records the depth counters that
+  make that number mean something). CI runs both.
 
 **What this does NOT protect against**
 
@@ -564,10 +712,13 @@ half that decides whether running this is safe for you.
   chain scripts derived from the target all flow to the model and to
   whatever the host does with model context. Do not point this at a binary
   you would not paste into a chat window.
-- **A timed-out request stopping work.** Until the v0.2 engine cancellation
-  token lands, a timeout returns a `timeout` error to the caller while the
-  worker keeps running to completion (`MCP-03`). The `--max-depth` and
-  `--max-concurrent` caps bound how much that can cost; they do not stop it.
+- **A worker that ignores its cancellation flag.** Since v0.2 a timed-out or
+  cancelled request really does stop the scan — the engine checks a token
+  inside its loops (`MCP-03`) — but the guarantee is *bounded*, not instant:
+  a worker that has not stopped within 5 s is reported as `timeout_hard` and
+  counted in `wedged_total` rather than being silently abandoned. Cost during
+  that window is bounded by `--max-depth`, `--max-concurrent` and
+  `--max-gadgets`, not by zero.
 - **The agent itself.** Nothing here judges intent. An agent that has been
   prompt-injected can issue any request the operator's own roots and flag
   allowlist permit.
@@ -580,13 +731,26 @@ python tests/parity.py --release   # uses release binary + timing comparison
 python tests/chain_parity.py       # --ropchain parity (ELF x86/x64 fixtures)
 python tests/flag_conformance.py   # every ROPgadget flag, stdout byte for byte
 python tests/capability_matrix.py  # the CLI and the MCP server must agree
+python tests/doc_claims.py         # every quantitative claim in these docs
+python tests/mcp_workability.py    # an MCP answer must fit an agent's context
+python tests/emulate.py --all      # generated chains, executed under unicorn
+python tests/emulate.py --regressions   # every recorded chain-defect verdict
 ```
+
+They need ROPgadget only where they compare against it: `parity.py`,
+`chain_parity.py` and `flag_conformance.py` want `ROPGADGET_PATH` /
+`ROPGADGET_PYTHON` (or the conventional `../ropgadget` checkout and a
+`.venv-oracle` with `capstone==5.0.7`), and `emulate.py` wants `unicorn` —
+each says so if it is missing. The other four need nothing but the built
+binaries.
 
 `capability_matrix.py` is the ECO-02 gate and needs no oracle: it enumerates
 the CLI's flags from clap's own `--help`, the MCP surface from the server's
 own `tools/list`, maps them through a declared equivalence table in which
 every asymmetry carries a written reason, and then asks both surfaces the
-same 31 questions and compares the gadget sets element by element. It exists
+same questions and compares the gadget sets element by element — the current
+run reports 45 paired capabilities, 45 declared asymmetries, 2 vocabularies
+and 43 answers compared. It exists
 because "the CLI is behind its own MCP server" was fixed once by hand and
 came back: two front ends, one shared vocabulary, and `--reads-reg rax` and
 `reads_reg: "rax"` still answered 2,888 and 2,147 gadgets.
@@ -605,8 +769,12 @@ divergences). The corpus is 24 binaries, not
 core dump exercising a distinct loader path — no section headers, unusual
 program-header layout), which was never copied into `tests/fixtures/`.
 `tests/fixtures/PROVENANCE.md` records that drop along with the origin and
-licence of each fixture that is present. The ET_CORE loader path is
-therefore unmeasured; re-adding the fixture is v0.2 work.
+licence of each fixture that is present, and explains why the corpus is not
+redistributable — which is also why no published crate contains it
+([`docs/PUBLISHING.md`](docs/PUBLISHING.md) §5). The ET_CORE loader path is
+therefore unmeasured. `python tests/fetch_fixtures.py` re-fetches all 24 from
+upstream and verifies them against `MANIFEST.sha256`, so a checkout without
+them can still run the parity suite.
 
 ## Semantic notes / intentional deviations
 
@@ -626,16 +794,18 @@ therefore unmeasured; re-adding the fixture is v0.2 work.
   region) → anchor-hit offset order → depth order — matching
   `rgutils.deleteDuplicateGadgets` + `core.py:__getGadgets`.
 - Disassembly uses iced-x86 (FastFormatter) for x86/x64 and capstone-rs
-  (pinned `capstone = "=0.13.0"`, capstone-sys 0.17 bundling the C capstone
-  5.0.x "next" core) for every other architecture. Because dedup is
+  (pinned `capstone = "=0.14.0"`, capstone-sys 0.18 bundling the C capstone
+  whose header says 5.0.6) for every other architecture. Because dedup is
   text-keyed, formatter differences can shift dedup *classes*, not just
   cosmetics; the x86 path normalizes the biggest capstone quirks
   (segment-override prefixes on non-memory instructions, rep/repne outside
   string ops and branch families, rep/repne kept on string ops, memory sizes
-  always shown, RIP-relative operands). On ARM/ARM64 the capstone "next"
-  core rejects a few encodings python-capstone 5.0.7 accepts (`udf #0`,
-  some `vmov`/`vmrs` VFP forms) — 11 gadgets on elf-ARM64-bash, 14 on
-  elf-ARMv7-ls.
+  always shown, RIP-relative operands). The 0.13 → 0.14 bump (capstone 5.0.0 → 5.0.6, moving *toward* the
+  5.0.7 the oracle runs) closed the ARM/ARM64 encoding gap that used to cost
+  11 gadgets on elf-ARM64-bash and 14 on elf-ARMv7-ls: both are 0 missing
+  now, with no architecture regressed. The per-architecture before/after
+  counts are in `crates/rf-scan/Cargo.toml` beside the pin, and in
+  [`docs/measured-2026-09.md`](docs/measured-2026-09.md).
 - **Two different divergence numbers, and they are not interchangeable.**
   Parity is judged on post-dedup `(vaddr, bytes)` SETS: which byte
   sequences at which addresses were found. On that measure the loss is
@@ -676,16 +846,15 @@ therefore unmeasured; re-adding the fixture is v0.2 work.
 - MPX anchors (`f2 c3` etc.) decode as `bnd ret`/`bnd jmp`, which are not in
   ROPgadget's accepted branch list — they are scanned but always rejected,
   exactly as in ROPgadget.
-- `--filter`: **known divergence, not yet fixed.** ROPgadget compiles the
-  value as a REGEX anchored at both ends (`re.match("({})$")`), i.e.
-  full-mnemonic regex equality. rop-finder splits on `|` and does a literal
-  `ends_with` on each part. This diverges in both directions: a regex like
-  `--filter "j.*"` filters nothing here (no mnemonic literally ends in the
-  four characters `j.*`) where ROPgadget removes every jump gadget, and a
-  short literal like `--filter "op"` removes every `pop` gadget here where
-  ROPgadget removes none (no mnemonic is exactly `op`). The parity harness
-  does not exercise `--filter`, which is why this survived. Tracked as
-  `CLI-02`/`SCAN-01`; scheduled for v0.2.
+- `--filter`: **fixed in v0.2 (`CLI-02`/`SCAN-01`), and it is the oracle's
+  semantics now.** The value is compiled as a `|`-separated regex
+  alternation, full-matched against each mnemonic — ROPgadget's
+  `re.match("({})$")` — so `--filter "j.*"` removes every jump gadget and
+  `--filter "op"` removes nothing, because no mnemonic *is* `op`. It used to
+  be a literal `ends_with` per alternative, which silently ignored every
+  regex and silently deleted `pop` for `op`; `tests/flag_conformance.py`
+  exercises the flag now, which is what the old divergence survived by not
+  being tested.
 - `--ropchain` (Phase 4a) intentional deviations from ropmaker:
   - the write-what-where register match in
     `ropgadget/ropchain/arch/ropmakerx64.py:29` /
@@ -731,9 +900,51 @@ therefore unmeasured; re-adding the fixture is v0.2 work.
     frame); only `jmp rax` is used.
   - export-table lookup (PLAN sec. 6.2 #3c) is not implemented: the spike
     showed anchor-first + IAT cover the realistic cases.
-  - multi-call second-stack composition (VirtualAlloc + copy + execute) is
-    future work; the single-call frame (return-into-shellcode) is
-    implemented.
+  - multi-call second-stack composition landed in v0.5 (`CHWIN-08`): a
+    comma-separated `--api-name` list composes several calls into one chain,
+    each returning into the next through a stack-adjust gadget, with
+    `--stage` writing the shellcode via write-what-where gadgets and
+    `--chain-pivot` splitting the chain at the pivot. The single-call
+    return-into-shellcode frame remains the default.
   - the alignment model assumes a 16-aligned chain base at the pivot —
     the standard exploit precondition; the invariant reasons about word
     index parity, not absolute addresses.
+
+## Documentation map
+
+| Document | What it is for |
+|---|---|
+| [MANUAL.md](MANUAL.md) | **The user manual.** Installation, concepts, the complete flag reference, the ROPgadget flag-coverage table, the known divergences, the generated MCP tool block, and nine worked scenarios. |
+| [TAXONOMY.md](TAXONOMY.md) | The classifier's decision rules R1–R13. Cite a rule number, not a label you observed. |
+| [`docs/API-STABILITY.md`](docs/API-STABILITY.md) | What the published crates promise, and — as explicitly — what they do not. |
+| [`docs/PUBLISHING.md`](docs/PUBLISHING.md) | Which crate is published under which name, in which order, and what is in the tarball. |
+| [`docs/measured-2026-09.md`](docs/measured-2026-09.md) | Every measurement this README quotes, with the command that produced it. |
+| [`docs/classifier-eval.md`](docs/classifier-eval.md) | How the classifier was evaluated, and the caveats on the accuracy table. |
+| [`docs/chain-regressions.md`](docs/chain-regressions.md) | Failing-before / passing-after runs for each chain defect fixed in v0.5. |
+| [`docs/AUDIT-FINDINGS.md`](docs/AUDIT-FINDINGS.md) · [`docs/REMEDIATION.md`](docs/REMEDIATION.md) | The 137-finding audit this project was rebuilt against, and the plan that closed it. |
+| [`docs/REMEDIATION-OUTCOME.md`](docs/REMEDIATION-OUTCOME.md) | **Read this before trusting the rest.** The final ledger: which of the 137 are fully closed (119), which only partly (15), which were deferred (3), what remains in each, and a section on what this evidence does *not* establish. |
+| [`docs/gate-mutation.md`](docs/gate-mutation.md) | Every recorded experiment in which a gate was deliberately made to fail, including the v1.0.0 re-run of the five source reverts. |
+| [`fuzz/README.md`](fuzz/README.md) | The two hostile-input harnesses and the recorded runs. |
+| [`docs/MCP-DESIGN.md`](docs/MCP-DESIGN.md) | The MCP server's design review. |
+
+Dated evidence files quote commands as they were run at the time, with the
+pre-1.0 package names (`-p rf-cli`, `-p rf-mcp`); `docs/PUBLISHING.md` §2 has
+the translation table.
+
+## License and attribution
+
+BSD-2-Clause — see [LICENSE](LICENSE). Every published crate ships a copy.
+
+rop-finder is a **derivative work of
+[ROPgadget](https://github.com/JonathanSalwan/ROPgadget)** in behaviour and in
+ported algorithms: the anchor tables, the clean-decode rule, the dedup order
+and the `ropmaker` chain construction are reimplementations of its logic, and
+its test-suite binaries are this project's parity corpus. The copyright notice
+and licence that entails are reproduced in [NOTICE](NOTICE);
+`rop-finder --version` prints a one-line attribution.
+
+`tests/fixtures/` is **not** covered by this repository's licence: those files
+are third-party binaries under their own terms, several of them not
+redistributable at all. See `tests/fixtures/PROVENANCE.md` before you fork,
+mirror or vendor this repository — and note that no published crate contains
+any of them.

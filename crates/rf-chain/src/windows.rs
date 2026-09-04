@@ -31,7 +31,7 @@
 //!     VirtualProtect writes a DWORD through `lpflOldProtect`; pointing it
 //!     at the shellcode's own first bytes corrupts the entry point of the
 //!     buffer the call just made RWX, and the chain then returns there.
-//!     See [`resolve_addresses`].
+//!     See `resolve_addresses`.
 //!   * **16-byte stack alignment at the call site** is a Chain IR
 //!     invariant enforced through `validate_with` hooks, and it is
 //!     achieved by placing a real bare-`ret` GADGET, never a data word
@@ -53,7 +53,7 @@
 //! assumption. See [`ChainBaseParity`] for the arithmetic.
 //!
 //! Win32 (stdcall): no register setup at all —
-//!   [api] [return = shellcode] [arg1] [arg2] [arg3] [arg4]
+//!   `[api] [return = shellcode] [arg1] [arg2] [arg3] [arg4]`
 //! and the API's `ret 0x10` continues into the shellcode.
 
 use rf_core::{Arch, PeImport};
@@ -68,6 +68,7 @@ const PADDING64: u64 = 0x4141_4141_4141_4141;
 const PADDING32: u64 = 0x4141_4141;
 /// PAGE_EXECUTE_READWRITE.
 pub const DEFAULT_PROTECT: u64 = 0x40;
+/// Default `dwSize` / `--shellcode-size`: one page.
 pub const DEFAULT_SHELLCODE_SIZE: u64 = 0x1000;
 /// `MEM_COMMIT`: VirtualAlloc's `flAllocationType` for re-committing a page
 /// that is already reserved and committed, which is how a VirtualAlloc
@@ -178,6 +179,9 @@ impl ApiRecipe {
     /// API names this builder can construct arguments for.
     pub const NAMES: &'static [&'static str] = &["VirtualProtect", "VirtualAlloc"];
 
+    /// Look up a recipe by API name, case-insensitively. `None` for an API
+    /// this builder does not model - an unmodelled API cannot be called
+    /// correctly, because the argument recipes differ.
     pub fn for_name(name: &str) -> Option<ApiRecipe> {
         if name.eq_ignore_ascii_case("VirtualProtect") {
             Some(ApiRecipe::VirtualProtect)
@@ -257,6 +261,7 @@ pub struct WinChainOpts {
 /// and no gadgets at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeExport {
+    /// The exported symbol's name.
     pub name: String,
     /// `image_base + the export RVA`, with any `--base` rebase applied.
     pub vaddr: u64,
@@ -420,7 +425,9 @@ pub fn windows_assumptions(
 /// One API call in the chain: which recipe, and how its address is found.
 #[derive(Debug, Clone)]
 pub struct ApiCall {
+    /// The API's canonical name.
     pub name: String,
+    /// Its argument recipe.
     pub recipe: ApiRecipe,
     /// Strategy (a) for THIS call. `None` = resolve through the IAT.
     pub addr: Option<u64>,

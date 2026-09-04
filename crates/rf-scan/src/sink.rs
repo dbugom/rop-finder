@@ -56,13 +56,16 @@ pub fn gadget_bytes(g: &Gadget) -> usize {
 /// Unbounded collector: the classic behaviour.
 #[derive(Debug, Default)]
 pub struct VecSink {
+    /// Everything the scan accepted, in the engine's deterministic order.
     pub gadgets: Vec<Gadget>,
 }
 
 impl VecSink {
+    /// An empty collector.
     pub fn new() -> Self {
         VecSink::default()
     }
+    /// Take the collected gadgets.
     pub fn into_inner(self) -> Vec<Gadget> {
         self.gadgets
     }
@@ -92,6 +95,8 @@ pub struct BoundedSink {
 }
 
 impl BoundedSink {
+    /// A collector that aborts the scan once either budget is crossed.
+    /// `None` for either means "no limit of that kind".
     pub fn new(max_gadgets: Option<usize>, max_memory: Option<usize>) -> Self {
         BoundedSink {
             gadgets: Vec::new(),
@@ -104,6 +109,7 @@ impl BoundedSink {
     pub fn bytes(&self) -> usize {
         self.bytes
     }
+    /// Take the gadgets accepted before the budget tripped.
     pub fn into_inner(self) -> Vec<Gadget> {
         self.gadgets
     }

@@ -1,0 +1,40 @@
+# The pre-first-publish bootstrap. NOT loaded automatically: cargo only reads
+# `.cargo/config.toml`, so this file does nothing until it is named
+# explicitly with `--config`.
+#
+# WHY IT EXISTS. `cargo publish --dry-run -p rop-finder-scan` packages the
+# crate, strips the `path` from its dependencies and then VERIFIES the
+# tarball by building it — which means resolving `rop-finder-core = "1.0.0"`
+# against crates.io. Before the first publish that version does not exist
+# there, so the dry run fails on dependency resolution rather than on
+# anything about this crate:
+#
+#     error: failed to prepare local package for uploading
+#     Caused by: no matching package named `rop-finder-core` found
+#       location searched: crates.io index
+#
+# Cargo 1.89 has no stable way around that on its own: `--workspace` on
+# `cargo publish` is unstable, and 1.89's `cargo package --workspace` does
+# not overlay the sibling packages either (both verified on this toolchain).
+# Pointing crates-io's `rop-finder-*` at the local paths gives the
+# verification build the same graph a consumer will get AFTER the crates are
+# published, one release at a time, in the order docs/PUBLISHING.md lists.
+#
+#     cargo publish --dry-run --allow-dirty -p rop-finder-scan \
+#         --config .cargo/publish-dry-run.toml
+#
+# Relative paths in a `--config` file are resolved against the PARENT of the
+# directory holding the file, i.e. the repository root.
+#
+# This changes nothing about the tarball: `cargo package --list` and the
+# packaged Cargo.toml are identical with and without it — only where the
+# verification build gets its dependencies from. Once the crates are on
+# crates.io, drop the `--config` and the dry run resolves for real; that is
+# the check this file cannot make for you.
+[patch.crates-io]
+rop-finder-core = { path = "crates/rf-core" }
+rop-finder-scan = { path = "crates/rf-scan" }
+rop-finder-classify = { path = "crates/rf-classify" }
+rop-finder-chain = { path = "crates/rf-chain" }
+rop-finder-cache = { path = "crates/rf-cache" }
+rop-finder-api = { path = "crates/rf-api" }

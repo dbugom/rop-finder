@@ -25,7 +25,7 @@ answers come from running the gadget's bytes on a CPU.
 
 ```sh
 # 1. the sample (deterministic; the stride rule is documented in effect_sample.rs)
-cargo test -p rf-classify --test effect_sample -- --ignored --nocapture \
+cargo test -p rop-finder-classify --test effect_sample -- --ignored --nocapture \
   | grep '^{' > crates/rf-classify/tests/ground-truth/x86-sample.jsonl
 
 # 2. the ground truth (needs the `unicorn` package; ~50 s)
@@ -33,7 +33,7 @@ cargo test -p rf-classify --test effect_sample -- --ignored --nocapture \
   crates/rf-classify/tests/ground-truth/oracle_unicorn.py
 
 # 3. the check
-cargo test -p rf-classify --test ground_truth
+cargo test -p rop-finder-classify --test ground_truth
 ```
 
 Steps 1 and 2 are both byte-for-byte reproducible: the sampler strides rather

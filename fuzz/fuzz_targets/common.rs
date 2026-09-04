@@ -11,7 +11,7 @@
 
 #![allow(dead_code)]
 
-use rf_cli::{RawSpec, ScanRequest};
+use rf_api::{RawSpec, ScanRequest};
 use rf_core::{Arch, Endianness};
 
 /// Hard cap on the bytes handed to the scan pipeline.

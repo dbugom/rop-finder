@@ -1,32 +1,52 @@
 [package]
-name = "rf-mcp"
-description = "MCP server exposing rop-finder gadget scanning (stdio)"
+# Directory `crates/rf-mcp`, library target `rf_mcp`, package
+# `rop-finder-mcp`: `cargo install rop-finder-mcp` builds the
+# `rop-finder-mcp` executable (see the workspace manifest).
+name = "rop-finder-mcp"
+description = "MCP (Model Context Protocol) server exposing rop-finder gadget scanning to agent hosts over stdio, with a directory allowlist and hard resource caps"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/rop-finder-mcp"
+keywords = ["rop", "gadget", "mcp", "exploit", "agent"]
+categories = ["command-line-utilities", "development-tools::debugging"]
+
+# As with rop-finder, the library half is an implementation detail of the
+# binary (tool handlers, JSON schemas). It is not a published API.
+[lib]
+name = "rf_mcp"
 
 [[bin]]
 name = "rop-finder-mcp"
 path = "src/main.rs"
 
+[package.metadata.docs.rs]
+all-features = true
+
 [dependencies]
-rf-cli = { path = "../rf-cli" }
-rf-core = { path = "../rf-core" }
-rf-scan = { path = "../rf-scan" }
-rf-classify = { path = "../rf-classify" }
+# ENG-08/ECO-10: the shared request/option layer. This used to be
+# `rf-cli`, a BINARY crate, which made rf-mcp unpublishable and forced it
+# to keep private copies of the option mapping and the cache key.
+rop-finder-api.workspace = true
+rop-finder-core.workspace = true
+rop-finder-scan.workspace = true
+rop-finder-classify.workspace = true
 # The chain IR's word kinds and gadget table, for build_rop_chain's typed
-# response (CRIT-03). Already in the graph through rf-cli.
-rf-chain = { path = "../rf-chain" }
+# response (CRIT-03). Already in the graph through rf-api.
+rop-finder-chain.workspace = true
 # MCP-04/ROB-04/CLI-01: the same authenticated, bounded cache module the
 # CLI uses. One record, one hex decoder, one key schema.
-rf-cache = { path = "../rf-cache" }
+rop-finder-cache.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rmcp = { version = "3", features = ["server", "transport-io"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-std", "time"] }
 schemars = "1"
-sha2 = "0.10"
+sha2.workspace = true
 # MCP-DESIGN fix #8 part C: the stable gadget id is
 # blake3(binary_sha256 || vaddr_le || bytes)[..10].
 blake3 = { version = "1", default-features = false, features = ["std"] }

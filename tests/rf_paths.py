@@ -102,7 +102,7 @@ def fixture_path(name):
     return os.path.join(FIXTURES, name)
 
 
-def rop_finder(release=True, build=True, package="rf-cli", stem="rop-finder"):
+def rop_finder(release=True, build=True, package="rop-finder", stem="rop-finder"):
     """Absolute path to the rop-finder binary, building it if it is absent.
 
     Resolution order: ``$ROP_FINDER_BIN`` -> ``target/<profile>/<name>`` ->

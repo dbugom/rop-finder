@@ -40,8 +40,11 @@ pub const DEFAULT_MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 /// CLI-08/PERF-12 budget.
 #[derive(Debug, Clone, Copy)]
 pub struct CacheLimits {
+    /// Total on-disk budget; the LRU evicts to stay under it.
     pub max_total_bytes: u64,
+    /// How long an entry stays usable.
     pub ttl: Duration,
+    /// Largest single entry that will be stored at all.
     pub max_entry_bytes: u64,
 }
 
@@ -83,17 +86,24 @@ impl CacheLimits {
 /// a file in the cache directory carried a body the cache did not write.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CacheStats {
+    /// Lookups served from disk.
     pub hits: u64,
+    /// Lookups that found nothing usable.
     pub misses: u64,
     /// Entries whose HMAC tag did not verify, or whose frame was not one
     /// this program writes (wrong magic, truncated).
     pub tampered: u64,
     /// Entries that authenticated but did not [`CachedScan::validate`].
     pub malformed: u64,
+    /// Entries dropped because they were older than the TTL.
     pub expired: u64,
+    /// Entries written.
     pub stored: u64,
+    /// Writes that failed (a full or read-only directory).
     pub store_errors: u64,
+    /// Entries dropped to stay under `max_total_bytes`.
     pub evicted: u64,
+    /// Bytes reclaimed by those evictions.
     pub evicted_bytes: u64,
 }
 
@@ -144,11 +154,13 @@ impl DiskCache {
         })
     }
 
+    /// The directory this cache lives in.
     #[must_use]
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
+    /// The budget this cache was opened with.
     #[must_use]
     pub fn limits(&self) -> CacheLimits {
         self.limits

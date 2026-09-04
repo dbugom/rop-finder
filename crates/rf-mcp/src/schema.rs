@@ -639,7 +639,7 @@ fn as_array(v: Option<Value>) -> Vec<Value> {
     }
 }
 
-/// Discard the mitigation report `rf_cli::info_json` now carries.
+/// Discard the mitigation report `rf_api::info_json` now carries.
 ///
 /// ECO-06 gives the MCP its own `get_mitigations` tool, whose record is
 /// typed (`enabled` is a bool or the string `"unknown"`, never a bare
@@ -747,7 +747,7 @@ impl SliceRecord {
 }
 
 impl InfoResponse {
-    /// Map `rf_cli::info_bytes`' free-form payload onto the fixed shape.
+    /// Map `rf_api::info_bytes`' free-form payload onto the fixed shape.
     ///
     /// Anything the payload carries that is not modelled here is reported
     /// as an `unmapped_info_fields` warning rather than silently dropped,

@@ -1,14 +1,87 @@
-# Measured baseline — 2026-09-03
+# Measured baseline — 2026-09-03, with v1.0.0 results appended 2026-09-04
 
 Numbers measured on this tree, on one machine, so that later releases can cite a
 file instead of a memory. `REMEDIATION.md` Phase 1 rewrites README/MANUAL/PLAN to
 reference this document rather than restating figures inline.
 
-**Environment.** macOS (Darwin 27), Apple Silicon. rustc 1.89.0.
-Oracle: ROPgadget 7.7 (`../ropgadget`) on CPython 3.11 with capstone 5.0.7 —
-the same capstone generation `rf-scan` pins via `capstone = "=0.13.0"`.
+Sections are dated and marked `(current)` or `[superseded]`. A superseded
+section is kept because comparing it with its replacement is itself evidence
+(most often, evidence that the *oracle* differs between platforms); it is not
+a claim about the build you have.
 
-## Build and test
+## Build and test — v1.0.0, 2026-09-04 (current)
+
+**Environment.** Windows 11 Pro 10.0.26200, 24 logical CPUs, AMD Ryzen.
+`rustc 1.89.0`, `cargo 1.89.0 (c24e10642 2025-06-23)`, pinned by
+`rust-toolchain.toml`. CPython 3.12.10. Oracle: ROPgadget 7.7 @ `b6e3fe31af46`
+under `.venv-oracle`, **capstone 5.0.7, unicorn 2.1.2** — the same capstone
+generation `rf-scan` pins via `capstone = "=0.14.0"`.
+
+| Check | Command | Result |
+|---|---|---|
+| format | `cargo fmt --all -- --check` | clean, exit 0 |
+| lint | `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
+| tests | `cargo test --workspace --lib --bins --tests` | **729 passed, 0 failed, 4 ignored** |
+| doctests | `cargo test --doc --workspace` | **21 passed, 0 failed** |
+| MSRV | `cargo +1.88.0 check --workspace --all-targets --locked` | exit 0 |
+| supply chain | `cargo deny check` | `advisories ok, bans ok, licenses ok, sources ok` |
+| packaging | `cargo publish --dry-run` × 8 | all exit 0, no metadata warnings |
+
+Per-package test counts (`--lib --bins --tests`): `rop-finder-core` 90,
+`rop-finder-scan` 90, `rop-finder-classify` 48 (+4 ignored),
+`rop-finder-chain` 91, `rop-finder-cache` 42, `rop-finder-api` 15,
+`rop-finder` 118, `rop-finder-mcp` 235, `rf-bench` 0 — total 729.
+Doc-tests by crate: `rf_api` 10, `rf_core` 4, `rf_classify` 3, `rf_scan` 3,
+`rf_chain` 1 — total 21 (there were **zero** before v1.0.0; `ENG-08`).
+
+The four ignored tests are review/sampling tools that assert nothing
+(`corpus_diff::print_disagreements`, `effect_cost::classification_throughput`,
+`effect_sample::dump_sample`, `sample_corpus::dump_candidates`), each carrying
+its reason in the `#[ignore = "…"]` string.
+
+### The eight gates — 2026-09-04 (current)
+
+| Gate | Result |
+|---|---|
+| `tests/parity.py` | **PASS** — 763,166 of 763,204 = 99.9950%, `ours-only=0`, 68 divergent texts |
+| `tests/doc_claims.py` | **PASS** — 12 claims, 0 failed, 0 warned; `LIVE-SPEEDUP` elf-Linux-x86 15.8x / 16.4x, elf-ARM64-bash 9.5x / 9.6x on two runs |
+| `tests/chain_parity.py` | **PASS** — ERROR-PARITY 19, MISMATCH 21, OURS-REFUSED 1, REF-REFUSED 13, STRUCTURAL 2 |
+| `tests/mcp_workability.py` | **PASS** — 4,972 rendered tokens vs a 10,000 budget (wire figure 10,692, advisory only) |
+| `tests/flag_conformance.py` | **PASS** — 1,562 cases, 0 failures |
+| `tests/capability_matrix.py` | **PASS** — 45 paired capabilities, 45 declared asymmetries, 43 answers |
+| `tests/emulate.py --all` | exit 0 — RUNS 6, NO-CHAIN 2 |
+| `tests/emulate.py --regressions` | exit 0 — CHWIN 8/8, CHWIN-08 5/5, CHLX-07 32/32 |
+
+`docs/gate-mutation.md` Part 4 records the five source reverts re-run on this
+tree: all five still turn a gate red, and all four touched files restored
+byte-identically (`sha256sum -c`, 4 of 4 OK).
+
+### `--cfg-aware` across the corpus — 2026-09-04
+
+`CRIT-01`'s fix is table-aware: ROP-table gadgets survive, JOP/SYS gadgets need
+an `endbr64`/`endbr32` landing pad. Measured on all 24 fixtures (the fat Mach-O
+with `--arch x64`, the raw blob with its `--raw*` spec):
+
+* **No fixture in the corpus contains an `endbr64` (`f3 0f 1e fa`) or
+  `endbr32` (`f3 0f 1e fb`) byte sequence.** There is still no CET-marked
+  binary here, so the JOP/SYS half of the filter is exercised only by unit
+  tests.
+* `--cfg-aware` returns a non-zero count on **21 of 24** fixtures — e.g.
+  `elf-Linux-x64` 8,389, `pe-x64-cmd-v6.1.7601` 2,097, `elf-ARM64-bash`
+  14,103, `UNIVERSAL-…-libSystem.B.dylib --arch x64` 21. The three zeros are
+  `elf-ARMv7-ls`, `elf-Mips-Defcon-20-pwn100` and
+  `pe-Windows-ARMv7-Thumb2LE-HelloWorld`.
+* Every one of the 24 prints `CRIT-01`'s promised warning
+  (`--cfg-aware: this binary contains no endbr32/endbr64 landing pads …`).
+
+Reverting the fix (`docs/gate-mutation.md` R5) takes those counts to 0 and 0.
+
+## Build and test — 2026-09-03 [superseded]
+
+**Environment.** macOS (Darwin 27), Apple Silicon. rustc 1.89.0.
+Oracle: ROPgadget 7.7 (`../ropgadget`) on CPython 3.11 with capstone 5.0.7.
+(This section's parenthetical about the pinned `capstone = "=0.13.0"` was true
+when it was written; `rf-scan` pins `=0.14.0` since v0.2.0, `ANCH-05`.)
 
 | Check | Result |
 |---|---|
@@ -459,8 +532,63 @@ Two things fall straight out of the table and are worth recording:
   server uses.
 
 The regression gate is `crates/rf-bench/check_regression.py`: >10% slower than
-the baseline median is a failure. Its red run is recorded in
+the baseline median is a failure. Its deliberately-red run is recorded in
 `docs/gate-mutation.md` (M5).
+
+### The committed baseline is not reproducible — measured 2026-09-04
+
+**Read this before treating `baseline.json` as a ratchet.** On 2026-09-04, on
+the same machine that recorded it, `cargo bench -p rf-bench` followed by
+`python crates/rf-bench/check_regression.py` was run four times and returned
+`BENCH GATE: FAIL` every time, **with a different set of "regressions" each
+time**:
+
+| run | conditions | reported regressions |
+|---|---|---|
+| A | this repo's `target/`, full suite | `decode/serial/arm64` 13.6%, `post_process/dedup/pe-x64` 14.3% |
+| B | same, offenders re-run alone | `decode/serial/arm64` 16.1% (the other fell back to 4.7%) |
+| C | fresh copy of the same source, fresh target, machine busy | `post_process/dedup/pe-x64` 43.3%, `post_process/sort_only/pe-x64` 44.1%, `scan/parallel/pe-x64` 15.8% — `decode/serial/arm64` back inside the band at 1.024x |
+| D | same fresh tree, machine quiet | `post_process/dedup/pe-x64` 52.3%, `post_process/sort_only/pe-x64` 44.1% |
+
+None of them is a real regression. The v1.0.0 source and the committed v0.5.0
+source (`git archive HEAD`), each built in a **fresh** target directory and
+benchmarked alternately, are indistinguishable:
+
+| benchmark | v1.0.0 fresh target | v0.5.0 fresh target | v1.0.0 in this repo's `target/` | baseline |
+|---|---|---|---|---|
+| `decode/serial/arm64` | 355.16 / 353.89 ms | 354.50 / 354.02 ms | 392.34 / 393.37 ms | 339.393 ms |
+| `post_process/dedup/pe-x64` | 4.575 / 4.372 ms | 4.536 / 4.439 ms | — | 4.061 ms |
+| `post_process/sort_only/pe-x64` | 2.989 / 3.044 ms | 3.153 / 3.043 ms | — | 3.247 ms |
+
+Two distinct artifacts, both identified:
+
+* **`decode/serial/arm64`'s 13-16% gap belongs to this working copy's
+  long-lived `target/` directory**, not to the source. The same source in a
+  clean target measures 354 ms, the same as v0.5.0. (That directory has by
+  now absorbed a debug build, a release build, an MSRV build under rustc
+  1.88, eight `cargo publish` verification builds and five mutation
+  rebuilds.)
+* **The `pe-x64` post-process 43-52% figures are suite contamination.** Those
+  two are the smallest benchmarks in the suite (3-4 ms medians) and follow
+  much heavier ones. Run on their own they land at 4.4-4.6 ms and 3.0-3.2 ms
+  in *both* trees.
+
+For the record, the source cannot be responsible: `git diff` over
+`crates/rf-scan/src` and `crates/rf-core/src`, comments filtered out, contains
+exactly two changes in total between them — a `#![warn(missing_docs)]`
+attribute and a rustfmt reflow of two enum variants that gained doc comments.
+`Cargo.lock` moved no third-party dependency, and `[profile.release]` is
+identical in both trees.
+
+The baseline was **not** re-recorded to make the gate green; re-recording a
+baseline to silence a gate is the failure mode this whole exercise exists to
+prevent. What this measurement says is that
+`check_regression.py --band 0.10` against a committed developer baseline is a
+**report, not a gate** — which is exactly how `.github/workflows/ci.yml` uses
+it (`|| true`, with the real gate against a baseline the runner records for
+itself), and how this file should have described it. The honest fixes are to
+raise the sample count on the sub-5 ms benchmarks or drop them, and to run the
+suite from a clean target directory.
 
 ## Not measured here
 

@@ -25,8 +25,11 @@ name = "rf-smoke"
 path = "src/main.rs"
 
 [dependencies]
-rf-core = { path = "../../crates/rf-core" }
-rf-cli = { path = "../../crates/rf-cli" }
+# Package names changed at 1.0.0 (ENG-08): `rf-core` and `rf-cli` were
+# already taken on crates.io. The library targets are still `rf_core` and
+# `rf_api`, so the fuzz targets' `use` lines are unchanged.
+rop-finder-core = { path = "../../crates/rf-core" }
+rop-finder-api = { path = "../../crates/rf-api" }
 
 [profile.release]
 # Keep the arithmetic checks the fuzzers rely on: a wrapping-vs-panicking

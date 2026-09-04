@@ -863,7 +863,7 @@ async fn audit_log_inside_an_allow_root_is_refused() {
 ///    can never expose a gadget reaching more than 9 bytes back. The test
 ///    reproduces the old post-filter from the align=1 result and requires
 ///    the real answer to be strictly bigger.
-/// 2. The value used to go through `rf_cli::parse_hex`, which always parses
+/// 2. The value used to go through `rf_api::parse_hex`, which always parses
 ///    base 16, so `--align 16` meant 0x16 = 22. The test pins 16 and 22 to
 ///    different answers and requires "16" and "0x10" to agree.
 #[tokio::test]

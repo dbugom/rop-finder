@@ -1,109 +1,53 @@
 //! The cancellable scan pipeline the MCP server runs.
 //!
-//! MCP-03's fix needs a [`CancelToken`] to reach the engine's hot loops.
-//! `rf_cli::scan_bytes` cannot carry one: its private `request_options`
-//! hard-codes `cancel: CancelToken::never()` (rf-cli/src/lib.rs:1186) and
-//! `run_scan_engine` routes an unbudgeted request through
-//! `rf_scan::scan_binary`, which explicitly resets the token. So this
-//! module assembles the same pipeline out of rf-cli's *public* parts —
-//! [`rf_cli::load_target`], [`rf_cli::prepare_view`] and its `parse_*`
-//! helpers — and finishes with [`rf_scan::scan_bounded`], which is one of
-//! the two entry points that observe the token.
+//! MCP-03's fix needs a [`CancelToken`] to reach the engine's hot loops,
+//! and [`rf_api::scan_bytes`] cannot carry one: it routes an unbudgeted
+//! request through `rf_scan::scan_binary`, which resets the token.
+//! [`rf_api::scan_bytes_cancellable`] is the twin that can, and this module
+//! is now only the mapping from its failure onto the MCP wire error.
 //!
-//! The duplication is the option mapping and nothing else, and it is
-//! guarded rather than trusted: `scan_matches_the_cli_pipeline` scans four
-//! request shapes both ways and requires bit-identical gadget lists, so a
-//! future change to `request_options` that this file does not mirror fails
-//! a test instead of silently giving the MCP server a different scan from
-//! the CLI's. When rf-cli grows the `scan_bytes_cancellable` mirror that
-//! MCP-DESIGN fix #4 part C specifies, [`scan_bytes_cancellable`] here
-//! becomes a one-line delegate and the mapping below is deleted.
+//! It used to be more than that. Until v1.0 the option mapping —
+//! `ScanRequest` field by `ScanOptions` field — existed **twice**, here and
+//! in `rf-cli`, because the CLI's copy was private and hard-coded
+//! `CancelToken::never()`. That duplication was guarded rather than
+//! trusted: `scan_matches_the_cli_pipeline` scans four request shapes both
+//! ways and requires bit-identical gadget lists. ENG-08's extraction of
+//! `rf-api` deleted the copy, and the test stays — it now proves that the
+//! bounded and the unbounded entry point agree, which is the property that
+//! actually mattered.
 
-use rf_core::Image;
-use rf_scan::{CancelToken, ScanOptions};
+use rf_api::{ScanBudget, ScanFailure};
+use rf_scan::CancelToken;
 
 use crate::schema::ErrorCode;
 use crate::ToolError;
 
-/// Everything `rf_cli::ScanOutcome` carries that the MCP surface uses.
-pub struct ScanProduct {
-    pub gadgets: Vec<rf_scan::Gadget>,
-    pub addr_size: usize,
-    pub universal_arch: Option<rf_core::Arch>,
-    pub selected_sections: Option<Vec<rf_cli::SectionEntry>>,
-    pub fallback_names: bool,
-    /// `--offset`, needed to map a gadget address back to its section.
-    pub offset: u64,
-}
-
-/// Build [`ScanOptions`] for `req` with `cancel` and the server's budget
-/// wired in.
+/// Everything [`rf_api::ScanOutcome`] carries that the MCP surface uses.
 ///
-/// A mirror of `rf_cli::request_options`, which is private. Keep the field
-/// order identical to that function so a diff between the two is readable.
-pub fn scan_options(
-    req: &rf_cli::ScanRequest,
-    cancel: &CancelToken,
-    max_gadgets: Option<usize>,
-    max_memory: Option<usize>,
-) -> Result<ScanOptions, rf_cli::ScanError> {
-    if req.depth < 2 {
-        return Err(rf_cli::ScanError::Usage("--depth must be >= 2".to_string()));
-    }
-    let usage = rf_cli::ScanError::Usage;
-    Ok(ScanOptions {
-        depth: req.depth,
-        rop: req.rop,
-        jop: req.jop,
-        sys: req.sys,
-        multibr: req.multibr,
-        only: req
-            .only
-            .as_deref()
-            .map(|s| s.split('|').map(|x| x.to_string()).collect()),
-        range: match &req.range {
-            Some(r) => rf_cli::parse_range(r).map_err(usage)?,
-            None => None,
-        },
-        badbytes: match &req.badbytes {
-            Some(b) => rf_cli::parse_badbytes(b).map_err(usage)?,
-            None => Vec::new(),
-        },
-        filter: req
-            .filter
-            .as_deref()
-            .map(|s| s.split('|').map(|x| x.to_string()).collect())
-            .unwrap_or_default(),
-        offset: match &req.offset {
-            Some(o) => rf_cli::parse_hex(o, "--offset").map_err(usage)?,
-            None => 0,
-        },
-        thumb: req.thumb,
-        cfg_aware: req.cfg_aware,
-        align: req.align,
-        call_preceded: req.call_preceded,
-        all: req.all,
-        noinstr: req.noinstr,
-        parallel: true,
-        // rf-scan rejoins the `--filter` parts and compiles ROPgadget's
-        // anchored `({...})$` itself, so there is nothing to pre-compile.
-        filter_re: None,
-        // The three fields that make this file exist.
-        cancel: cancel.clone(),
-        max_gadgets: max_gadgets.or(req.max_gadgets),
-        max_memory: max_memory.or(req.max_memory),
-    })
-}
+/// Defined in `rf-api` and re-exported here so the tool handlers keep
+/// naming it `scan::ScanProduct`.
+pub use rf_api::ScanProduct;
 
 /// How a cancellable scan failed.
 pub enum ScanFail {
-    Cli(rf_cli::ScanError),
+    /// The request could not be turned into a scan.
+    Cli(rf_api::ScanError),
+    /// The engine stopped: cancelled, over budget, or a decode failure.
     Engine(rf_scan::Error),
 }
 
-impl From<rf_cli::ScanError> for ScanFail {
-    fn from(e: rf_cli::ScanError) -> Self {
+impl From<rf_api::ScanError> for ScanFail {
+    fn from(e: rf_api::ScanError) -> Self {
         ScanFail::Cli(e)
+    }
+}
+
+impl From<ScanFailure> for ScanFail {
+    fn from(e: ScanFailure) -> Self {
+        match e {
+            ScanFailure::Request(e) => ScanFail::Cli(e),
+            ScanFailure::Engine(e) => ScanFail::Engine(e),
+        }
     }
 }
 
@@ -122,8 +66,7 @@ impl ScanFail {
                 ToolError::with_details(
                     ErrorCode::ResourceExhausted,
                     format!(
-                        "the scan exceeded the server's gadget budget after {produced} gadgets \
-                         (limit {limit}); lower depth, or narrow the scan with section/range"
+                        "the scan exceeded the server's gadget budget after {produced} gadgets                          (limit {limit}); lower depth, or narrow the scan with section/range"
                     ),
                     serde_json::json!({"limit": "max_gadgets",
                                        "limit_value": limit,
@@ -138,35 +81,24 @@ impl ScanFail {
     }
 }
 
-/// `rf_cli::scan_bytes` with a [`CancelToken`] threaded into the engine.
+/// [`rf_api::scan_bytes`] with a [`CancelToken`] threaded into the engine.
+///
+/// A delegate to [`rf_api::scan_bytes_cancellable`]; the argument shape is
+/// kept as the server's handlers already spell it (`cancel` and the two
+/// budgets separately) rather than as a [`ScanBudget`].
 pub fn scan_bytes_cancellable(
     bytes: &[u8],
-    req: &rf_cli::ScanRequest,
+    req: &rf_api::ScanRequest,
     cancel: &CancelToken,
     max_gadgets: Option<usize>,
     max_memory: Option<usize>,
 ) -> Result<ScanProduct, ScanFail> {
-    let opts = scan_options(req, cancel, max_gadgets, max_memory)?;
-    let target = rf_cli::load_target(bytes, None)?;
-    let base = req
-        .base
-        .as_deref()
-        .map(|b| rf_cli::parse_hex(b, "--base"))
-        .transpose()
-        .map_err(rf_cli::ScanError::Usage)?;
-    let prepared =
-        rf_cli::prepare_view(&target, base, &req.section, req.arch.as_deref(), req.compat)?;
-    let view = prepared.view;
-    let universal_arch = view.universal.then(|| Image::arch(&view));
-    let gadgets = rf_scan::scan_bounded(&view, &opts).map_err(ScanFail::Engine)?;
-    Ok(ScanProduct {
-        gadgets,
-        addr_size: view.addr_size(),
-        universal_arch,
-        selected_sections: prepared.selected_sections,
-        fallback_names: prepared.fallback_names,
-        offset: opts.offset,
-    })
+    let budget = ScanBudget {
+        cancel: cancel.clone(),
+        max_gadgets,
+        max_memory,
+    };
+    rf_api::scan_bytes_cancellable(bytes, req, &budget).map_err(ScanFail::from)
 }
 
 #[cfg(test)]
@@ -187,35 +119,35 @@ mod tests {
         std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
     }
 
-    fn req(depth: usize) -> rf_cli::ScanRequest {
-        rf_cli::ScanRequest {
+    fn req(depth: usize) -> rf_api::ScanRequest {
+        rf_api::ScanRequest {
             depth,
-            ..rf_cli::ScanRequest::default()
+            ..rf_api::ScanRequest::default()
         }
     }
 
     /// THE GUARD ON THE DUPLICATION. The locally-assembled pipeline must
-    /// produce exactly what `rf_cli::scan_bytes` produces: same gadgets,
+    /// produce exactly what `rf_api::scan_bytes` produces: same gadgets,
     /// same order, same addr_size, same section table. If `request_options`
     /// gains a field this file does not mirror, this fails.
     #[test]
     fn scan_matches_the_cli_pipeline() {
         let bytes = fixture("elf-Linux-x64");
-        let shapes: Vec<rf_cli::ScanRequest> = vec![
+        let shapes: Vec<rf_api::ScanRequest> = vec![
             req(4),
-            rf_cli::ScanRequest {
+            rf_api::ScanRequest {
                 depth: 6,
                 only: Some("pop|ret".to_string()),
                 ..req(6)
             },
-            rf_cli::ScanRequest {
+            rf_api::ScanRequest {
                 depth: 5,
                 section: vec![".text".to_string()],
                 badbytes: Some("0a|0d".to_string()),
                 offset: Some("0x1000".to_string()),
                 ..req(5)
             },
-            rf_cli::ScanRequest {
+            rf_api::ScanRequest {
                 depth: 8,
                 align: Some(4),
                 all: true,
@@ -226,7 +158,7 @@ mod tests {
         ];
         let never = CancelToken::never();
         for (n, r) in shapes.iter().enumerate() {
-            let want = rf_cli::scan_bytes(&bytes, None, r).expect("cli scan");
+            let want = rf_api::scan_bytes(&bytes, None, r).expect("cli scan");
             let got = scan_bytes_cancellable(&bytes, r, &never, None, None)
                 .unwrap_or_else(|_| panic!("shape {n} failed"));
             assert_eq!(
@@ -305,13 +237,18 @@ mod tests {
     fn a_cancelled_scan_maps_to_the_cancelled_code() {
         let e = ScanFail::Engine(rf_scan::Error::Cancelled).to_tool_error();
         assert_eq!(e.code, ErrorCode::Cancelled);
-        let e = ScanFail::Cli(rf_cli::ScanError::Usage("x".into())).to_tool_error();
+        let e = ScanFail::Cli(rf_api::ScanError::Usage("x".into())).to_tool_error();
         assert_eq!(e.code, ErrorCode::UsageError);
     }
 
     #[test]
     fn depth_below_two_is_a_usage_error() {
-        let e = scan_options(&req(1), &CancelToken::never(), None, None).unwrap_err();
-        assert!(matches!(e, rf_cli::ScanError::Usage(_)));
+        // Asserted through the delegate rather than through the mapping
+        // function directly, because there is no longer a second mapping
+        // function here to get this wrong.
+        let e = scan_bytes_cancellable(&[], &req(1), &CancelToken::never(), None, None)
+            .err()
+            .expect("depth 1 must be refused");
+        assert!(matches!(e, ScanFail::Cli(rf_api::ScanError::Usage(_))));
     }
 }

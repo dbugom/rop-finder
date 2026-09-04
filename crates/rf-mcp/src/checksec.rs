@@ -136,11 +136,11 @@ fn records(m: &Mitigations) -> Vec<MitigationRecord> {
 /// from rf-core.
 #[must_use]
 pub fn report(
-    target: &rf_cli::Target,
+    target: &rf_api::Target,
     binary_sha256: String,
     binary_label: String,
 ) -> MitigationsResponse {
-    use rf_cli::Target;
+    use rf_api::Target;
     use rf_core::Image;
 
     let mut warnings = Vec::new();
@@ -149,7 +149,7 @@ pub fn report(
             let m = b.mitigations();
             (
                 "elf",
-                Some(rf_cli::arch_name(Image::arch(b)).to_string()),
+                Some(rf_api::arch_name(Image::arch(b)).to_string()),
                 records(m),
                 m.note().map(str::to_string),
                 Vec::new(),
@@ -159,7 +159,7 @@ pub fn report(
             let m = b.mitigations();
             (
                 "pe",
-                Some(rf_cli::arch_name(Image::arch(b)).to_string()),
+                Some(rf_api::arch_name(Image::arch(b)).to_string()),
                 records(m),
                 m.note().map(str::to_string),
                 Vec::new(),
@@ -169,7 +169,7 @@ pub fn report(
             let m = b.mitigations();
             (
                 "macho",
-                Some(rf_cli::arch_name(Image::arch(b)).to_string()),
+                Some(rf_api::arch_name(Image::arch(b)).to_string()),
                 records(m),
                 m.note().map(str::to_string),
                 Vec::new(),
@@ -179,7 +179,7 @@ pub fn report(
             let m = b.mitigations();
             (
                 "raw",
-                Some(rf_cli::arch_name(Image::arch(b)).to_string()),
+                Some(rf_api::arch_name(Image::arch(b)).to_string()),
                 records(&m),
                 m.note().map(str::to_string),
                 Vec::new(),
@@ -195,7 +195,7 @@ pub fn report(
                 .iter()
                 .zip(u.slice_infos())
                 .map(|(s, info)| SliceMitigations {
-                    arch: rf_cli::arch_name(Image::arch(s)).to_string(),
+                    arch: rf_api::arch_name(Image::arch(s)).to_string(),
                     slice: info.name().to_string(),
                     mitigations: records(s.mitigations()),
                 })
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn a_raw_blob_reports_an_empty_set_with_its_reason() {
         // A raw blob is whatever bytes you hand it; 8 NOPs will do.
-        let target = rf_cli::load_target(
+        let target = rf_api::load_target(
             &[0x90u8; 8],
             Some((rf_core::Arch::X64, rf_core::Endianness::Little, false)),
         )

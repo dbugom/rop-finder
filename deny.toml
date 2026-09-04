@@ -51,7 +51,16 @@ ignore = []
 #   24  MIT                                 tokio, capstone, capstone-sys,
 #                                           goblin, iced-x86, schemars, ...
 #    6  Apache-2.0 OR MIT                   same thing, other spelling
-#    6  BSD-2-Clause                        the six rf-* workspace crates
+#    9  BSD-2-Clause                        the nine workspace crates.
+#                                        RE-COUNTED 2026-09-04 with the
+#                                        command above, after ENG-08 added
+#                                        rf-api and renamed the packages:
+#                                        rop-finder, rop-finder-{api,cache,
+#                                        chain,classify,core,mcp,scan} and
+#                                        rf-bench. The other rows are the
+#                                        2026-09-03 inventory and were not
+#                                        re-counted; no third-party edge
+#                                        changed in this release.
 #    3  Unlicense OR MIT                    aho-corasick, globset, memchr
 #    3  MIT/Apache-2.0                      ident_case, plain, version_check
 #                                           (legacy slash spelling, = OR)
@@ -87,22 +96,24 @@ exceptions = []
 # copies of a crate" into a build failure instead of a line of log nobody
 # reads. Known, deliberate duplicates are listed in `skip` with a reason.
 multiple-versions = "deny"
-# WARN, not DENY, and this is a deliberate, temporary compromise.
+# DENY, restored in v1.0.0. This was `warn` from Phase 1 to Phase 5 for one
+# reason: the workspace crates depended on each other by
+# `{ path = "../rf-core" }` with NO version requirement, which cargo-deny
+# counts as a wildcard, and `allow-wildcard-paths` does not apply to a
+# publishable crate because crates.io rejects a bare path dependency. With
+# `wildcards = "deny"` that run failed with eleven `error[wildcard]`
+# diagnostics.
 #
-# The six rf-* crates depend on each other by `{ path = "../rf-core" }` with
-# no version requirement, which cargo-deny counts as a wildcard.
-# `allow-wildcard-paths` is the intended escape hatch, but cargo-deny 0.20.2
-# refuses to apply it to crates that are publishable, because crates.io
-# rejects bare path dependencies — and none of the six crates sets
-# `publish = false`. Verified: with `wildcards = "deny"` the run fails with
-# eleven `error[wildcard]` diagnostics for rf-scan/rf-classify/rf-cli/rf-mcp
-# and nothing else.
+# ENG-08 removed the cause rather than the check: every internal dependency
+# is now `{ path = "...", version = "1.0.0" }`, declared once in the root
+# `[workspace.dependencies]`, so there are no wildcards left to allow. The
+# 2026-09-04 run of `cargo deny check advisories licenses bans sources`
+# reports "9 checks; 0 errors, 0 warnings" with this setting.
 #
-# To restore `wildcards = "deny"`, add `publish = false` to each of the six
-# crates/*/Cargo.toml (they are not published to crates.io) and leave
-# allow-wildcard-paths on; the check then passes with no exceptions. That
-# edit belongs to the workspace-manifest workstream, not to this file.
-wildcards = "warn"
+# Keep `allow-wildcard-paths` on: it costs nothing now and it is what would
+# catch a NEW unversioned path dependency as the narrower error rather than
+# as a general wildcard.
+wildcards = "deny"
 allow-wildcard-paths = true
 # Build scripts run arbitrary code at build time; 23 packages in this graph
 # have one. `highlight` makes them visible in `cargo deny check bans` output
@@ -115,6 +126,18 @@ skip = [
     # pulls the other. Both are build-time only and neither ships in the
     # released binary. Remove this entry once the graph converges on syn 3.
     { crate = "syn@2", reason = "syn 2/3 split across proc-macro deps; build-time only" },
+    # PRE-EXISTING at the v0.5.0 tag, surfaced here because v1.0.0 is the
+    # release that makes `cargo deny check` part of the publish checklist.
+    # `cpufeatures` is the 3-file CPU-feature-detection shim RustCrypto uses:
+    # sha2 0.10.9 (the newest 0.10) pulls 0.2.17, blake3 1.8.7 pulls 0.3.1.
+    # Nothing this workspace declares can reconcile them — sha2 0.11.0 exists
+    # and moves to cpufeatures 0.3, but it is a breaking `digest` bump that
+    # would change rf-cache's hashing call sites, which is not a v1.0.0
+    # packaging change. Both copies are runtime code and both ship in the
+    # binary; the cost is a few KB of duplicated `is_x86_feature_detected`
+    # plumbing and no security surface. Remove this entry when rf-cache,
+    # rop-finder and rop-finder-mcp move to sha2 0.11.
+    { crate = "cpufeatures", reason = "sha2 0.10 pulls 0.2, blake3 1.8 pulls 0.3; converges on the sha2 0.11 bump" },
 ]
 
 deny = []

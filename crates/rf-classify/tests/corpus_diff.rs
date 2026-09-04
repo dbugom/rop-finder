@@ -4,7 +4,7 @@
 //! reading an aggregate number.
 //!
 //! ```text
-//! cargo test -p rf-classify --test corpus_diff -- --ignored --nocapture
+//! cargo test -p rop-finder-classify --test corpus_diff -- --ignored --nocapture
 //! ```
 //!
 //! It writes nothing.

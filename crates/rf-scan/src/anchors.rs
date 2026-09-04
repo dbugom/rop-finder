@@ -23,8 +23,11 @@ use rf_core::{Arch, Endianness};
 /// byte ranges (regex character class).
 #[derive(Debug, Clone, Copy)]
 pub enum BytePat {
+    /// This byte and no other.
     Fixed(u8),
+    /// Any byte (`.` in the oracle's regex).
     Any,
+    /// Any byte inside one of these inclusive ranges (a character class).
     Ranges(&'static [(u8, u8)]),
 }
 
@@ -43,6 +46,7 @@ impl BytePat {
 pub struct Anchor {
     /// Human-readable comment from the Python source.
     pub name: &'static str,
+    /// The byte pattern, one [`BytePat`] per position.
     pub pattern: Cow<'static, [BytePat]>,
     /// Gadget size (`gad_size`): gadget end = anchor offset + size. May be
     /// smaller than `pattern.len()` (Thumb ldm.w/ldmdb quirk, see module docs).
@@ -53,9 +57,12 @@ pub struct Anchor {
 }
 
 impl Anchor {
+    /// The gadget size (`gad_size`); see the [`size`](Self::size) field.
     pub fn size(&self) -> usize {
         self.size
     }
+    /// The backward-stepping alignment (`gad_align`); see the
+    /// [`align`](Self::align) field.
     pub fn align(&self) -> usize {
         self.align
     }
@@ -275,8 +282,11 @@ pub const MAX_ANCHOR_SIZE: usize = 8;
 /// `addSYSGadgets`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableKind {
+    /// `addROPGadgets` — return-terminated gadgets.
     Rop,
+    /// `addJOPGadgets` — indirect-branch-terminated gadgets.
     Jop,
+    /// `addSYSGadgets` — syscall/trap-terminated gadgets.
     Sys,
 }
 
