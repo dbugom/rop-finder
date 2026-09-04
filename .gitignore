@@ -9,3 +9,8 @@ tests/spike-binaries/
 # mcp_workability.py) all `import rf_paths`, so running any gate leaves a
 # tests/__pycache__ behind. It is build detritus, never an artifact.
 __pycache__/
+
+# Locally built release artifacts. Never committed: that is ENG-09, and
+# dist/README.md explains why an unverifiable binary in git is worse than none.
+dist/build/
+dist/.zigshim/

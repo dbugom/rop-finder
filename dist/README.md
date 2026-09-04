@@ -104,3 +104,69 @@ Full documentation: [`../README.md`](../README.md) and
 [`../MANUAL.md`](../MANUAL.md). Measured performance and parity figures, with
 the method used to obtain them, are in
 [`../docs/measured-2026-09.md`](../docs/measured-2026-09.md).
+
+## Build them yourself
+
+Three scripts, one per platform. All of them strip the binary, remap the build
+machine's paths out of it, set mode 0755, emit `SHA256SUMS`, and package into an
+archive so the executable bit survives a download. Output lands in
+`dist/build/<platform>/`, which is gitignored -- see the note above about why
+binaries do not belong in this repository.
+
+```sh
+./dist/build-linux.sh                 # static musl x86_64
+./dist/build-linux.sh --arch aarch64
+pwsh -File dist/build-windows.ps1     # MSVC x86_64
+./dist/build-macos.sh                 # native (Apple Silicon -> arm64)
+./dist/build-macos.sh --universal     # arm64 + x86_64, lipo'd
+./dist/build-macos.sh --universal --sign "Developer ID Application: NAME (TEAMID)" \
+                      --notarize-profile my-profile
+```
+
+### What each one needs
+
+`rf-scan` depends on `capstone-sys`, which compiles ~44 MB of vendored C with the
+`cc` crate, so **every** platform needs a working C toolchain -- not just a Rust
+target.
+
+| platform | C toolchain |
+|---|---|
+| Linux (musl) | `cross`, or `musl-tools`, or `zig` (the script picks whichever it finds) |
+| Windows | MSVC C++ build tools (`cl.exe`) |
+| macOS | Xcode Command Line Tools -- `xcode-select --install` |
+
+### macOS notes
+
+* **Apple Silicon** builds `aarch64-apple-darwin` natively; `--universal` adds
+  `x86_64-apple-darwin` and `lipo`s the two together.
+* **Unsigned binaries are quarantined by Gatekeeper**, and when that happens
+  Claude Desktop's MCP spawn fails with no visible error -- it looks like the
+  server is broken rather than blocked. Either pass `--sign`, or tell users to
+  run `xattr -d com.apple.quarantine <binary>`.
+* A bare executable cannot be stapled; the notarization ticket attaches to a
+  container, which is why the script ships the `.tar.gz`.
+
+### Verified for v1.0.0-rc1
+
+Built and smoke-tested on 2026-09-04:
+
+| artifact | size | check |
+|---|---|---|
+| `rop-finder` (linux-musl) | 11,951,344 | `statically linked, stripped`; `ldd` -> not a dynamic executable |
+| `rop-finder-mcp` (linux-musl) | 14,895,696 | starts, exits 2 with no `--allow-dir` |
+| `rop-finder.exe` (windows) | 12,558,336 | 42,508 gadgets on `elf-Linux-x86`, matching the oracle |
+| `rop-finder-mcp.exe` (windows) | 16,522,752 | -- |
+
+The Windows and Linux builds produce **byte-identical** gadget output: `--json`
+on `elf-Linux-x64` at depth 10 is 5,992,606 bytes with SHA-256
+`e982483145035d5316930f7e391ee0ce79bbdc218e0d4691a87e991995eaa4dc` from both.
+
+Build-path leakage was measured before and after adding `--remap-path-prefix`:
+`rop-finder.exe` went from **178** occurrences of the build machine's home
+directory to **0**, and `rop-finder-mcp.exe` from **330** to **0**. The single
+remaining `C:\Users` string in the MCP binary is not a leak -- it is the
+wide-allowlist refusal table from `MCP-02`, naming roots the server declines to
+serve.
+
+macOS artifacts have **not** been produced: no macOS machine was available. The
+script is written and syntax-checked but has never been executed.

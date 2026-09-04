@@ -122,3 +122,10 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 [profile.release]
 lto = true
 codegen-units = 1
+# Distributed binaries carry no symbol table and no build-machine paths.
+# ENG-09: the pre-v0.1.1 dist/ binaries were unstripped and embedded the
+# panic-location path of every dependency, all rooted at the maintainer's
+# home directory. `strip` handles the symbols; the path remapping is in
+# dist/build-*.sh and .github/workflows/release.yml (RUSTFLAGS), because
+# --remap-path-prefix cannot be expressed in a profile.
+strip = "symbols"
