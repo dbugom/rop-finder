@@ -93,8 +93,21 @@ jobs:
       - name: cargo clippy -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Job logs need admin rights to download through the API, so a failure
+      # here was invisible to anyone without them. Echo the failing tail back
+      # as ::error:: workflow commands: those become check-run annotations,
+      # which ARE readable on a public repository. Costs nothing when green.
       - name: cargo test
-        run: cargo test --workspace
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! cargo test --workspace 2>&1 | tee cargo-test.log; then
+            echo "::group::cargo test --workspace (full output)"
+            cat cargo-test.log
+            echo "::endgroup::"
+            grep -E '^(test .* FAILED|---- .* stdout ----|thread .* panicked|error(\[|:))' cargo-test.log               | head -40 | while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          fi
 
       # Exit criterion for this release: `--version`, `--help`, and both output
       # modes piped into `head` must exit 0 on every platform. All four exited
@@ -433,7 +446,16 @@ jobs:
           ROPGADGET_PATH: ${{ runner.temp }}/ropgadget/ROPgadget.py
           ROPGADGET_PYTHON: ${{ runner.temp }}/venv-oracle/bin/python
           RF_NO_BUILD: '1'
-        run: python3 tests/doc_claims.py --no-timing --json doc-claims.json
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! python3 tests/doc_claims.py --no-timing --json doc-claims.json 2>&1 | tee doc-claims.log; then
+            echo "::group::doc_claims.py (full output)"
+            cat doc-claims.log
+            echo "::endgroup::"
+            grep -E '^\[(FAIL|warn)|Traceback|Error|error' doc-claims.log               | head -40 | while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         if: always()
