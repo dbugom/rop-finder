@@ -406,7 +406,8 @@ Not delivered, and each is named in `ENG-08`'s own text:
 * **No CHANGELOG.** `ENG-08` lists "no CHANGELOG" among the reasons there is
   no semver discipline to inherit. There still is none. The release commit
   messages are the changelog, and they are not in the tarball.
-* **`repository` is `https://placeholder.invalid/rop-finder`.** This working
+* **`repository` was `https://placeholder.invalid/rop-finder`; it is now
+  `https://github.com/dbugom/rop-finder` (set 2026-09-05).** This working
   copy has no git remote (`git remote -v` is empty; `.git/config` has no
   `[remote]` section), so there is no honest URL to put there and inventing a
   `github.com` path would point crates.io and docs.rs at a repository that

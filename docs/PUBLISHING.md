@@ -129,7 +129,7 @@ wildcard, and `allow-wildcard-paths` does not apply to a publishable crate.
 ## 4. Before the first real publish
 
 1. **Set `repository`.** `[workspace.package] repository` is
-   `https://placeholder.invalid/rop-finder`. This working copy has no git
+   `https://github.com/dbugom/rop-finder` (set 2026-09-05). This working copy had no git
    remote at all, so there is no URL to put there, and inventing a github.com
    path would point crates.io and docs.rs at a repository that either does not
    exist or belongs to somebody else. `.invalid` is reserved by RFC 2606 so a

@@ -72,7 +72,7 @@ rust-version = "1.88"
 # never resolve to a stranger's property. docs/PUBLISHING.md step 1 is
 # replacing this line; nothing else in the release is blocked on it, and
 # `cargo publish --dry-run` does not check it.
-repository = "https://placeholder.invalid/rop-finder"
+repository = "https://github.com/dbugom/rop-finder"
 
 [workspace.dependencies]
 # --- the workspace's own crates ------------------------------------------
