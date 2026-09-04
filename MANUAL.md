@@ -65,6 +65,11 @@ none has been measured.
 
 ## 2. Installation
 
+> This section is a summary. For per-OS installation, checksum verification,
+> the MCP-to-Claude wiring and a troubleshooting table, see the operator guide:
+> [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md).
+
+
 ### From crates.io
 
 ```sh

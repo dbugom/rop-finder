@@ -509,6 +509,11 @@ targets (`--chain`) remain the supported interface. Future work.
 
 ## MCP server
 
+> Installing, running and wiring the server into Claude Desktop or Claude Code is
+> covered step by step, per operating system, in
+> [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md).
+
+
 `rop-finder-mcp` (package `rop-finder-mcp`, directory `crates/rf-mcp`)
 exposes the engine to AI agent hosts over the Model Context Protocol, using
 the official Rust SDK (`rmcp`). **stdio

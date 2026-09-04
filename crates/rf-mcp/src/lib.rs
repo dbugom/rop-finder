@@ -3278,7 +3278,7 @@ impl RopFinderMcp {
 // operator — stderr, the alternative, is what hosts discard, which is
 // MCP-09 itself. Scoped to this impl.
 #[allow(deprecated)]
-#[tool_handler(name = "rop-finder-mcp", version = "0.1.0")]
+#[tool_handler(name = "rop-finder-mcp", version = "1.0.0")]
 impl ServerHandler for RopFinderMcp {
     /// `instructions` is built at runtime rather than baked into the macro
     /// so it can name the *effective* allowlist. An agent that is told the
@@ -3300,7 +3300,7 @@ impl ServerHandler for RopFinderMcp {
                 .enable_resources()
                 .build(),
         )
-        .with_server_info(rmcp::model::Implementation::new("rop-finder-mcp", "0.1.0"))
+        .with_server_info(rmcp::model::Implementation::new("rop-finder-mcp", env!("CARGO_PKG_VERSION")))
         .with_instructions(self.instructions())
     }
 
@@ -3456,11 +3456,26 @@ impl RopFinderMcp {
 
 #[cfg(test)]
 mod tests {
+
     // Panicking on a bad index is the desired behaviour in a test; the
     // crate-level deny exists to keep it out of the server.
     #![allow(clippy::indexing_slicing)]
 
     use super::*;
+
+    /// The `#[tool_handler]` attribute takes a string literal — it cannot call
+    /// `env!()` — so the version there can silently drift from the crate's. It did:
+    /// the handshake reported 0.1.0 while `--version` said 1.0.0, which is what an
+    /// MCP host displays to the operator. `with_server_info` now uses
+    /// `env!("CARGO_PKG_VERSION")`; this makes the literal drifting a build failure.
+    #[test]
+    fn tool_handler_version_literal_matches_the_crate_version() {
+        assert_eq!(
+            "1.0.0",
+            env!("CARGO_PKG_VERSION"),
+            "bump the version literal in #[tool_handler(...)] to match Cargo.toml"
+        );
+    }
 
     /// Unique temp dir per test, cleaned up on drop.
     struct TempDir(PathBuf);
