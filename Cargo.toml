@@ -54,7 +54,7 @@ version = "1.0.0"
 # so the binary and the crates.io metadata cannot disagree. This is
 # SEPARATE from the ROPgadget attribution, which credits the upstream
 # project this is a port of and is required by its licence (ENG-03).
-authors = ["razavi <i@dbug.om>"]
+authors = ["Mohammad Razavi <i@dbug.om>"]
 edition = "2021"
 license = "BSD-2-Clause"
 # Real floor, not aspiration: the highest `rust-version` declared anywhere in
