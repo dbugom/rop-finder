@@ -361,7 +361,20 @@ fn purge_empties_the_cache_but_keeps_the_key() {
 #[test]
 fn a_wrong_length_key_file_disables_the_cache() {
     let t = TempDir::new("badkey");
-    std::fs::write(t.path().join(KEY_FILE), b"short").unwrap();
+    let path = t.path().join(KEY_FILE);
+    std::fs::write(&path, b"short").unwrap();
+    // `std::fs::write` creates the file 0644, and `DiskCache::open` checks the
+    // mode BEFORE the length, so on Unix this test used to receive the
+    // permission refusal and assert against the wrong message. It passed on
+    // Windows only because there is no mode check there — the first CI run
+    // caught it on ubuntu-22.04 and macos-14. Narrow the file to 0600 so this
+    // test exercises the length path it is named for; the mode path has its
+    // own test immediately below.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let err = DiskCache::open(t.path(), CacheLimits::default()).unwrap_err();
     assert!(err.to_string().contains("expected 32"), "{err}");
 }
