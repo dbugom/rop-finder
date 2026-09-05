@@ -38,6 +38,29 @@ debug = 1
 debug-assertions = true
 overflow-checks = true
 
+# ...for OUR code. iced-x86 is exempted, and this is not a convenience.
+#
+# iced-x86 1.21.0 decoder.rs:1421 computes an instruction's length as
+#
+#     let instr_len = self.data_ptr as u32 - data_ptr as u32;
+#
+# where both operands are 64-bit POINTERS truncated to u32. When the decode
+# buffer straddles a 4 GiB address boundary -- start at ...FFFF_FFFD, a five
+# byte instruction ending at ...0000_0002 -- the truncated subtraction is
+# 0x00000002 - 0xFFFFFFFD. Wrapping, that is 5, which is the right answer and
+# what every shipped build computes. Checked, it panics.
+#
+# So this is a false positive of our own making: overflow-checks turns correct
+# wrapping code in a dependency into a crash. It is address-layout dependent,
+# so ASLR makes it rare and non-deterministic -- CI hit it once in a 60 s run
+# and it does not reproduce from the saved artifact. 1.21.0 is the newest
+# release, so there is no upgrade that fixes it.
+#
+# Exempting the one crate keeps overflow checking everywhere it can still find
+# a real bug, which is the whole point of the setting. Do not widen this.
+[profile.release.package.iced-x86]
+overflow-checks = false
+
 # --- loader targets: one per container format (see README "Why four targets") -
 
 [[bin]]

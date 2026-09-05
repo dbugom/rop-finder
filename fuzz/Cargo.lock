@@ -275,60 +275,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
-name = "rf-api"
-version = "0.1.0"
+name = "rop-finder-api"
+version = "1.0.0"
 dependencies = [
  "globset",
  "regex",
- "rf-chain",
- "rf-classify",
- "rf-core",
- "rf-scan",
+ "rop-finder-chain",
+ "rop-finder-classify",
+ "rop-finder-core",
+ "rop-finder-scan",
  "serde_json",
 ]
 
 [[package]]
-name = "rf-chain"
-version = "0.1.0"
+name = "rop-finder-chain"
+version = "1.0.0"
 dependencies = [
- "rf-classify",
- "rf-core",
- "rf-scan",
+ "rop-finder-classify",
+ "rop-finder-core",
+ "rop-finder-scan",
  "serde",
  "serde_json",
  "thiserror",
 ]
 
 [[package]]
-name = "rf-classify"
-version = "0.1.0"
+name = "rop-finder-classify"
+version = "1.0.0"
 dependencies = [
  "iced-x86",
- "rf-core",
- "rf-scan",
+ "rop-finder-core",
+ "rop-finder-scan",
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "rf-core"
-version = "0.1.0"
+name = "rop-finder-core"
+version = "1.0.0"
 dependencies = [
  "goblin",
  "thiserror",
-]
-
-[[package]]
-name = "rf-scan"
-version = "0.1.0"
-dependencies = [
- "capstone",
- "goblin",
- "iced-x86",
- "memchr",
- "rayon",
- "regex",
- "rf-core",
 ]
 
 [[package]]
@@ -336,8 +323,21 @@ name = "rop-finder-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
- "rf-api",
- "rf-core",
+ "rop-finder-api",
+ "rop-finder-core",
+]
+
+[[package]]
+name = "rop-finder-scan"
+version = "1.0.0"
+dependencies = [
+ "capstone",
+ "goblin",
+ "iced-x86",
+ "memchr",
+ "rayon",
+ "regex",
+ "rop-finder-core",
 ]
 
 [[package]]

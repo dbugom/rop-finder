@@ -673,7 +673,13 @@ jobs:
           fi
           for t in $targets; do
             echo "=== $t"
-            cargo +nightly fuzz run "$t" -- -max_total_time=60
+            # fuzz/README.md section 7's `fuzz-short` recipe, in full. Only
+            # -max_total_time was being passed, so -max_len left inputs
+            # unbounded and -timeout let a hang burn the job instead of
+            # reporting itself. The nightly recipe's -rss_limit_mb=512 is
+            # NOT used here: the README is explicit that it stays red on
+            # purpose until ROB-02 is fixed, which is a different job.
+            cargo +nightly fuzz run "$t" -- -max_total_time=60 -max_len=65536 -rss_limit_mb=2048 -timeout=25
           done
 
       - uses: actions/upload-artifact@v4
