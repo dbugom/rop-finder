@@ -243,7 +243,20 @@ async fn info_does_not_block_the_runtime() {
         .expect("tools/list answered");
     let took = t0.elapsed();
     assert!(resp["result"]["tools"].is_array(), "{resp}");
-    println!("info_does_not_block_the_runtime: tools/list answered in {took:?}");
+
+    // THE PROPERTY, measured by ordering rather than by a clock. `seen` holds
+    // every response that arrived ahead of tools/list. A blocked runtime cannot
+    // answer id 40 until the four get_binary_info calls are done, so all four
+    // would be sitting in `seen`. An unblocked one answers while they are still
+    // in flight. This is exact and identical on every machine.
+    let inflight_first = ids_in(&seen, 30, 33);
+    println!(
+        "info_does_not_block_the_runtime: tools/list answered in {took:?}, {inflight_first} of 4 get_binary_info calls had answered first"
+    );
+    assert!(
+        inflight_first < 4,
+        "all four get_binary_info calls answered before tools/list did, which is exactly what a blocked runtime looks like (took {took:?})"
+    );
     assert!(
         took < cheap_tool_budget(),
         "tools/list took {took:?} behind four get_binary_info calls"
@@ -258,16 +271,24 @@ async fn info_does_not_block_the_runtime() {
 /// healthy server answers in single-digit milliseconds — 3.1 ms measured on
 /// the development machine.
 ///
-/// The bound was 100 ms, which is a fast-workstation number rather than a
-/// property, and it failed on the windows-2022 runner in the first CI run. One
-/// second still separates the two cases by a factor of four and gives a
-/// throttled shared runner 300x the healthy time. Set
-/// `RF_CHEAP_TOOL_BUDGET_MS` to tighten it locally.
+/// This is now a BACKSTOP, not the property. The property is the ordering
+/// assertion in each test: a blocked runtime answers the in-flight work before
+/// it answers `tools/list`, and that is exact on every machine.
+///
+/// The clock is kept only to catch a server that is slow without being blocked,
+/// and its number has been wrong twice. 100 ms was a fast-workstation figure and
+/// failed immediately. 1 s then failed at 1.0355007 s on windows-2022 -- over by
+/// 35 ms. That is not a bug it caught; it is the measurement being unfit. Note
+/// that `took` is not tools/list's latency: `await_id_with` drains the stream
+/// until the matching id appears, so it also includes reading anything queued
+/// ahead of it. Five seconds is loose enough to stop measuring the runner and
+/// tight enough to notice a genuine stall. `RF_CHEAP_TOOL_BUDGET_MS` tightens it
+/// where the machine is known.
 fn cheap_tool_budget() -> Duration {
     let ms = std::env::var("RF_CHEAP_TOOL_BUDGET_MS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1000);
+        .unwrap_or(5000);
     Duration::from_millis(ms)
 }
 
@@ -296,7 +317,18 @@ async fn a_saturated_server_still_answers_cheap_tools() {
         .expect("tools/list answered");
     let took = t0.elapsed();
     assert!(resp["result"]["tools"].is_array(), "{resp}");
-    println!("a_saturated_server_still_answers_cheap_tools: tools/list answered in {took:?}");
+
+    // Same ordering property as above: both scans hold permits and run for
+    // `timeout_secs: 4`, so a blocked server answers them before it answers
+    // tools/list. Neither should have finished first.
+    let scans_first = ids_in(&seen, 50, 51);
+    println!(
+        "a_saturated_server_still_answers_cheap_tools: tools/list answered in {took:?}, {scans_first} of 2 scans had answered first"
+    );
+    assert!(
+        scans_first < 2,
+        "both scans answered before tools/list did, with both slots busy (took {took:?})"
+    );
     assert!(
         took < cheap_tool_budget(),
         "tools/list took {took:?} with both scan slots busy"
@@ -378,4 +410,19 @@ async fn the_gadget_budget_stops_a_huge_scan() {
         .await;
     assert_eq!(big["result"]["isError"], false, "{big}");
     assert!(structured(&big)["total_count"].as_u64().unwrap() > 500);
+}
+
+/// How many responses with ids in `lo..=hi` arrived before the one we awaited.
+///
+/// `McpChild::await_id_with` collects them in order, so this counts the in-flight
+/// work that finished ahead of the cheap call -- the thing that distinguishes a
+/// blocked runtime from a merely slow machine.
+fn ids_in(seen: &[serde_json::Value], lo: u64, hi: u64) -> usize {
+    seen.iter()
+        .filter(|v| {
+            v.get("id")
+                .and_then(|i| i.as_u64())
+                .is_some_and(|i| i >= lo && i <= hi)
+        })
+        .count()
 }
