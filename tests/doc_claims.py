@@ -136,6 +136,23 @@ class Result:
 # --------------------------------------------------------------------------
 # document + baseline access
 # --------------------------------------------------------------------------
+class DocMissing(Exception):
+    """A document under test is not present in this checkout.
+
+    PLAN.md deliberately lives one level ABOVE the repository: it is the
+    planning document, not a published artefact. A clone therefore never has
+    it, and CI checks out only the repository. Every claim that reads it has
+    to degrade to a reported skip -- the previous `sys.exit` killed the whole
+    gate before it could report anything at all, which is how this went
+    undiagnosed: the job failed with exit 1 and never wrote doc-claims.json.
+    """
+
+    def __init__(self, name, path):
+        super().__init__(f"document not found: {path}")
+        self.name = name
+        self.path = path
+
+
 class Docs:
     """The documents under test. PLAN.md lives one level above the repo."""
 
@@ -157,8 +174,12 @@ class Docs:
 
     def get(self, name):
         if name not in self.text:
-            sys.exit(f"document not found: {self.paths.get(name, name)}")
+            raise DocMissing(name, self.paths.get(name, name))
         return self.text[name]
+
+    def missing(self):
+        """Documents that were looked for and are not here."""
+        return [n for n in self.paths if n not in self.text]
 
     def current(self, name):
         """`get`, minus lines explicitly marked as a superseded measurement.
@@ -632,27 +653,51 @@ def main():
 
     print(f"# environment: {rf_paths.describe_environment()}")
     print(f"# documents:   {args.doc_root or REPO}")
+    absent = docs.missing()
+    if absent:
+        print(f"# NOT PRESENT: {', '.join(absent)} - claims that read them are SKIPPED, not passed")
     print(f"# baselines:   {len(base)} fixtures from {BASELINE_DIR}\n")
 
     results = []
     for fn in CLAIMS:
-        r = fn(docs, base, args)
+        try:
+            r = fn(docs, base, args)
+        except DocMissing as exc:
+            cid = fn.__name__.replace("claim_", "").replace("_", "-").upper()
+            results.append(
+                Result(
+                    cid,
+                    "skip",
+                    exc.name,
+                    f"SKIPPED - this claim reads {exc.name}, which is not in this checkout",
+                    True,
+                    f"{exc.name} present",
+                    "absent",
+                    note=str(exc),
+                )
+            )
+            continue
         if r is not None:
             results.append(r)
 
     width = max(len(r.cid) for r in results)
     failed = 0
     warned = 0
+    skipped = 0
     for r in results:
         sev = r.severity
-        if not r.ok and sev == "warn" and args.strict:
-            sev = "fail"
-        status = "ok  " if r.ok else ("FAIL" if sev == "fail" else "warn")
-        if not r.ok:
-            if sev == "fail":
-                failed += 1
-            else:
-                warned += 1
+        if sev == "skip":
+            skipped += 1
+            status = "skip"
+        else:
+            if not r.ok and sev == "warn" and args.strict:
+                sev = "fail"
+            status = "ok  " if r.ok else ("FAIL" if sev == "fail" else "warn")
+            if not r.ok:
+                if sev == "fail":
+                    failed += 1
+                else:
+                    warned += 1
         print(f"[{status}] {r.cid:<{width}}  {r.description}")
         print(f"{'':>7}  expected: {r.expected}")
         print(f"{'':>7}  measured: {r.measured}")
@@ -660,7 +705,9 @@ def main():
             print(f"{'':>7}  note:     {r.note}")
         print(f"{'':>7}  source:   {r.source}")
 
-    print(f"\n{len(results)} claims checked, {failed} failed, {warned} warned")
+    checked = len(results) - skipped
+    tail = f", {skipped} SKIPPED (document absent)" if skipped else ""
+    print(f"\n{checked} claims checked, {failed} failed, {warned} warned{tail}")
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8", newline="\n") as fh:
             json.dump(

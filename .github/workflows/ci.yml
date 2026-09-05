@@ -105,8 +105,8 @@ jobs:
             echo "::group::cargo test --workspace (full output)"
             cat cargo-test.log
             echo "::endgroup::"
-            grep -E '^(test .* FAILED|---- .* stdout ----|thread .* panicked|error(\[|:))' cargo-test.log | head -30 | while IFS= read -r line; do echo "::error::$line"; done
-            echo "--- tail ---"; tail -20 cargo-test.log | while IFS= read -r line; do echo "::error::$line"; done
+            grep -E -A6 '^---- .* stdout ----' cargo-test.log | head -60 | while IFS= read -r line; do echo "::error::$line"; done
+            grep -E '^test result: FAILED' cargo-test.log | head -10 | while IFS= read -r line; do echo "::error::$line"; done
             exit 1
           fi
 
