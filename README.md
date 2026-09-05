@@ -207,11 +207,23 @@ Stated plainly, because the audit that produced this tool was mostly about unsta
 
 - **Nothing is published.** `cargo publish --dry-run` is clean for all eight crates; no crate has
   been uploaded to crates.io.
-- **CI has never run.** The workflows are written and have never executed on a runner.
+- **CI runs now, and is not yet green.** As of 2026-09-05 the workflows execute on every
+  push. Passing: the full test suite on ubuntu-22.04 (755 tests), plus parity against
+  ROPgadget, flag conformance, the CLI/MCP capability matrix, MSRV, rustfmt, cargo-deny +
+  cargo-audit, and `cargo publish --dry-run`. Still failing: a saturated-server latency
+  bound on windows-2022, an RSS growth bound on macOS, and cargo-fuzz's toolchain install.
+  The first run found three defects no local run could have -- a corpus file that no clone
+  could reproduce, a cache test that was only ever correct on Windows, and two timing
+  assertions that encoded a fast workstation rather than a property.
 - **No ARM64 or MIPS chain builder.** The scanner reads those architectures; the chain builder
   does not target them. They are absent from `--help` rather than advertised and broken.
-- **macOS is unexercised.** `dist/build-macos.sh` is syntax-checked and has never run; no macOS
-  artifact has ever existed.
+- **`dist/build-macos.sh` has never run.** It is syntax-checked only. The release workflow
+  does build a universal macOS binary and smoke-test it, so a macOS artifact now exists --
+  but it is not produced by that script.
+- **The universal binary's x86_64 half is never executed.** GitHub retired the macos-13
+  Intel runner, and its successor is a billed larger runner, so every macOS job -- build,
+  test and release smoke -- runs on arm64. The Intel slice is compiled and shipped without
+  ever having been started on an Intel Mac.
 - **`--badbytes 00` on 64-bit is unsatisfiable** by construction — every address below 2⁴⁸ packed
   little-endian contains a zero byte. Refusing is the correct answer.
 - **rp++ is faster** at default settings and finds memory-indirect terminators this tool misses.

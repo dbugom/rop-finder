@@ -142,7 +142,7 @@ jobs:
   macos:
     name: macos universal
     needs: version
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       # `secrets` is not one of the contexts available to a step-level `if:`,
       # but it IS available to a job-level `env:`, so the signing steps below
@@ -359,10 +359,9 @@ jobs:
           - os: ubuntu-22.04-arm
             artifact_suffix: aarch64-unknown-linux-musl
             kind: tar
-          - os: macos-14
-            artifact_suffix: universal-apple-darwin
-            kind: tar
-          - os: macos-13
+          # arm64 only: GitHub retired macos-13, so the x86_64 half of the
+          # universal binary is built but never executed. See ci.yml's header.
+          - os: macos-15
             artifact_suffix: universal-apple-darwin
             kind: tar
           - os: windows-2022

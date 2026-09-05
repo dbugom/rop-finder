@@ -6,9 +6,17 @@
 # paths in particular (%LOCALAPPDATA% cache directory, \\?\ verbatim path
 # handling in rf-mcp, the whole windows-virtualprotect chain builder) had never
 # been executed by an automated build; windows-2022 below is therefore not
-# optional, and macos-13 (x86_64) is kept alongside macos-14 (arm64) because
-# the two differ in pointer-authentication behaviour and in which capstone
-# object files get built.
+# optional.
+#
+# macOS is arm64-only here, and that is a LOSS rather than a choice. macos-13
+# (x86_64) was originally kept alongside macos-14 (arm64) because the two differ
+# in pointer-authentication behaviour and in which capstone object files get
+# built. GitHub has since retired the macos-13 image: jobs requesting that label
+# are never picked up, they simply wait until the run is killed -- one held a CI
+# run open for 9h19m before being cancelled, and blocked the v0.1.1 release.
+# The Intel successor (macos-15-intel) is a -large-class runner and is billed
+# even on public repositories, so the x86_64 half of the universal binary is now
+# unexercised. README's Known limits says so.
 #
 # Third-party actions: none. Only actions/checkout and actions/cache, both
 # first-party, referenced by major-version tag. Commit-SHA pinning is the
@@ -62,8 +70,7 @@ jobs:
       matrix:
         os:
           - ubuntu-22.04
-          - macos-14        # arm64
-          - macos-13        # x86_64
+          - macos-15        # arm64; macos-14 is deprecated, macos-13 is retired
           - windows-2022
     steps:
       - uses: actions/checkout@v4
