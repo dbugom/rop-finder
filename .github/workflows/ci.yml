@@ -647,7 +647,20 @@ jobs:
         run: |
           set -euo pipefail
           rustup toolchain install nightly --profile minimal --no-self-update
-          cargo install --locked cargo-fuzz
+          # +nightly deliberately, NOT the pinned toolchain. rust-toolchain.toml
+          # pins 1.89.0 so that everyone reproduces docs/measured-2026-09.md, and
+          # `cargo install` honours that pin -- but cargo-fuzz 0.13.2 pulls
+          # cargo-platform 0.3.3, which requires rustc 1.91:
+          #
+          #     error: failed to compile `cargo-fuzz v0.13.2`
+          #     Caused by:
+          #       rustc 1.89.0 is not supported by the following package:
+          #         cargo-platform@0.3.3 requires rustc 1.91
+          #
+          # which is the bare "exit code 101" this job reported on every run. The
+          # pin is right and stays; a dev tool has no business inheriting it,
+          # especially one this job already invokes as `cargo +nightly fuzz`.
+          cargo +nightly install --locked cargo-fuzz
 
       - name: Run every fuzz target for 60 s
         if: steps.has-fuzz.outputs.present == 'true'

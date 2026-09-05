@@ -93,14 +93,33 @@ async fn cache_is_bounded() {
         entries_seen < 40,
         "all 40 entries were retained: {entries_seen}"
     );
-    // The pre-fix behaviour is monotonic growth. The budget is 64 MiB and
-    // the process needs room for one live scan on top of it; anything near
-    // the old 40-entry total would fail here.
+    // A backstop against CATASTROPHIC runaway, and deliberately nothing more.
+    //
+    // This bound was baseline + 600 MiB, and it failed on macos-15 with the
+    // cache demonstrably working: peak cache_bytes 64.0 MiB (exactly the
+    // budget), 29 evictions, 11 of 40 entries retained, RSS peak 743.8 MiB.
+    // Process RSS here is dominated by scan working memory and by an allocator
+    // that does not return freed pages to the OS, neither of which is the cache.
+    //
+    // It cannot be repaired by picking a better number. The regression it named
+    // -- 40 entries retained instead of 11, roughly +170 MiB -- is SMALLER than
+    // the run-to-run scan noise it is measured through, so any threshold tight
+    // enough to catch that regression flakes, and any threshold loose enough to
+    // be stable cannot catch it. The four assertions above already catch it
+    // exactly, from the server's own accounting, which is what MCP-05 is
+    // actually about.
+    //
+    // So this now guards only the failure mode RSS genuinely can see: the
+    // pre-fix cancellation blowup reached 54.8 GB (see cancellation.rs). Two
+    // gigabytes separates that from any healthy run on any platform.
+    // RF_CACHE_RSS_CEILING_MIB tightens it where the environment is known.
+    let ceiling = rss_ceiling_bytes(baseline.rss_bytes);
     assert!(
-        final_rss < baseline.rss_bytes + 600 * 1024 * 1024,
-        "RSS grew from {:.1} MiB to {:.1} MiB",
+        final_rss < ceiling,
+        "RSS grew from {:.1} MiB to {:.1} MiB, past the {:.1} MiB runaway ceiling",
         mib(baseline.rss_bytes),
-        mib(final_rss)
+        mib(final_rss),
+        mib(ceiling)
     );
 }
 
@@ -157,4 +176,19 @@ async fn the_ttl_expires_entries() {
     assert_eq!(structured(&c)["cache"], "miss", "TTL did not expire it");
     let s = mcp.stats(4).await;
     assert!(s["cache"]["expired"].as_u64().unwrap() >= 1, "{s}");
+}
+
+/// Ceiling for [`cache_is_bounded`]'s runaway backstop: baseline RSS plus 2 GiB
+/// by default, or `RF_CACHE_RSS_CEILING_MIB` megabytes over baseline if set.
+///
+/// Two gigabytes is not a tolerance for normal growth -- normal growth is bounded
+/// by the cache budget and asserted directly above. It is the gap between a
+/// healthy run (743.8 MiB peak measured on macos-15) and the 54.8 GB the
+/// pre-fix server reached when work escaped cancellation.
+fn rss_ceiling_bytes(baseline: u64) -> u64 {
+    let over_mib: u64 = std::env::var("RF_CACHE_RSS_CEILING_MIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2048);
+    baseline + over_mib * 1024 * 1024
 }
