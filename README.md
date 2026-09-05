@@ -207,14 +207,15 @@ Stated plainly, because the audit that produced this tool was mostly about unsta
 
 - **Nothing is published.** `cargo publish --dry-run` is clean for all eight crates; no crate has
   been uploaded to crates.io.
-- **CI is green, with two gates weaker than they look.** As of 2026-09-05, run #19, all 13
-  jobs pass: the test suite on ubuntu-22.04, macos-15 and windows-2022, parity against
+- **CI is green, with one gate weaker than it looks.** As of 2026-09-05, all 13 jobs pass: the
+  test suite on ubuntu-22.04, macos-15 and windows-2022, parity against
   ROPgadget, flag conformance, the CLI/MCP capability matrix, MSRV, rustfmt, cargo-deny +
-  cargo-audit, `cargo publish --dry-run`, doc-claims, criterion and cargo-fuzz. Two
-  qualifications, because "green" is doing less work here than it appears to. The criterion
-  gate re-recorded its baseline in that same run, so it compared against itself and the
-  first real comparison is the next run. And the fuzz job runs with
-  `ASAN_OPTIONS=detect_leaks=0`, so CI performs no leak detection at all
+  cargo-audit, `cargo publish --dry-run`, doc-claims, criterion and cargo-fuzz, twice in a
+  row (runs #19 and #20). The criterion gate is doing real work in that number: #19 recorded
+  its baseline, #20 restored it -- the record step is conditional on a cache miss and shows
+  as skipped -- so #20 was a genuine comparison against a previously banked run, not a
+  benchmark measured against itself. One qualification remains, and it is not small: the
+  fuzz job runs with `ASAN_OPTIONS=detect_leaks=0`, so CI performs no leak detection at all
   ([fuzz/README.md](fuzz/README.md) says why, and what it would take to restore it).
 - **Getting there took six defects, none of which any local run could have found.** A corpus
   file no clone could reproduce; a cache test only ever correct on Windows; two timing
