@@ -593,12 +593,29 @@ jobs:
       - name: cargo bench -p rf-bench -- --test
         run: cargo bench -p rf-bench -- --test
 
+      # The key used to be os+arch+v1, which depends on nothing that ever
+      # changes: the baseline was recorded on whichever runner happened to
+      # go first and then restored unchanged forever. It was recorded while
+      # this account was running 28 concurrent jobs, so it banked a heavily
+      # contended machine, and every run since compared against it. The
+      # result was a report of 36 improvements of 20-30% with no code change
+      # at all, and one 11.5% 'regression' on a 5 ms benchmark whose
+      # siblings on the same code path (output/text/arm64, output/text/pe-x64)
+      # both got ~20% FASTER. That is noise measured against a stale floor,
+      # not a regression.
+      #
+      # Keying on Cargo.lock and rust-toolchain.toml re-records when a
+      # dependency or the compiler changes -- the things that legitimately
+      # move these numbers -- and holds steady across ordinary commits, which
+      # is what a regression gate needs. It does NOT cure runner contention:
+      # nothing keyed can, and this job has already passed and failed on
+      # identical product code.
       - name: Restore the CI bench baseline
         id: benchcache
         uses: actions/cache@v4
         with:
           path: ci-bench-baseline.json
-          key: bench-baseline-${{ runner.os }}-${{ runner.arch }}-v1
+          key: bench-baseline-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}-v2
 
       - name: cargo bench -p rf-bench
         run: cargo bench -p rf-bench
