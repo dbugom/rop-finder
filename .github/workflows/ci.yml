@@ -105,7 +105,8 @@ jobs:
             echo "::group::cargo test --workspace (full output)"
             cat cargo-test.log
             echo "::endgroup::"
-            grep -E '^(test .* FAILED|---- .* stdout ----|thread .* panicked|error(\[|:))' cargo-test.log               | head -40 | while IFS= read -r line; do echo "::error::$line"; done
+            grep -E '^(test .* FAILED|---- .* stdout ----|thread .* panicked|error(\[|:))' cargo-test.log | head -30 | while IFS= read -r line; do echo "::error::$line"; done
+            echo "--- tail ---"; tail -20 cargo-test.log | while IFS= read -r line; do echo "::error::$line"; done
             exit 1
           fi
 
@@ -453,7 +454,7 @@ jobs:
             echo "::group::doc_claims.py (full output)"
             cat doc-claims.log
             echo "::endgroup::"
-            grep -E '^\[(FAIL|warn)|Traceback|Error|error' doc-claims.log               | head -40 | while IFS= read -r line; do echo "::error::$line"; done
+            tail -40 doc-claims.log | while IFS= read -r line; do echo "::error::$line"; done
             exit 1
           fi
 

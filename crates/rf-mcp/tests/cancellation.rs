@@ -245,9 +245,30 @@ async fn info_does_not_block_the_runtime() {
     assert!(resp["result"]["tools"].is_array(), "{resp}");
     println!("info_does_not_block_the_runtime: tools/list answered in {took:?}");
     assert!(
-        took < Duration::from_millis(100),
+        took < cheap_tool_budget(),
         "tools/list took {took:?} behind four get_binary_info calls"
     );
+}
+
+/// How long a *cheap* tool may take while expensive work is in flight.
+///
+/// The property under test is that the async runtime is not blocked: a blocked
+/// server cannot answer `tools/list` until the scans holding its threads
+/// finish, which is seconds (the scans below run with `timeout_secs: 4`). A
+/// healthy server answers in single-digit milliseconds — 3.1 ms measured on
+/// the development machine.
+///
+/// The bound was 100 ms, which is a fast-workstation number rather than a
+/// property, and it failed on the windows-2022 runner in the first CI run. One
+/// second still separates the two cases by a factor of four and gives a
+/// throttled shared runner 300x the healthy time. Set
+/// `RF_CHEAP_TOOL_BUDGET_MS` to tighten it locally.
+fn cheap_tool_budget() -> Duration {
+    let ms = std::env::var("RF_CHEAP_TOOL_BUDGET_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+    Duration::from_millis(ms)
 }
 
 /// The same property with the *expensive* tool: two long scans hold both
@@ -277,7 +298,7 @@ async fn a_saturated_server_still_answers_cheap_tools() {
     assert!(resp["result"]["tools"].is_array(), "{resp}");
     println!("a_saturated_server_still_answers_cheap_tools: tools/list answered in {took:?}");
     assert!(
-        took < Duration::from_millis(100),
+        took < cheap_tool_budget(),
         "tools/list took {took:?} with both scan slots busy"
     );
 }
