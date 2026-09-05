@@ -207,14 +207,23 @@ Stated plainly, because the audit that produced this tool was mostly about unsta
 
 - **Nothing is published.** `cargo publish --dry-run` is clean for all eight crates; no crate has
   been uploaded to crates.io.
-- **CI runs now, and is not yet green.** As of 2026-09-05 the workflows execute on every
-  push. Passing: the full test suite on ubuntu-22.04 (755 tests), plus parity against
+- **CI is green, with two gates weaker than they look.** As of 2026-09-05, run #19, all 13
+  jobs pass: the test suite on ubuntu-22.04, macos-15 and windows-2022, parity against
   ROPgadget, flag conformance, the CLI/MCP capability matrix, MSRV, rustfmt, cargo-deny +
-  cargo-audit, and `cargo publish --dry-run`. Still failing: a saturated-server latency
-  bound on windows-2022, an RSS growth bound on macOS, and cargo-fuzz's toolchain install.
-  The first run found three defects no local run could have -- a corpus file that no clone
-  could reproduce, a cache test that was only ever correct on Windows, and two timing
-  assertions that encoded a fast workstation rather than a property.
+  cargo-audit, `cargo publish --dry-run`, doc-claims, criterion and cargo-fuzz. Two
+  qualifications, because "green" is doing less work here than it appears to. The criterion
+  gate re-recorded its baseline in that same run, so it compared against itself and the
+  first real comparison is the next run. And the fuzz job runs with
+  `ASAN_OPTIONS=detect_leaks=0`, so CI performs no leak detection at all
+  ([fuzz/README.md](fuzz/README.md) says why, and what it would take to restore it).
+- **Getting there took six defects, none of which any local run could have found.** A corpus
+  file no clone could reproduce; a cache test only ever correct on Windows; two timing
+  assertions that encoded a fast workstation rather than a property; a `macos-13` runner
+  GitHub had retired, which held one run open for 9h19m waiting for a machine that no longer
+  exists; a truncating pointer subtraction inside iced-x86 that only panics under
+  `overflow-checks`; and a bench baseline frozen against a contended runner. Four of the six
+  were in the harness rather than the product -- which is the point: an unrun CI suite is a
+  claim, not evidence.
 - **No ARM64 or MIPS chain builder.** The scanner reads those architectures; the chain builder
   does not target them. They are absent from `--help` rather than advertised and broken.
 - **`dist/build-macos.sh` has never run.** It is syntax-checked only. The release workflow
