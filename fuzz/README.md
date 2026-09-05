@@ -404,6 +404,39 @@ fuzz-nightly:
 Phase 2 exit criteria set for the amplifying PE, so the nightly job stays red
 until `ROB-02` is fixed and then guards it.
 
+### Leak detection, and why CI turns it off
+
+The short CI run adds `-detect_leaks=0`, which is not in the recipe above.
+
+LeakSanitizer reports the same thing on every run:
+
+```
+SUMMARY: AddressSanitizer: 552 byte(s) leaked in 12 allocation(s).
+```
+
+It is not a leak. `rf-classify` keeps a `thread_local!` cache of capstone
+`Classifier` handles, one per architecture per thread, because capstone handles
+are `!Send` and reopening up to four of them per gadget would dominate
+classification. rayon never joins its worker threads, so those `thread_local`
+destructors never run, and LSan correctly observes memory that is still
+allocated and no longer reachable at exit.
+
+Two things distinguish this from a real leak, and both are arithmetic rather
+than opinion. The total is FIXED at 552 bytes across 19,562 executions -- a leak
+driven by input would have been megabytes. And every allocation count is a
+multiple of two, one set per worker thread that classified anything.
+
+The honest cost: the fast job now does no leak detection at all, because
+`fuzz-nightly` above is documented and not yet implemented. If you implement it,
+leave leak detection ON there -- a long run is where a real leak would show as
+growth rather than as a constant, and where maintaining an
+`LSAN_OPTIONS=suppressions=` file for this one cache is worth the trouble.
+
+Note also that CI reports arrive UNSYMBOLIZED (raw addresses, no function
+names), which is why the cache above was identified from the shape of the report
+rather than read off a stack frame. Putting `llvm-symbolizer` on PATH fixes that
+and is a prerequisite for name-based suppressions working at all.
+
 ---
 
 ## 8. Measured, 2026-09-03, this machine
