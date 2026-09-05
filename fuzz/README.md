@@ -406,7 +406,15 @@ until `ROB-02` is fixed and then guards it.
 
 ### Leak detection, and why CI turns it off
 
-The short CI run adds `-detect_leaks=0`, which is not in the recipe above.
+The short CI run sets `ASAN_OPTIONS=detect_leaks=0` and passes libFuzzer's
+`-detect_leaks=0`. Both, and the environment variable is the one that works.
+
+libFuzzer's flag only disables the leak checks it performs BETWEEN inputs. The
+report that fails the job arrives from LeakSanitizer's atexit handler -- it
+appears after `Done 19562 runs in 61 second(s)`, once fuzzing has finished
+cleanly -- and that check belongs to the ASan runtime, which reads
+`ASAN_OPTIONS`. Setting only the libFuzzer flag leaves the job failing exactly
+as before, with an identical report.
 
 LeakSanitizer reports the same thing on every run:
 

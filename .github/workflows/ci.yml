@@ -664,6 +664,15 @@ jobs:
 
       - name: Run every fuzz target for 60 s
         if: steps.has-fuzz.outputs.present == 'true'
+        env:
+          # THE flag that matters, and not the one I reached for first.
+          # libFuzzer's -detect_leaks=0 only turns off the leak checks it
+          # runs BETWEEN inputs. The report that fails this job arrives from
+          # LeakSanitizer's atexit handler, after 'Done 19562 runs', and that
+          # one belongs to the ASan runtime. Only ASAN_OPTIONS switches it
+          # off. The libFuzzer flag stays because the per-input checks are
+          # equally pointless against a process-lifetime cache.
+          ASAN_OPTIONS: detect_leaks=0
         run: |
           set -euo pipefail
           targets=$(cargo +nightly fuzz list)
