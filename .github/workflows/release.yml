@@ -27,15 +27,38 @@ name: Release
 on:
   push:
     tags: ['v*']
-  # Manual runs build, package and smoke-test everything but never publish:
-  # the `publish` job below is gated on `github.ref_type == 'tag'`.
+  # A manual run with NO `tag` input behaves as before: it builds, packages and
+  # smoke-tests the selected ref and never publishes. Supplying `tag` builds that
+  # tag and publishes its release.
+  #
+  # This input exists because a tag push runs the workflow file stored AT THE TAG,
+  # and all six existing tags predate GitHub retiring the macos-13 image. Their
+  # copy of this file still smoke-tests on `macos-13`, a runner that no longer
+  # exists, so that job waits until something kills it and `publish` is never
+  # reached. That is the whole reason this repository has six tags and zero
+  # releases -- v0.1.1 was pushed, ran, and stalled exactly there. Dispatching
+  # from a branch runs THIS file, which checks the requested tag out and builds
+  # it, so the historical tags can be released without rewriting them.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and publish (e.g. v0.2.0). LEAVE THE REF SELECTOR ON A BRANCH -- running this from a tag ref loads that tag stale workflow file. Empty = dry run, no release.'
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  # inputs.tag, not just github.ref. On a tag push github.ref is refs/tags/vX so
+  # each tag already gets its own group, but on a workflow_dispatch github.ref is
+  # the BRANCH -- so every backfill dispatch would land in one shared group. With
+  # cancel-in-progress: false that is not safe queueing: GitHub keeps at most one
+  # PENDING run per group and cancels the previously pending one, so dispatching
+  # v0.2.0..v1.0.0-rc1 back to back would silently cancel the middle three and
+  # publish only the first and last. The cancelled runs would look exactly like
+  # the macos-13 stall this input exists to route around.
+  group: release-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -50,10 +73,32 @@ jobs:
       version: ${{ steps.v.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # empty input -> github.ref: tag-push behaviour is unchanged
+          ref: ${{ inputs.tag || github.ref }}
       - id: v
+        env:
+          # Passed through the environment, never interpolated into the script
+          # body: a ${{ }} expansion inside `run` is a script-injection sink and
+          # this repository is a security tool.
+          TAG_IN: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+          # Validate before anything expensive. ${TAG_IN#v} strips a leading "v"
+          # only, so a pasted "refs/tags/v0.2.0" survives into the artifact NAME,
+          # and upload-artifact rejects "/" -- failing all five uploads at the end
+          # of a ~40 minute build instead of here, in seconds.
+          case "${TAG_IN:-}" in
+            ''|v[0-9]*) ;;
+            *) echo "::error::tag input must be a bare tag like v0.2.0, got: ${TAG_IN}"; exit 1 ;;
+          esac
+          if [ -n "${TAG_IN:-}" ] && ! git rev-parse -q --verify "refs/tags/${TAG_IN}" >/dev/null; then
+            echo "::error::no such tag: ${TAG_IN}"
+            exit 1
+          fi
+          if [ -n "${TAG_IN:-}" ]; then
+            version="${TAG_IN#v}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             version="${GITHUB_REF_NAME#v}"
           else
             version="$(git rev-parse --short HEAD)-dev"
@@ -73,6 +118,9 @@ jobs:
           - aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
+        with:
+          # empty input -> github.ref: tag-push behaviour is unchanged
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install toolchain
         run: |
@@ -136,7 +184,15 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.pkg.outputs.name }}
-          path: dist/*
+          # Enumerated, never dist/*: every tag tracks a committed dist/README.md
+          # ("There are no prebuilt binaries in this repository any more"), and
+          # Package mkdir -p's into that same checked-out directory. A glob would
+          # ship that file inside all five artifacts, and publish -- which merges
+          # them -- would attach it to the release next to the prebuilt binaries
+          # it says do not exist, unlisted in SHA256SUMS.
+          path: |
+            dist/${{ steps.pkg.outputs.name }}.tar.gz
+            dist/${{ steps.pkg.outputs.name }}.tar.gz.sha256
           if-no-files-found: error
 
   macos:
@@ -170,6 +226,9 @@ jobs:
       MACOS_SIGNING: ${{ secrets.MACOS_CERT_P12 != '' && 'yes' || 'no' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # empty input -> github.ref: tag-push behaviour is unchanged
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install toolchain
         run: |
@@ -280,7 +339,15 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.pkg.outputs.name }}
-          path: dist/*
+          # Enumerated, never dist/*: every tag tracks a committed dist/README.md
+          # ("There are no prebuilt binaries in this repository any more"), and
+          # Package mkdir -p's into that same checked-out directory. A glob would
+          # ship that file inside all five artifacts, and publish -- which merges
+          # them -- would attach it to the release next to the prebuilt binaries
+          # it says do not exist, unlisted in SHA256SUMS.
+          path: |
+            dist/${{ steps.pkg.outputs.name }}.tar.gz
+            dist/${{ steps.pkg.outputs.name }}.tar.gz.sha256
           if-no-files-found: error
 
   windows:
@@ -298,6 +365,9 @@ jobs:
           - aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
+        with:
+          # empty input -> github.ref: tag-push behaviour is unchanged
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install toolchain
         shell: bash
@@ -335,7 +405,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.pkg.outputs.name }}
-          path: dist/*
+          # Enumerated for the same reason as the linux/macos jobs above.
+          path: |
+            dist/${{ steps.pkg.outputs.name }}.zip
+            dist/${{ steps.pkg.outputs.name }}.zip.sha256
           if-no-files-found: error
 
   smoke:
@@ -436,12 +509,15 @@ jobs:
   publish:
     name: Publish release
     needs: [version, smoke]
-    if: github.ref_type == 'tag'
+    if: github.ref_type == 'tag' || inputs.tag != ''
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # empty input -> github.ref: tag-push behaviour is unchanged
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Download every artifact
         uses: actions/download-artifact@v4
@@ -461,11 +537,28 @@ jobs:
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          gh release create "$TAG" \
-            --title "$TAG" \
-            --generate-notes \
-            --verify-tag \
-            incoming/*
+          # --prerelease for any semver prerelease field. Without it v1.0.0-rc1
+          # publishes as stable, and since its tag is the newest of the six it
+          # becomes the repository's "Latest" -- what /releases/latest and every
+          # install script reach for. A release candidate must not outrank v0.5.0.
+          pre=()
+          case "$TAG" in
+            *-*) pre=(--prerelease) ;;
+          esac
+          # Idempotent: re-dispatching a tag that already has a release replaces
+          # its assets instead of aborting with "already exists" and stranding a
+          # half-published release.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists - replacing its assets"
+            gh release upload "$TAG" incoming/* --clobber
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --generate-notes \
+              --verify-tag \
+              "${pre[@]}" \
+              incoming/*
+          fi
